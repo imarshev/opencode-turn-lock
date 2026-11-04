@@ -461,6 +461,43 @@ test("only one mark is written while a session keeps waiting", async () => {
   }
 })
 
+test("two waiters see their place in the queue", async () => {
+  const harness = await setup(
+    { remindEveryMs: 40 },
+    { titles: { ses_3: "three", ses_4: "four" } },
+  )
+  try {
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+    let thirdDone = false
+    let fourthDone = false
+    const third = harness.context("ses_3").then(() => {
+      thirdDone = true
+    })
+    await until(() => harness.titles.get("ses_3") === "⏳ three", "first waiter marked")
+    const fourth = harness.context("ses_4").then(() => {
+      fourthDone = true
+    })
+
+    await until(() => harness.titles.get("ses_3") === "⏳ 1/2 · three", "first in queue")
+    await until(() => harness.titles.get("ses_4") === "⏳ 2/2 · four", "second in queue")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await until(() => thirdDone || fourthDone, "a waiter got the slot")
+
+    // Which waiter wins is the lease race, not the displayed order: the place
+    // is a hint, the lock has no FIFO. Whoever is left must drop the "N/M".
+    const remaining = thirdDone ? "ses_4" : "ses_3"
+    const remainingTitle = thirdDone ? "⏳ four" : "⏳ three"
+    await until(() => harness.titles.get(remaining) === remainingTitle, "queue shrank after a grant")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+    await Promise.all([third, fourth])
+  } finally {
+    await harness.teardown()
+  }
+})
+
 test("a title regenerated while waiting is marked again", async () => {
   const harness = await setup({ remindEveryMs: 60 }, { titles: { ses_3: "three" } })
   try {
@@ -527,7 +564,7 @@ test("boot restores a mark left by a dead process", async () => {
       JSON.stringify({ sid: "ses_ghost", pid: 999_999, owner: "C:/work", markedAt: Date.now() }),
       "utf8",
     )
-    const harness = await setup({ dir, logFile: join(dir, "log.txt") }, { titles: { ses_ghost: "⏳ old title" } })
+    const harness = await setup({ dir, logFile: join(dir, "log.txt") }, { titles: { ses_ghost: "⏳ 12 мин · old title" } })
     try {
       assert.equal(harness.titles.get("ses_ghost"), "old title", "the marker is removed on boot")
     } finally {
@@ -619,6 +656,37 @@ test("a covered subagent cannot starve an unrelated third session", async () => 
   } finally {
     await harness.teardown()
   }
+})
+
+test("wait label: compact and international", () => {
+  assert.equal(mod.formatWait(0), "")
+  assert.equal(mod.formatWait(59_000), "")
+  assert.equal(mod.formatWait(60_000), "1m")
+  assert.equal(mod.formatWait(26 * 60_000), "26m")
+  assert.equal(mod.formatWait(65 * 60_000), "1h5m")
+  assert.equal(mod.formatWait(120 * 60_000), "2h")
+  assert.equal(mod.formatWait(3 * 60_000, { position: 2, total: 3 }), "2/3 · 3m")
+  assert.equal(mod.formatWait(0, { position: 2, total: 3 }), "2/3")
+  assert.equal(mod.formatWait(3 * 60_000, { position: 1, total: 1 }), "3m")
+
+  assert.equal(mod.withWaitPrefix("do it", 0), "⏳ do it")
+  assert.equal(mod.withWaitPrefix("do it", 3 * 60_000), "⏳ 3m · do it")
+  assert.equal(mod.withWaitPrefix("do it", 3 * 60_000, { position: 2, total: 3 }), "⏳ 2/3 · 3m · do it")
+  assert.equal(mod.withWaitPrefix("⏳ 3m · do it", 4 * 60_000), "⏳ 4m · do it")
+  assert.equal(mod.withWaitPrefix("⏳ do it", 2 * 60_000), "⏳ 2m · do it")
+
+  assert.equal(mod.stripWaitPrefix("⏳ 4m · do it"), "do it")
+  assert.equal(mod.stripWaitPrefix("⏳ 2/3 · 1h5m · do it"), "do it")
+  assert.equal(mod.stripWaitPrefix("⏳ 4 мин · do it"), "do it")
+  assert.equal(mod.stripWaitPrefix("⏳ 1 ч 5 мин · do it"), "do it")
+  assert.equal(mod.stripWaitPrefix("⏳ ждёт · do it"), "do it")
+  assert.equal(mod.stripWaitPrefix("⏳ do it"), "do it")
+  assert.equal(mod.stripWaitPrefix("⏳ 2/3 · ⏳ 5m · do it"), "do it")
+  assert.equal(mod.stripWaitPrefix("plain title"), "plain title")
+})
+
+test("default wait tick fits a visible countdown", () => {
+  assert.equal(mod.DEFAULTS.remindEveryMs, 60_000)
 })
 
 test("default timeout is 4 hours (long-running goals stay serialised)", () => {

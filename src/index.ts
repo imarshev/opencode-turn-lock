@@ -50,7 +50,7 @@
 //     "sweepMs": 60000,
 //     "releaseOnForm": true,            // a `question` tool form frees the slot
 //     "releaseOnPermission": true,      // a permission prompt frees the slot
-//     "remindEveryMs": 300000,          // re-log a long wait every interval
+//     "remindEveryMs": 60000,           // title countdown tick + log line for a long wait
 //     "markWaitingTitle": true,         // prefix the session title with "⏳ " while it waits
 //     "dir": "%TEMP%/opencode/turn-lock",
 //     "logFile": "%TEMP%/opencode/turn-lock.log",
@@ -115,7 +115,7 @@ export const DEFAULTS: TurnLockConfig = {
   sweepMs: 60_000,
   releaseOnForm: true,
   releaseOnPermission: true,
-  remindEveryMs: 5 * 60_000,
+  remindEveryMs: 60_000,
   markWaitingTitle: true,
   dir: join(tmpdir(), "opencode", "turn-lock"),
   logFile: join(tmpdir(), "opencode", "turn-lock.log"),
@@ -276,6 +276,42 @@ function readBaseUrl(info: unknown): string | undefined {
 export const WAITING_MARK = "⏳ "
 
 /**
+ * Matches the whole waiting prefix, not just the emoji: `⏳ 2/3 · 3h10m · `,
+ * `⏳ 3m · `, the Russian wording older versions wrote (`⏳ ждёт · `,
+ * `⏳ 4 мин · `), and the bare `⏳ `. Applied in a loop, so a title that was
+ * marked twice is still cleaned up.
+ */
+const WAIT_PREFIX =
+  /^⏳ (?:(?:\d+\/\d+) · )?(?:(?:\d+h(?:\d+m)?|\d+m|\d+ мин|\d+ ч(?: \d+ мин)?|ждёт) · )?/
+
+/** Where a waiting session stands: `position` of `total` waiters, 1-based. */
+export type QueuePlace = { position: number; total: number }
+
+/** Compact wait label for the title: "" under a minute, "26m", "3h10m",
+ *  prefixed by "2/3 · " when the session is not alone in the queue. */
+export function formatWait(waitedMs: number, place?: QueuePlace): string {
+  const minutes = Math.floor(Math.max(0, waitedMs) / 60_000)
+  const parts: string[] = []
+  if (place && place.total > 1) parts.push(`${place.position}/${place.total}`)
+  if (minutes >= 60) parts.push(`${Math.floor(minutes / 60)}h${minutes % 60 ? `${minutes % 60}m` : ""}`)
+  else if (minutes >= 1) parts.push(`${minutes}m`)
+  return parts.join(" · ")
+}
+
+/** Original title with every waiting prefix removed. */
+export function stripWaitPrefix(title: string): string {
+  let result = title
+  while (WAIT_PREFIX.test(result)) result = result.replace(WAIT_PREFIX, "")
+  return result
+}
+
+/** Title of a waiting session: `⏳ 2/3 · 3h10m · <title>`. */
+export function withWaitPrefix(title: string, waitedMs: number, place?: QueuePlace): string {
+  const label = formatWait(waitedMs, place)
+  return `${WAITING_MARK}${label ? `${label} · ` : ""}${stripWaitPrefix(title)}`
+}
+
+/**
  * True for a synthetic transcript entry this plugin posted. Older versions
  * queued "turn-lock" notices into the session inbox; those become real messages
  * at the next step boundary and the model then answers them, so they must never
@@ -334,10 +370,10 @@ export default Plugin.define({
     const canEditTitle = (): boolean =>
       typeof ctx?.session?.get === "function" && typeof ctx?.session?.update === "function"
 
-    const readWaitMark = (sid: string): { pid?: number; owner?: string } | undefined => {
+    const readWaitMark = (sid: string): { pid?: number; owner?: string; since?: number } | undefined => {
       try {
         const value = JSON.parse(readFileSync(waitPath(sid), "utf8"))
-        return value && typeof value === "object" ? (value as { pid?: number; owner?: string }) : undefined
+        return value && typeof value === "object" ? (value as { pid?: number; owner?: string; since?: number }) : undefined
       } catch {
         return undefined
       }
@@ -351,20 +387,58 @@ export default Plugin.define({
       }
     }
 
-    const writeWaitMark = (sid: string) => {
+    const writeWaitMark = (sid: string, since: number) => {
       try {
         mkdirSync(config.dir, { recursive: true })
-        writeFileSync(waitPath(sid), JSON.stringify({ sid, pid: process.pid, owner, markedAt: Date.now() }), "utf8")
+        writeFileSync(
+          waitPath(sid),
+          JSON.stringify({ sid, pid: process.pid, owner, since, markedAt: Date.now() }),
+          "utf8",
+        )
       } catch {
         // the title mark still works without the sidecar
       }
     }
 
-    /** Prefix the title of a queued session. Best-effort and unawaited: a slow
-     *  or failing update must never delay or break the gate. Re-checked on every
-     *  reminder tick, because a fresh session's title may be generated after the
-     *  first mark and would overwrite it. */
-    async function markWaiting(sid: string): Promise<void> {
+    /** Everyone waiting right now, oldest first. The sidecars are the only
+     *  shared record of waiters (the store holds granted leases only), so the
+     *  queue position is derived from them; a waiter whose process is gone is
+     *  ignored. This is the wait order, not a guaranteed FIFO — slots are taken
+     *  by whoever wakes first. */
+    const readWaiters = (): Array<{ sid: string; since: number }> => {
+      let names: string[]
+      try {
+        names = readdirSync(config.dir)
+      } catch {
+        return []
+      }
+      const waiters: Array<{ sid: string; since: number }> = []
+      for (const name of names) {
+        if (!name.endsWith(".wait.json")) continue
+        const sid = name.slice(0, -".wait.json".length)
+        const mark = readWaitMark(sid)
+        if (!mark) continue
+        const pid = typeof mark.pid === "number" ? mark.pid : undefined
+        if (pid !== undefined && pid !== process.pid && !processAlive(pid)) continue
+        const since = typeof mark.since === "number" ? mark.since : typeof mark.markedAt === "number" ? mark.markedAt : 0
+        waiters.push({ sid, since })
+      }
+      return waiters.sort((a, b) => a.since - b.since || a.sid.localeCompare(b.sid))
+    }
+
+    const placeOf = (sid: string, since: number): QueuePlace => {
+      const waiters = readWaiters()
+      const index = waiters.findIndex((waiter) => waiter.sid === sid)
+      if (index >= 0) return { position: index + 1, total: waiters.length }
+      return { position: waiters.filter((waiter) => waiter.since < since).length + 1, total: waiters.length + 1 }
+    }
+
+    /** Prefix the title of a queued session with the elapsed wait. Best-effort
+     *  and unawaited: a slow or failing update must never delay or break the
+     *  gate. The title is re-read on every reminder tick, because a fresh
+     *  session's title may be generated after the first mark and would overwrite
+     *  it, and because the countdown itself has to move. */
+    async function markWaiting(sid: string, waitedMs: number): Promise<void> {
       if (!config.markWaitingTitle || marking.has(sid) || !canEditTitle()) return
       marking.add(sid)
       const epoch = epochOf(sid)
@@ -373,15 +447,17 @@ export default Plugin.define({
         if (epochOf(sid) !== epoch) return // the slot was granted while we looked
         const title = typeof info?.title === "string" ? info.title : ""
         if (!title) return
-        if (title.startsWith(WAITING_MARK)) {
+        const since = Date.now() - waitedMs
+        writeWaitMark(sid, since)
+        const place = placeOf(sid, since)
+        const next = withWaitPrefix(title, waitedMs, place)
+        if (next === title) {
           marked.add(sid)
-          writeWaitMark(sid)
           return
         }
-        writeWaitMark(sid)
-        await ctx.session.update({ sessionID: sid, title: `${WAITING_MARK}${title}` })
+        await ctx.session.update({ sessionID: sid, title: next })
         marked.add(sid)
-        log("debug", `mark ${sid}: waiting for a slot`)
+        log("debug", `mark ${sid}: ${formatWait(waitedMs, place)}`)
       } catch (error) {
         marked.delete(sid)
         dropWaitMark(sid)
@@ -403,8 +479,9 @@ export default Plugin.define({
       try {
         const info: any = await ctx.session.get({ sessionID: sid })
         const title = typeof info?.title === "string" ? info.title : ""
-        if (title.startsWith(WAITING_MARK)) {
-          await ctx.session.update({ sessionID: sid, title: title.slice(WAITING_MARK.length) })
+        const base = stripWaitPrefix(title)
+        if (base !== title) {
+          await ctx.session.update({ sessionID: sid, title: base })
           log("debug", `unmark ${sid}: ${reason}`)
         }
         dropWaitMark(sid)
@@ -435,8 +512,9 @@ export default Plugin.define({
         try {
           const info: any = await ctx.session.get({ sessionID: sid })
           const title = typeof info?.title === "string" ? info.title : ""
-          if (title.startsWith(WAITING_MARK)) {
-            await ctx.session.update({ sessionID: sid, title: title.slice(WAITING_MARK.length) })
+          const base = stripWaitPrefix(title)
+          if (base !== title) {
+            await ctx.session.update({ sessionID: sid, title: base })
             restored += 1
           }
           dropWaitMark(sid)
@@ -469,7 +547,7 @@ export default Plugin.define({
               event.waitedMs ? ` (already ${Math.round(event.waitedMs / 1000)}s)` : ""
             }`,
           )
-          void markWaiting(event.sid)
+          void markWaiting(event.sid, event.waitedMs)
           break
         case "release":
           log("info", `release ${event.sid}: ${event.reason} (held ${event.held}/${config.limit})`)

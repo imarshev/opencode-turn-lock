@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "limit": 2,
+  "localProviders": ["strata"],
+  "localHosts": ["127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::", "[::]"],
+  "acquireTimeoutMs": 14400000,
+  "onTimeout": "proceed",
+  "leaseTimeoutMs": 7200000,
+  "pollMs": 1000,
+  "refreshEveryMs": 20000,
+  "sweepMs": 60000,
+  "releaseOnForm": true,
+  "releaseOnPermission": true,
+  "notify": "wait",
+  "notifyEveryMs": 30000,
+  "remindEveryMs": 300000,
+  "logLevel": "info"
+}

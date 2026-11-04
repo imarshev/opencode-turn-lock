@@ -1,0 +1,39 @@
+{
+  "name": "opencode-turn-lock",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin that keeps at most N local agent sessions on the model engine, queues the rest per turn, and tells the waiting session why it is waiting.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"tests/*.test.ts\"",
+    "test:watch": "node --test --watch \"tests/*.test.ts\""
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "local-llm",
+    "llm",
+    "scheduler",
+    "queue",
+    "conversation-cache"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode/plugin": "*"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
+  }
+}

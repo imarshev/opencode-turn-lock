@@ -19,11 +19,18 @@
 // child is exempt too. Without this, a local parent waiting for its own
 // subagent would queue behind itself.
 //
-// While a session is queued it posts one synthetic message into its own
-// transcript ("запрос стоит в очереди, занято N из M, ждёт ses_…") and repeats
-// it every `remindEveryMs` while it keeps waiting. The notice uses
-// `delivery: "queue"` and `resume: false`, so it never preempts the running
-// step and never schedules another run.
+// A queued session used to get a synthetic "turn-lock: в очереди" message in
+// its inbox. That message is invisible while the session waits (a queued
+// request is held inside the `context` hook, so there is no step boundary that
+// would drain the inbox), and once the slot is granted the inbox is flushed into
+// the transcript — where the model reads the notice as user input and answers
+// it. So the plugin no longer writes into sessions at all.
+//
+// Visibility comes from the one field every client renders: the title. A queued
+// session's title is prefixed with "⏳ " while it waits and restored on
+// grant/release (`markWaitingTitle`, on by default). The server reports a queued
+// session exactly like a working one (`running`), so this prefix is the only
+// signal the session list can show.
 //
 // Configuration (optional), highest precedence last:
 //   built-in defaults
@@ -43,15 +50,14 @@
 //     "sweepMs": 60000,
 //     "releaseOnForm": true,            // a `question` tool form frees the slot
 //     "releaseOnPermission": true,      // a permission prompt frees the slot
-//     "notify": "wait",                 // "off" | "wait" (queued notice) | "all" (+ granted/over-limit)
-//     "notifyEveryMs": 30000,           // at most one queue notice per session per interval
-//     "remindEveryMs": 300000,          // repeat the notice while still queued
+//     "remindEveryMs": 300000,          // re-log a long wait every interval
+//     "markWaitingTitle": true,         // prefix the session title with "⏳ " while it waits
 //     "dir": "%TEMP%/opencode/turn-lock",
 //     "logFile": "%TEMP%/opencode/turn-lock.log",
 //     "logLevel": "info"                // "off" | "info" | "debug"
 //   }
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -85,9 +91,8 @@ export type TurnLockConfig = {
   sweepMs: number
   releaseOnForm: boolean
   releaseOnPermission: boolean
-  notify: "off" | "wait" | "all"
-  notifyEveryMs: number
   remindEveryMs: number
+  markWaitingTitle: boolean
   dir: string
   logFile: string
   logLevel: "off" | "info" | "debug"
@@ -110,9 +115,8 @@ export const DEFAULTS: TurnLockConfig = {
   sweepMs: 60_000,
   releaseOnForm: true,
   releaseOnPermission: true,
-  notify: "wait",
-  notifyEveryMs: 30_000,
   remindEveryMs: 5 * 60_000,
+  markWaitingTitle: true,
   dir: join(tmpdir(), "opencode", "turn-lock"),
   logFile: join(tmpdir(), "opencode", "turn-lock.log"),
   logLevel: "info",
@@ -207,8 +211,7 @@ function mergeConfig(base: TurnLockConfig, raw: unknown): TurnLockConfig {
     sweepMs: Math.max(1_000, asNumber(value.sweepMs, base.sweepMs, 1_000)),
     releaseOnForm: asBoolean(value.releaseOnForm, base.releaseOnForm),
     releaseOnPermission: asBoolean(value.releaseOnPermission, base.releaseOnPermission),
-    notify: value.notify === "off" || value.notify === "all" ? value.notify : value.notify === "wait" ? "wait" : base.notify,
-    notifyEveryMs: asNumber(value.notifyEveryMs, base.notifyEveryMs, 0),
+    markWaitingTitle: asBoolean(value.markWaitingTitle, base.markWaitingTitle),
     remindEveryMs: asNumber(value.remindEveryMs, base.remindEveryMs, 0),
     dir: typeof value.dir === "string" && value.dir ? value.dir : base.dir,
     logFile: typeof value.logFile === "string" && value.logFile ? value.logFile : base.logFile,
@@ -269,50 +272,22 @@ function readBaseUrl(info: unknown): string | undefined {
   return undefined
 }
 
-/** Compact session id for human-facing notices: `ses_1234…abcd`. */
-export function shortSessionID(sid: string): string {
-  return sid.length <= 13 ? sid : `${sid.slice(0, 8)}…${sid.slice(-4)}`
-}
-
-/** Human duration: "42 с", "13 мин", "2 ч 5 мин". */
-export function formatDuration(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1_000))
-  if (seconds < 90) return `${seconds} с`
-  const minutes = Math.round(seconds / 60)
-  if (minutes < 90) return `${minutes} мин`
-  const hours = Math.floor(minutes / 60)
-  const rest = minutes % 60
-  return rest ? `${hours} ч ${rest} мин` : `${hours} ч`
-}
+/** Prefix a queued session's title with this, so any session list shows it is waiting. */
+export const WAITING_MARK = "⏳ "
 
 /**
- * Text of the in-session queue notice. Delivered as a synthetic message
- * (`delivery: "queue"`, `resume: false`), so it shows up in the session
- * transcript without scheduling another run or preempting the current step.
+ * True for a synthetic transcript entry this plugin posted. Older versions
+ * queued "turn-lock" notices into the session inbox; those become real messages
+ * at the next step boundary and the model then answers them, so they must never
+ * reach the request (`delivery: "queue"` does not keep them out of the context).
  */
-export function queueNotice(input: {
-  held: number
-  limit: number
-  holders: Array<{ sid: string; since: number }>
-  now: number
-  waitedMs: number
-}): string {
-  const holders = input.holders
-    .slice(0, 3)
-    .map((holder) => `${shortSessionID(holder.sid)} — ${formatDuration(input.now - holder.since)}`)
-    .join(", ")
-  const repeat = input.waitedMs > 0
-  const head = repeat
-    ? `⏳ turn-lock: всё ещё в очереди (${formatDuration(input.waitedMs)})`
-    : "⏳ turn-lock: запрос стоит в очереди"
-  return `${head} — занято ${input.held} из ${input.limit} локальных слотов${holders ? ` (${holders})` : ""}. Запрос уйдёт в модель автоматически, как только слот освободится.`
-}
-
-export function grantNotice(waitedMs: number, overLimit: boolean): string {
-  if (overLimit) {
-    return `⚠ turn-lock: слот не освободился за ${formatDuration(waitedMs)} — отправляю запрос сверх лимита.`
-  }
-  return `▶ turn-lock: слот получен, запрос уходит в модель (ожидание ${formatDuration(waitedMs)}).`
+export function isTurnLockNotice(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false
+  const record = message as { type?: unknown; text?: unknown; metadata?: unknown }
+  if (record.type !== "synthetic") return false
+  const metadata = record.metadata as { plugin?: unknown } | undefined
+  if (metadata?.plugin === "turn-lock") return true
+  return typeof record.text === "string" && /^[⏳▶⚠] turn-lock:/.test(record.text)
 }
 
 export default Plugin.define({
@@ -343,7 +318,134 @@ export default Plugin.define({
     const store = fileStore(config.dir)
     const pruned = store.pruneDead(processAlive)
     const held = new Set<string>()
-    const notifiedAt = new Map<string, number>()
+    const owner = String(ctx?.location?.directory ?? "")
+
+    // Queue visibility. Session lists render a title, and the server reports a
+    // queued session exactly like a working one (`running`), so the wait is
+    // marked on the title: "⏳ <title>" while queued, restored on grant. The
+    // sidecar file `<sid>.wait.json` records the mark so a crash or hot reload
+    // cannot leave a session labelled forever.
+    const marked = new Set<string>()
+    const marking = new Set<string>()
+    const waitEpoch = new Map<string, number>()
+    const epochOf = (sid: string) => waitEpoch.get(sid) ?? 0
+    const waitPath = (sid: string) => join(config.dir, `${sid.replace(/[^A-Za-z0-9_.-]/g, "_")}.wait.json`)
+
+    const canEditTitle = (): boolean =>
+      typeof ctx?.session?.get === "function" && typeof ctx?.session?.update === "function"
+
+    const readWaitMark = (sid: string): { pid?: number; owner?: string } | undefined => {
+      try {
+        const value = JSON.parse(readFileSync(waitPath(sid), "utf8"))
+        return value && typeof value === "object" ? (value as { pid?: number; owner?: string }) : undefined
+      } catch {
+        return undefined
+      }
+    }
+
+    const dropWaitMark = (sid: string) => {
+      try {
+        if (existsSync(waitPath(sid))) unlinkSync(waitPath(sid))
+      } catch {
+        // best-effort
+      }
+    }
+
+    const writeWaitMark = (sid: string) => {
+      try {
+        mkdirSync(config.dir, { recursive: true })
+        writeFileSync(waitPath(sid), JSON.stringify({ sid, pid: process.pid, owner, markedAt: Date.now() }), "utf8")
+      } catch {
+        // the title mark still works without the sidecar
+      }
+    }
+
+    /** Prefix the title of a queued session. Best-effort and unawaited: a slow
+     *  or failing update must never delay or break the gate. Re-checked on every
+     *  reminder tick, because a fresh session's title may be generated after the
+     *  first mark and would overwrite it. */
+    async function markWaiting(sid: string): Promise<void> {
+      if (!config.markWaitingTitle || marking.has(sid) || !canEditTitle()) return
+      marking.add(sid)
+      const epoch = epochOf(sid)
+      try {
+        const info: any = await ctx.session.get({ sessionID: sid })
+        if (epochOf(sid) !== epoch) return // the slot was granted while we looked
+        const title = typeof info?.title === "string" ? info.title : ""
+        if (!title) return
+        if (title.startsWith(WAITING_MARK)) {
+          marked.add(sid)
+          writeWaitMark(sid)
+          return
+        }
+        writeWaitMark(sid)
+        await ctx.session.update({ sessionID: sid, title: `${WAITING_MARK}${title}` })
+        marked.add(sid)
+        log("debug", `mark ${sid}: waiting for a slot`)
+      } catch (error) {
+        marked.delete(sid)
+        dropWaitMark(sid)
+        log("debug", `mark ${sid} failed: ${String(error)}`)
+      } finally {
+        marking.delete(sid)
+      }
+    }
+
+    /** Restore the original title once the wait is over. */
+    async function unmarkWaiting(sid: string, reason: string): Promise<void> {
+      waitEpoch.set(sid, epochOf(sid) + 1)
+      const wasMarked = marked.delete(sid)
+      if (!wasMarked && !readWaitMark(sid)) return
+      if (!canEditTitle()) {
+        dropWaitMark(sid)
+        return
+      }
+      try {
+        const info: any = await ctx.session.get({ sessionID: sid })
+        const title = typeof info?.title === "string" ? info.title : ""
+        if (title.startsWith(WAITING_MARK)) {
+          await ctx.session.update({ sessionID: sid, title: title.slice(WAITING_MARK.length) })
+          log("debug", `unmark ${sid}: ${reason}`)
+        }
+        dropWaitMark(sid)
+      } catch (error) {
+        // keep the sidecar: the next boot retries the restore
+        log("debug", `unmark ${sid} failed: ${String(error)}`)
+      }
+    }
+
+    /** Restore marks left by a dead process or a previous load of this location. */
+    async function restoreStaleMarks(): Promise<number> {
+      if (!config.markWaitingTitle || !canEditTitle()) return 0
+      let names: string[]
+      try {
+        names = readdirSync(config.dir)
+      } catch {
+        return 0
+      }
+      let restored = 0
+      for (const name of names) {
+        if (!name.endsWith(".wait.json")) continue
+        const sid = name.slice(0, -".wait.json".length)
+        const mark = readWaitMark(sid)
+        if (!mark) continue
+        const pid = typeof mark.pid === "number" ? mark.pid : undefined
+        if (pid !== undefined && pid !== process.pid && processAlive(pid)) continue
+        if (pid === process.pid && mark.owner !== owner) continue
+        try {
+          const info: any = await ctx.session.get({ sessionID: sid })
+          const title = typeof info?.title === "string" ? info.title : ""
+          if (title.startsWith(WAITING_MARK)) {
+            await ctx.session.update({ sessionID: sid, title: title.slice(WAITING_MARK.length) })
+            restored += 1
+          }
+          dropWaitMark(sid)
+        } catch (error) {
+          log("debug", `restore ${sid} failed: ${String(error)}`)
+        }
+      }
+      return restored
+    }
 
     const onChange = (event: ChangeEvent) => {
       switch (event.type) {
@@ -355,10 +457,10 @@ export default Plugin.define({
                 event.overLimit ? ", over limit" : ""
               })`,
             )
-            void notify(event.sid, "grant", grantNotice(event.waitedMs, event.overLimit))
           } else {
             log("debug", `grant ${event.sid} (held ${event.held}/${event.limit})`)
           }
+          void unmarkWaiting(event.sid, "grant")
           break
         case "wait":
           log(
@@ -367,23 +469,15 @@ export default Plugin.define({
               event.waitedMs ? ` (already ${Math.round(event.waitedMs / 1000)}s)` : ""
             }`,
           )
-          void notify(
-            event.sid,
-            "wait",
-            queueNotice({
-              held: event.held,
-              limit: event.limit,
-              holders: lock.snapshot().leases.filter((lease) => lease.sid !== event.sid),
-              now: Date.now(),
-              waitedMs: event.waitedMs,
-            }),
-          )
+          void markWaiting(event.sid)
           break
         case "release":
           log("info", `release ${event.sid}: ${event.reason} (held ${event.held}/${config.limit})`)
+          void unmarkWaiting(event.sid, "release")
           break
         case "cancel":
           log("debug", `cancel wait ${event.sid}: ${event.reason}`)
+          void unmarkWaiting(event.sid, "cancel")
           break
         case "stale":
           log("warn", `drop stale lease ${event.sid} (no refresh for ${Math.round(event.ageMs / 1000)}s)`)
@@ -454,36 +548,9 @@ export default Plugin.define({
       onTimeout: config.onTimeout,
       remindEveryMs: config.remindEveryMs,
       pid: process.pid,
-      owner: String(ctx?.location?.directory ?? ""),
+      owner,
       onChange,
     })
-
-    /** In-session queue notice: a durable synthetic message, queued (never a
-     *  preemption) and without scheduling a run. Best-effort and unawaited so
-     *  a slow or failing notice can never delay or break the gate. */
-    async function notify(sid: string, kind: "wait" | "grant", text: string): Promise<void> {
-      if (config.notify === "off") return
-      if (kind === "grant" && config.notify !== "all") return
-      if (kind === "wait" && config.notifyEveryMs > 0) {
-        const at = Date.now()
-        const last = notifiedAt.get(sid)
-        if (last !== undefined && at - last < config.notifyEveryMs) return
-        notifiedAt.set(sid, at)
-      }
-      if (typeof ctx?.session?.synthetic !== "function") return
-      try {
-        await ctx.session.synthetic({
-          sessionID: sid,
-          text,
-          delivery: "queue",
-          resume: false,
-          metadata: { plugin: "turn-lock", kind },
-        })
-        log("debug", `notice ${sid}: ${kind}`)
-      } catch (error) {
-        log("debug", `notice ${sid} failed: ${String(error)}`)
-      }
-    }
 
     // Provider locality, cached until config/provider updates.
     const localCache = new Map<string, boolean>()
@@ -510,27 +577,38 @@ export default Plugin.define({
     // The gate itself. `context` runs for the agent loop only (including
     // tool-driven continuations); title/summary/compaction/generate are other
     // hooks and are never delayed by this plugin.
-    await ctx.session.hook("context", async (event: { sessionID?: string; model?: { providerID?: string } }) => {
-      const sid = event?.sessionID
-      if (!sid) return
-      if (!(await isLocalProvider(event?.model?.providerID))) return
+    await ctx.session.hook(
+      "context",
+      async (event: { sessionID?: string; model?: { providerID?: string }; messages?: unknown[] }) => {
+        const sid = event?.sessionID
+        if (!sid) return
+        // Defence in depth: a "turn-lock" notice posted by an older version may
+        // still be sitting in this session's inbox. It is UI noise, not input —
+        // never let the model answer it.
+        if (Array.isArray(event.messages)) {
+          for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+            if (isTurnLockNotice(event.messages[index])) event.messages.splice(index, 1)
+          }
+        }
+        if (!(await isLocalProvider(event?.model?.providerID))) return
 
-      const gate = await resolveGate(sid)
-      if (gate.kind !== "root") {
-        // A subagent: covered by the parent's slot (keep it fresh) or exempt
-        // because the parent run is not gated at all.
-        if (gate.kind === "covered") lock.refresh(gate.root)
-        log("info", `subagent ${sid}: ${gate.kind} by ${gate.root}`)
-        return
-      }
+        const gate = await resolveGate(sid)
+        if (gate.kind !== "root") {
+          // A subagent: covered by the parent's slot (keep it fresh) or exempt
+          // because the parent run is not gated at all.
+          if (gate.kind === "covered") lock.refresh(gate.root)
+          log("info", `subagent ${sid}: ${gate.kind} by ${gate.root}`)
+          return
+        }
 
-      const result = await lock.acquire(sid)
-      if (!result.granted) {
-        log("debug", `skip ${sid}: ${result.reason ?? "not granted"}`)
-        return
-      }
-      held.add(sid)
-    })
+        const result = await lock.acquire(sid)
+        if (!result.granted) {
+          log("debug", `skip ${sid}: ${result.reason ?? "not granted"}`)
+          return
+        }
+        held.add(sid)
+      },
+    )
 
     const controller = new AbortController()
     void (async () => {
@@ -547,6 +625,9 @@ export default Plugin.define({
           if (!sid) continue
           held.delete(sid)
           lock.release(sid, type)
+          // A queued session has no lease, so a terminal event for it (deleted,
+          // inbox cancelled) releases nothing — still drop its title mark.
+          void unmarkWaiting(sid, type)
         }
       } catch {
         // the stream closed: the plugin is being unloaded
@@ -568,11 +649,15 @@ export default Plugin.define({
       ;(heartbeat as { unref: () => void }).unref()
     }
 
+    const restored = await restoreStaleMarks()
+
     log(
       "info",
       `ready: src=${SOURCE} limit=${config.limit} local=${config.localProviders.join(",")} timeout=${Math.round(
         config.acquireTimeoutMs / 60_000,
-      )}min onTimeout=${config.onTimeout} notify=${config.notify} dir=${config.dir} pruned=${pruned.length}`,
+      )}min onTimeout=${config.onTimeout} mark=${config.markWaitingTitle} dir=${config.dir} pruned=${
+        pruned.length
+      } restored=${restored}`,
     )
 
     return async () => {
@@ -581,6 +666,7 @@ export default Plugin.define({
       if (heartbeat) clearInterval(heartbeat)
       for (const sid of held) lock.release(sid, "unload")
       held.clear()
+      for (const sid of [...marked]) await unmarkWaiting(sid, "unload")
       log("info", "unloaded")
     }
   },

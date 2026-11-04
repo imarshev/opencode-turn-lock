@@ -11,8 +11,7 @@
   "sweepMs": 60000,
   "releaseOnForm": true,
   "releaseOnPermission": true,
-  "notify": "wait",
-  "notifyEveryMs": 30000,
   "remindEveryMs": 300000,
+  "markWaitingTitle": true,
   "logLevel": "info"
 }

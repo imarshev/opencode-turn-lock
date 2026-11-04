@@ -91,14 +91,19 @@ const PROVIDERS: Record<string, unknown> = {
   polzaai: { id: "polzaai", name: "Polza", activation: "enabled", package: "x", settings: { baseURL: "https://polza.ai/api/v1" } },
 }
 
-function makeCtx(
-  options: Record<string, unknown>,
-  behavior: { failSynthetic?: boolean; parents?: Record<string, string> } = {},
-) {
+type Behavior = {
+  failUpdate?: boolean
+  parents?: Record<string, string>
+  titles?: Record<string, string>
+}
+
+function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
   const hooks: Hook[] = []
   const bus = makeEventBus()
-  const notices: Array<Record<string, unknown>> = []
+  const updates: Array<{ sessionID: string; title: string }> = []
   const parents = behavior.parents ?? {}
+  const titles = new Map<string, string>(Object.entries(behavior.titles ?? {}))
+  const titleOf = (sessionID: string) => titles.get(sessionID) ?? "test session"
   const ctx = {
     app: { version: "test" },
     location: { directory: "C:/work" },
@@ -114,13 +119,13 @@ function makeCtx(
           },
         }
       },
-      synthetic: async (input: Record<string, unknown>) => {
-        if (behavior.failSynthetic) throw new Error("session is busy")
-        notices.push(input)
-        return { id: "msg_test", ...input }
-      },
       get: async ({ sessionID }: { sessionID: string }) => {
-        return { id: sessionID, parentID: parents[sessionID] }
+        return { id: sessionID, parentID: parents[sessionID], title: titleOf(sessionID) }
+      },
+      update: async ({ sessionID, title }: { sessionID: string; title: string }) => {
+        if (behavior.failUpdate) throw new Error("session update failed")
+        titles.set(sessionID, title)
+        updates.push({ sessionID, title })
       },
     },
     provider: {
@@ -132,18 +137,15 @@ function makeCtx(
     },
     event: { subscribe: bus.subscribe },
   }
-  return { ctx, hooks, bus, notices }
+  return { ctx, hooks, bus, titles, updates }
 }
 
 type Harness = Awaited<ReturnType<typeof setup>>
 
-async function setup(
-  overrides: Record<string, unknown> = {},
-  behavior: { failSynthetic?: boolean; parents?: Record<string, string> } = {},
-) {
+async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior = {}) {
   const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
   const logFile = join(dir, "turn-lock.log")
-  const { ctx, hooks, bus, notices } = makeCtx(
+  const { ctx, hooks, bus, titles, updates } = makeCtx(
     {
       dir,
       logFile,
@@ -162,12 +164,21 @@ async function setup(
     logFile,
     hooks,
     bus,
-    notices,
+    titles,
+    updates,
     cleanup,
-    async context(sessionID: string, providerID = "strata") {
+    async context(sessionID: string, providerID = "strata", messages: unknown[] = []) {
       const hook = hooks.find((candidate) => candidate.name === "context")
       if (!hook) throw new Error("plugin did not register the context hook")
-      await hook.callback({ sessionID, model: { providerID }, agent: "build", system: [], messages: [], options: {}, tools: {} })
+      await hook.callback({
+        sessionID,
+        model: { providerID },
+        agent: "build",
+        system: [],
+        messages,
+        options: {},
+        tools: {},
+      })
     },
     async events() {
       // give the subscription loop a chance to start before the first emit
@@ -405,8 +416,8 @@ test("releaseOnForm/releaseOnPermission can be turned off", async () => {
   }
 })
 
-test("a queued request posts an in-session notice (synthetic, queued, no new run)", async () => {
-  const harness = await setup()
+test("a queued session is marked in the session list and unmarked on grant", async () => {
+  const harness = await setup({}, { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } })
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
@@ -415,63 +426,33 @@ test("a queued request posts an in-session notice (synthetic, queued, no new run
     const third = harness.context("ses_3").then(() => {
       thirdDone = true
     })
-    await wait(120)
+    await until(() => harness.titles.get("ses_3") === "⏳ three", "waiting mark")
 
-    const notices = harness.notices.filter((notice) => notice.sessionID === "ses_3")
-    assert.equal(notices.length, 1, "exactly one queue notice per blocked call")
-    const notice = notices[0] as Record<string, any>
-    assert.equal(notice.delivery, "queue", "must not preempt the running step")
-    assert.equal(notice.resume, false, "must not schedule another run")
-    assert.equal(notice.metadata?.kind, "wait")
-    assert.match(notice.text, /в очереди/)
-    assert.match(notice.text, /2 из 2/)
+    assert.equal(thirdDone, false, "still queued")
+    assert.equal(harness.titles.get("ses_1"), "one", "running sessions keep their title")
+    assert.equal(harness.titles.get("ses_2"), "two")
 
     harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
     await third
-    assert.equal(thirdDone, true)
-    assert.equal(
-      harness.notices.filter((notice) => notice.sessionID === "ses_3").length,
-      1,
-      "no extra notice on grant when notify=wait",
-    )
+    await until(() => harness.titles.get("ses_3") === "three", "title restored")
   } finally {
     await harness.teardown()
   }
 })
 
-test("notify=all also reports the granted slot", async () => {
-  const harness = await setup({ notify: "all" })
-  try {
-    await harness.context("ses_1")
-    await harness.context("ses_2")
-    const third = harness.context("ses_3")
-    await wait(120)
-
-    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
-    await third
-    await until(
-      () => harness.notices.some((notice) => (notice.metadata as { kind?: string })?.kind === "grant"),
-      "grant notice",
-    )
-    const grant = harness.notices.find((notice) => (notice.metadata as { kind?: string })?.kind === "grant") as Record<string, any>
-    assert.match(grant.text, /слот получен/)
-    assert.equal(grant.resume, false)
-  } finally {
-    await harness.teardown()
-  }
-})
-
-test("reminders repeat the queue notice for a long wait", async () => {
-  const harness = await setup({ remindEveryMs: 80, notifyEveryMs: 0 })
+test("only one mark is written while a session keeps waiting", async () => {
+  const harness = await setup({ remindEveryMs: 60 }, { titles: { ses_3: "three" } })
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
     const third = harness.context("ses_3")
     await wait(400)
 
-    const notices = harness.notices.filter((notice) => notice.sessionID === "ses_3")
-    assert.ok(notices.length >= 2, `expected reminders, got ${notices.length}`)
-    assert.match((notices.at(-1) as Record<string, any>).text, /всё ещё в очереди/)
+    assert.equal(
+      harness.updates.filter((update) => update.sessionID === "ses_3" && update.title === "⏳ three").length,
+      1,
+      "reminders refresh the wait, not the title",
+    )
 
     harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
     await third
@@ -480,35 +461,101 @@ test("reminders repeat the queue notice for a long wait", async () => {
   }
 })
 
-test("notify=off and a failing notification never break the gate", async () => {
-  const quiet = await setup({ notify: "off" })
+test("a title regenerated while waiting is marked again", async () => {
+  const harness = await setup({ remindEveryMs: 60 }, { titles: { ses_3: "three" } })
   try {
-    await quiet.context("ses_1")
-    await quiet.context("ses_2")
-    const third = quiet.context("ses_3")
-    await wait(100)
-    quiet.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
-    await third
-    assert.equal(quiet.notices.length, 0, "notify=off posts nothing")
-  } finally {
-    await quiet.teardown()
-  }
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+    const third = harness.context("ses_3")
+    await until(() => harness.titles.get("ses_3") === "⏳ three", "first mark")
 
-  const broken = await setup({}, { failSynthetic: true })
+    // The server generates a session title after the first message and replaces
+    // the one we just marked; the next reminder tick must restore the prefix.
+    harness.titles.set("ses_3", "generated title")
+    await until(() => harness.titles.get("ses_3") === "⏳ generated title", "re-mark")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await third
+    await until(() => harness.titles.get("ses_3") === "generated title", "restored after grant")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("markWaitingTitle=false leaves titles alone", async () => {
+  const harness = await setup({ markWaitingTitle: false }, { titles: { ses_3: "three" } })
   try {
-    await broken.context("ses_1")
-    await broken.context("ses_2")
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+    const third = harness.context("ses_3")
+    await wait(150)
+    assert.equal(harness.titles.get("ses_3"), "three")
+    assert.equal(harness.updates.length, 0)
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await third
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a failing title update never breaks the gate", async () => {
+  const harness = await setup({}, { failUpdate: true })
+  try {
+    await harness.context("ses_1")
+    await harness.context("ses_2")
     let thirdDone = false
-    const third = broken.context("ses_3").then(() => {
+    const third = harness.context("ses_3").then(() => {
       thirdDone = true
     })
     await wait(120)
     assert.equal(thirdDone, false)
-    broken.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
     await third
-    assert.equal(thirdDone, true, "a failed notice must not block the queue")
+    assert.equal(thirdDone, true, "the queue does not depend on the title")
   } finally {
-    await broken.teardown()
+    await harness.teardown()
+  }
+})
+
+test("boot restores a mark left by a dead process", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "turn-lock-mark-"))
+  try {
+    writeFileSync(
+      join(dir, "ses_ghost.wait.json"),
+      JSON.stringify({ sid: "ses_ghost", pid: 999_999, owner: "C:/work", markedAt: Date.now() }),
+      "utf8",
+    )
+    const harness = await setup({ dir, logFile: join(dir, "log.txt") }, { titles: { ses_ghost: "⏳ old title" } })
+    try {
+      assert.equal(harness.titles.get("ses_ghost"), "old title", "the marker is removed on boot")
+    } finally {
+      await harness.teardown()
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("turn-lock notices from an older version never reach the model", async () => {
+  const harness = await setup({ limit: 1 })
+  try {
+    const messages = [
+      { type: "user", text: "do the thing" },
+      { type: "assistant", text: "ok" },
+      { type: "synthetic", metadata: { plugin: "turn-lock", kind: "wait" }, text: "⏳ turn-lock: в очереди" },
+      { type: "synthetic", text: "⏳ turn-lock: всё ещё в очереди (5 мин)" },
+      { type: "synthetic", text: "<shell>output</shell>" },
+    ]
+    await harness.context("ses_1", "strata", messages)
+    assert.deepEqual(
+      messages.map((message) => (message as { type: string }).type),
+      ["user", "assistant", "synthetic"],
+      "only unrelated synthetic entries survive",
+    )
+  } finally {
+    await harness.teardown()
   }
 })
 
@@ -577,7 +624,7 @@ test("a covered subagent cannot starve an unrelated third session", async () => 
 test("default timeout is 4 hours (long-running goals stay serialised)", () => {
   assert.equal(mod.DEFAULTS.acquireTimeoutMs, 4 * 60 * 60_000)
   assert.equal(mod.DEFAULTS.onTimeout, "proceed")
-  assert.equal(mod.DEFAULTS.notify, "wait")
+  assert.equal(mod.DEFAULTS.markWaitingTitle, true)
 })
 
 test("helper predicates: baseURL classification and event session ids", () => {

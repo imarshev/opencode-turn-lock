@@ -101,7 +101,16 @@ git clone https://github.com/imarshev/opencode-turn-lock F:\Development\opencode
 }
 ```
 
-Локальный плагин-каталог OpenCode грузит через `package.json` → `exports` (`./src/index.ts`), собирать ничего не нужно. После изменения списка плагинов — `opencode reload` или перезапуск сервиса.
+Локальный плагин-каталог OpenCode грузит через `package.json` → `exports` (`./src/index.ts`), собирать ничего не нужно. Список плагинов читается **при старте сервиса**, поэтому после правки `opencode.json` нужен `opencode service restart` — обычного «reload» нет.
+
+Если рестарт сейчас неудобен, есть путь без него: положить в `~/.config/opencode/plugins/` файл-шим (этот каталог OpenCode перечитывает на лету):
+
+```ts
+// ~/.config/opencode/plugins/turn-lock.ts
+export { default } from "file:///F:/Development/opencode-turn-lock/src/index.ts"
+```
+
+Код в этом случае исполняется из проекта (`ready:` в логе покажет `src=…\opencode-turn-lock\src\index.ts`), а сам шим — три строки, которые нечему расходиться с проектом. Оба способа одновременно не нужны: шим + запись в `plugins[]` дадут два экземпляра плагина.
 
 Опции можно задать прямо здесь:
 

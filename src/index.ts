@@ -54,11 +54,23 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { Plugin } from "@opencode/plugin"
 
 import { createTurnLock, type ChangeEvent } from "./core.ts"
 import { fileStore, processAlive } from "./store-file.ts"
+
+// Which copy of the plugin is running. A loose file in ~/.config/opencode/plugins
+// and a package install of this project both load code that looks identical, so
+// the `ready:` log line names its own source.
+const SOURCE = (() => {
+  try {
+    return fileURLToPath(import.meta.url)
+  } catch {
+    return "unknown"
+  }
+})()
 
 export type TurnLockConfig = {
   enabled: boolean
@@ -558,7 +570,7 @@ export default Plugin.define({
 
     log(
       "info",
-      `ready: limit=${config.limit} local=${config.localProviders.join(",")} timeout=${Math.round(
+      `ready: src=${SOURCE} limit=${config.limit} local=${config.localProviders.join(",")} timeout=${Math.round(
         config.acquireTimeoutMs / 60_000,
       )}min onTimeout=${config.onTimeout} notify=${config.notify} dir=${config.dir} pruned=${pruned.length}`,
     )

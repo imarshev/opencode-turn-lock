@@ -121,7 +121,7 @@ git clone https://github.com/imarshev/opencode-turn-lock F:\Development\opencode
 Плагин пишет лог в `%TEMP%/opencode/turn-lock.log`:
 
 ```
-INFO ready: limit=2 local=strata timeout=240min onTimeout=proceed notify=wait dir=... pruned=0
+INFO ready: src=F:\Development\opencode-turn-lock\src\index.ts limit=2 local=strata timeout=240min onTimeout=proceed notify=wait dir=... pruned=0
 INFO wait ses_…: 2/2 local sessions are busy
 INFO grant ses_… after 35s wait (held 1/2)
 INFO subagent ses_…: exempt by ses_…      ← сабагент облачной сессии не ждал

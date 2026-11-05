@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.2.2
+// @version      0.2.3
 // @description  Пилюля приоритета для opencode-turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
@@ -184,7 +184,7 @@
 
   const BASE =
     "pointer-events:none;max-width:calc(100vw - 32px);font:13px/1.2 system-ui,-apple-system,'Segoe UI',sans-serif"
-  const INLINE_CSS = `${BASE};display:flex;align-items:center;flex:0 0 auto`
+  const INLINE_CSS = `${BASE};display:flex;align-items:center;flex:0 1 auto;min-width:0`
   const FIXED_CSS = `${BASE};position:fixed;right:16px;bottom:96px;z-index:2147483000`
 
   const paint = () => {
@@ -205,7 +205,7 @@
         button {
           pointer-events:auto;
           display:inline-flex; align-items:center; gap:6px;
-          height:32px; max-width:100%;
+          height:32px; max-width:100%; min-width:0;
           box-sizing:border-box;
           padding:0 10px;
           border-radius:8px;
@@ -227,7 +227,8 @@
           background: color-mix(in oklab, #f5a524 20%, Canvas);
         }
         button[data-state="error"] { border-color:#e5484d; color:#e5484d }
-        .mark { font-size:14px; line-height:1 }
+        .mark { font-size:14px; line-height:1; flex:0 0 auto }
+        .text { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
       </style>
       <button type="button" data-on="false" title="">
         <span class="mark" aria-hidden="true">↑</span><span class="text"></span>

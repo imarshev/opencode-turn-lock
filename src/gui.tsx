@@ -63,12 +63,32 @@ export default Plugin.define({
     const checked = new Set<string>()
     const loaded = new Set<string>()
 
+    // A subagent session has no priority of its own: the scheduler judges it by
+    // its parent's verdict, so a `/prio` typed here would write a flag nothing
+    // reads. Such sessions get no pill; the parent session's pill is the only
+    // control. `probed` keeps the pill from appearing before the session is
+    // classified.
+    const [child, setChild] = createSignal(new Set<string>())
+    const [probed, setProbed] = createSignal(new Set<string>())
+
+    const probe = (key: string, isChild: boolean) =>
+      setChild((current) => {
+        if (current.has(key) === isChild) return current
+        const next = new Set(current)
+        if (isChild) next.add(key)
+        else next.delete(key)
+        return next
+      })
+
     const read = async (session: MountedSession) => {
       try {
         const info = await ctx.client.session.get({ sessionID: session.id })
         remember(session.key, String(info?.title ?? "").startsWith(MARK))
+        probe(session.key, Boolean((info as { parentID?: string } | undefined)?.parentID))
       } catch {
         // keep the last known state: the server may be restarting
+      } finally {
+        setProbed((current) => (current.has(session.key) ? current : new Set(current).add(session.key)))
       }
     }
 
@@ -136,6 +156,8 @@ export default Plugin.define({
           void read(session)
         }
         if (!ready().has(session.directory)) return undefined
+        if (!probed().has(session.key)) return undefined
+        if (child().has(session.key)) return undefined
         const on = state().get(session.key) ?? false
         return {
           label: ctx.t(on ? "priority" : "ordinary"),

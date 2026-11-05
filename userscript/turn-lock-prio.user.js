@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.2.3
+// @version      0.2.4
 // @description  Пилюля приоритета для opencode-turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
@@ -137,6 +137,9 @@
     return {
       on: String(info && info.title ? info.title : "").startsWith(MARK),
       directory: info && info.location ? info.location.directory : undefined,
+      // A subagent session is judged by its parent's verdict, not its own: a
+      // `/prio` there would write a flag the scheduler never reads.
+      parent: Boolean(info && info.parentID),
     }
   }
 
@@ -297,7 +300,7 @@
 
   // --------------------------------------------------------------------- loop
 
-  const state = { id: null, on: false, busy: false, error: false, missing: false }
+  const state = { id: null, on: false, busy: false, error: false, missing: false, parent: false }
   let lastRead = 0
   let reading = false
 
@@ -307,10 +310,6 @@
       hide()
       return
     }
-    mount()
-    if (!host) return
-    attach()
-    show()
     if (reading) return
     if (!force && Date.now() - lastRead < 2000) return
     reading = true
@@ -318,6 +317,7 @@
       const info = await readSession(id)
       state.id = id
       state.on = info.on
+      state.parent = info.parent
       state.error = false
       state.missing = false
       try {
@@ -325,8 +325,15 @@
       } catch {
         state.missing = false // an unreachable command list hides nothing
       }
-      if (state.missing) hide()
-      else show()
+      // Subagent sessions inherit the parent's verdict, so there is nothing to
+      // switch here; the parent session's pill is the only control.
+      if (state.parent || state.missing) {
+        hide()
+      } else {
+        mount()
+        attach()
+        show()
+      }
       render(state)
       lastRead = Date.now()
     } catch {
@@ -334,6 +341,7 @@
       if (state.id !== id) {
         state.id = id
         state.on = false
+        state.parent = false
         render(state)
       }
     } finally {

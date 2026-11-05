@@ -447,10 +447,12 @@ export default Plugin.define({
     const canEditTitle = (): boolean =>
       typeof ctx?.session?.get === "function" && typeof ctx?.session?.update === "function"
 
-    const readWaitMark = (sid: string): { pid?: number; owner?: string; since?: number } | undefined => {
+    const readWaitMark = (sid: string): { pid?: number; owner?: string; since?: number; markedAt?: number } | undefined => {
       try {
         const value = JSON.parse(readFileSync(waitPath(sid), "utf8"))
-        return value && typeof value === "object" ? (value as { pid?: number; owner?: string; since?: number }) : undefined
+        return value && typeof value === "object"
+          ? (value as { pid?: number; owner?: string; since?: number; markedAt?: number })
+          : undefined
       } catch {
         return undefined
       }

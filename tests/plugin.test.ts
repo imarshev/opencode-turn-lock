@@ -172,7 +172,11 @@ async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior
     },
     behavior,
   )
-  const cleanup = await plugin.setup(ctx)
+  const returned = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0])
+  // `setup` may return nothing (a disabled plugin), so the cleanup is optional
+  const cleanup = async () => {
+    if (typeof returned === "function") await returned()
+  }
   const harness = {
     dir,
     logFile,

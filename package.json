@@ -4,16 +4,28 @@
   "description": "OpenCode V2 plugin that keeps at most N local agent sessions on the model engine, queues the rest per turn, and marks a waiting session with a ⏳ title prefix.",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs"
   },
   "files": [
     "src",
+    "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --test \"tests/*.test.ts\"",
-    "test:watch": "node --test --watch \"tests/*.test.ts\""
+    "test:watch": "node --test --watch \"tests/*.test.ts\"",
+    "build": "vite build",
+    "check": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.2.5",
+    "@types/node": "^24.19.2",
+    "solid-js": "^1.9.18",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.7",
+    "vite-plugin-solid": "^2.11.15"
   },
   "engines": {
     "node": ">=22.18.0"

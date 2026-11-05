@@ -32,7 +32,15 @@ export interface LeaseStore {
 
 export type ChangeEvent =
   | { type: "grant"; sid: string; waited: boolean; waitedMs: number; overLimit: boolean; held: number; limit: number }
-  | { type: "wait"; sid: string; held: number; limit: number; waitedMs: number }
+  | {
+      type: "wait"
+      sid: string
+      held: number
+      limit: number
+      waitedMs: number
+      /** A slot was free but reserved: `holdBack` kept this session waiting. */
+      blocked?: "priority"
+    }
   | { type: "release"; sid: string; reason: string; held: number }
   | { type: "cancel"; sid: string; reason: string }
   | { type: "stale"; sid: string; ageMs: number }
@@ -61,6 +69,11 @@ export type TurnLockOptions = {
   onChange?: (event: ChangeEvent) => void
   /** How long a cancelled wait stays flagged, so the polling loop can see it. */
   cancelTtlMs?: number
+  /** Reserve a free slot for someone else: return true to keep `sid` waiting
+   *  even though `live < limit`. Used for priority — an ordinary session holds
+   *  back while a priority session queues. A holder is never affected: the
+   *  check runs only where a slot would newly be taken. */
+  holdBack?: (sid: string) => boolean
 }
 
 export type TurnLock = {
@@ -85,6 +98,7 @@ export function createTurnLock(options: TurnLockOptions): TurnLock {
   const now = options.now ?? (() => Date.now())
   const sleep = options.sleep ?? defaultSleep
   const onChange = options.onChange ?? (() => {})
+  const holdBack = options.holdBack
   const cancelTtlMs = Math.max(pollMs * 2, options.cancelTtlMs ?? 5_000)
 
   const cancelled = new Map<string, number>() // sid -> expiresAt
@@ -128,9 +142,11 @@ export function createTurnLock(options: TurnLockOptions): TurnLock {
   // it is atomic. Across processes two writers can still race; the post-write
   // verification keeps the limit honest: the loser removes its own lease and
   // keeps waiting.
-  const tryTake = (sid: string, at: number): "taken" | "full" => {
+  const tryTake = (sid: string, at: number): "taken" | "full" | "priority" => {
     const mine = store.read(sid)
     if (mine) return "taken"
+    // A free slot is not necessarily an available one: priority waiters get it.
+    if (holdBack?.(sid)) return "priority"
     const live = freshLeases(at)
     if (live.length >= limit) return "full"
     const lease: Lease = {
@@ -172,12 +188,14 @@ export function createTurnLock(options: TurnLockOptions): TurnLock {
         return { granted: true, waited, overLimit: mine.over === true }
       }
       const held = freshLeases(at).length
-      if (tryTake(sid, at) === "taken") {
+      const taken = tryTake(sid, at)
+      if (taken === "taken") {
         if (waited) {
           emit({ type: "grant", sid, waited: true, waitedMs: at - started, overLimit: false, held: held + 1, limit })
         }
         return { granted: true, waited, overLimit: false }
       }
+      const blocked = taken === "priority" ? ("priority" as const) : undefined
       const waitedMs = at - started
       if (onTimeout === "proceed" && waitedMs >= acquireTimeoutMs) {
         store.write({ sid, since: at + Math.random(), seen: at, over: true, pid: options.pid, owner: options.owner })
@@ -188,10 +206,10 @@ export function createTurnLock(options: TurnLockOptions): TurnLock {
       if (!waited) {
         waited = true
         lastWaitAt = at
-        emit({ type: "wait", sid, held, limit, waitedMs: 0 })
+        emit({ type: "wait", sid, held, limit, waitedMs: 0, blocked })
       } else if (remindEveryMs > 0 && at - lastWaitAt >= remindEveryMs) {
         lastWaitAt = at
-        emit({ type: "wait", sid, held, limit, waitedMs })
+        emit({ type: "wait", sid, held, limit, waitedMs, blocked })
       }
       await sleep(pollMs)
     }

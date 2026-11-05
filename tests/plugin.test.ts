@@ -4,7 +4,7 @@
 // module.registerHooks; everything else (hook gating, event releases, shared
 // file store, boot cleanup, timeout) is the real code.
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { registerHooks } from "node:module"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -104,6 +104,7 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
   const parents = behavior.parents ?? {}
   const titles = new Map<string, string>(Object.entries(behavior.titles ?? {}))
   const titleOf = (sessionID: string) => titles.get(sessionID) ?? "test session"
+  const commands: Array<{ name: string; description?: string; execute: (input: unknown) => Promise<void> }> = []
   const ctx = {
     app: { version: "test" },
     location: { directory: "C:/work" },
@@ -135,9 +136,22 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
         return info
       },
     },
+    command: {
+      transform: async (callback: (editor: { add: (command: (typeof commands)[number]) => void }) => void) => {
+        callback({
+          add: (command) => {
+            const index = commands.findIndex((candidate) => candidate.name === command.name)
+            if (index >= 0) commands.splice(index, 1, command)
+            else commands.push(command)
+          },
+        })
+        return { dispose: async () => {} }
+      },
+      list: async () => commands,
+    },
     event: { subscribe: bus.subscribe },
   }
-  return { ctx, hooks, bus, titles, updates }
+  return { ctx, hooks, bus, titles, updates, commands }
 }
 
 type Harness = Awaited<ReturnType<typeof setup>>
@@ -145,7 +159,7 @@ type Harness = Awaited<ReturnType<typeof setup>>
 async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior = {}) {
   const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
   const logFile = join(dir, "turn-lock.log")
-  const { ctx, hooks, bus, titles, updates } = makeCtx(
+  const { ctx, hooks, bus, titles, updates, commands } = makeCtx(
     {
       dir,
       logFile,
@@ -166,7 +180,23 @@ async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior
     bus,
     titles,
     updates,
+    commands,
     cleanup,
+    /** Runs a plugin-registered slash command the way the server does: the
+     *  callback runs immediately, with the session it was typed in. */
+    async command(sessionID: string, name = "prio", text = "") {
+      const definition = commands.find((candidate) => candidate.name === name)
+      if (!definition) throw new Error(`plugin did not register /${name}`)
+      await definition.execute({ sessionID, prompt: { text }, delivery: "steer" })
+    },
+    prioFiles() {
+      return readdirSync(dir)
+        .filter((name) => name.endsWith(".prio.json"))
+        .map((name) => name.slice(0, -".prio.json".length))
+    },
+    logText() {
+      return readFileSync(logFile, "utf8")
+    },
     async context(sessionID: string, providerID = "strata", messages: unknown[] = []) {
       const hook = hooks.find((candidate) => candidate.name === "context")
       if (!hook) throw new Error("plugin did not register the context hook")
@@ -653,6 +683,167 @@ test("a covered subagent cannot starve an unrelated third session", async () => 
 
     harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_other" } })
     await third
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("priority mark composes with the waiting prefix", () => {
+  assert.equal(mod.withPriorityMark("do it"), "⚡ do it")
+  assert.equal(mod.withPriorityMark("⚡ do it"), "⚡ do it")
+  assert.equal(mod.withoutPriorityMark("⚡ ⏳ 3m · do it"), "⏳ 3m · do it")
+  assert.equal(mod.withoutPriorityMark("do it"), "do it")
+  assert.equal(mod.hasPriorityMark("⚡ ⏳ do it"), true)
+  assert.equal(mod.hasPriorityMark("⏳ do it"), false)
+
+  assert.equal(mod.withWaitPrefix("⚡ do it", 3 * 60_000, { position: 1, total: 2 }), "⚡ ⏳ 1/2 · 3m · do it")
+  assert.equal(mod.withWaitPrefix("do it", 3 * 60_000, { position: 2, total: 2 }, false), "⏳ 2/2 · 3m · do it")
+  assert.equal(mod.withWaitPrefix("⚡ ⏳ 4m · do it", 5 * 60_000, undefined, false), "⏳ 5m · do it")
+  assert.equal(mod.withWaitPrefix("⚡ ⏳ 4m · do it", 5 * 60_000), "⚡ ⏳ 5m · do it")
+
+  assert.equal(mod.stripWaitPrefix("⚡ ⏳ 2/3 · 1h5m · do it"), "⚡ do it")
+  assert.equal(mod.stripWaitPrefix("⚡ do it"), "⚡ do it")
+  assert.equal(mod.stripWaitPrefix("⏳ 2/3 · 3m · do it"), "do it")
+})
+
+test("/prio marks the session and writes the flag; a second call clears both", async () => {
+  const harness = await setup({}, { titles: { ses_1: "one" } })
+  try {
+    await harness.context("ses_1")
+    assert.equal(harness.titles.get("ses_1"), "one", "an ordinary session keeps its title")
+
+    await harness.command("ses_1", "prio")
+    assert.equal(harness.titles.get("ses_1"), "⚡ one")
+    assert.deepEqual(harness.prioFiles(), ["ses_1"])
+
+    await harness.command("ses_1", "prio") // no argument toggles
+    assert.equal(harness.titles.get("ses_1"), "one")
+    assert.deepEqual(harness.prioFiles(), [])
+
+    await harness.command("ses_1", "prio", "on")
+    assert.equal(harness.titles.get("ses_1"), "⚡ one")
+    await harness.command("ses_1", "prio", "off")
+    assert.equal(harness.titles.get("ses_1"), "one")
+    assert.deepEqual(harness.prioFiles(), [])
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a priority waiter takes the next free slot ahead of an older ordinary waiter", async () => {
+  const harness = await setup({}, { titles: { ses_3: "three", ses_4: "four" } })
+  try {
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+
+    let thirdDone = false
+    let fourthDone = false
+    const third = harness.context("ses_3").then(() => {
+      thirdDone = true
+    })
+    await until(() => harness.titles.get("ses_3") === "⏳ three", "older waiter marked")
+    const fourth = harness.context("ses_4").then(() => {
+      fourthDone = true
+    })
+    await until(() => harness.titles.get("ses_4") === "⏳ 2/2 · four", "newer waiter marked")
+
+    await harness.command("ses_4", "prio", "on")
+    assert.equal(harness.titles.get("ses_4"), "⚡ ⏳ 1/2 · four", "the priority session is first in the queue")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await until(() => fourthDone, "the priority session got the freed slot")
+    await wait(150)
+    assert.equal(thirdDone, false, "an ordinary waiter holds back while a priority session queues")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+    await Promise.all([third, fourth])
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("an active session yields its slot at the next step, without breaking the running one", async () => {
+  const harness = await setup({}, { titles: { ses_1: "one", ses_3: "three" } })
+  try {
+    await harness.context("ses_1") // one step done, the slot is held
+    await harness.context("ses_2")
+
+    let thirdDone = false
+    const third = harness.context("ses_3").then(() => {
+      thirdDone = true
+    })
+    await until(() => harness.titles.get("ses_3") === "⏳ three", "waiter marked")
+
+    await harness.command("ses_3", "prio", "on")
+    assert.equal(thirdDone, false, "priority does not interrupt the session that is already running")
+
+    // ses_1's next step boundary: it gives the slot up and queues again.
+    let firstDone = false
+    const first = harness.context("ses_1").then(() => {
+      firstDone = true
+    })
+    await until(() => thirdDone, "the priority session starts after one step")
+    await wait(150)
+    assert.equal(firstDone, false, "the preempted session waits for a slot again")
+    assert.match(harness.logText(), /yield ses_1: ses_3 has priority/)
+
+    // It resumes on its own: the other holder ends its turn, nothing priority waits.
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+    await first
+    assert.equal(harness.titles.get("ses_1"), "one", "the queue mark comes off when the slot is back")
+    await third
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("priority off leaves nobody holding a slot back", async () => {
+  const harness = await setup({}, { titles: { ses_3: "three" } })
+  try {
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+    let thirdDone = false
+    const third = harness.context("ses_3").then(() => {
+      thirdDone = true
+    })
+    await until(() => harness.titles.get("ses_3") === "⏳ three", "waiter marked")
+
+    await harness.command("ses_3", "prio", "on")
+    await harness.command("ses_3", "prio", "off")
+    assert.equal(harness.titles.get("ses_3"), "⏳ three", "the ⚡ mark is gone")
+    assert.deepEqual(harness.prioFiles(), [])
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await third
+    assert.match(harness.titles.get("ses_3") ?? "", /^three$/)
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("the command argument survives both shapes a client may send", () => {
+  assert.equal(mod.parsePriorityArgument("", "prio"), "toggle")
+  assert.equal(mod.parsePriorityArgument("  ", "prio"), "toggle")
+  assert.equal(mod.parsePriorityArgument("on", "prio"), "on")
+  assert.equal(mod.parsePriorityArgument("OFF", "prio"), "off")
+  assert.equal(mod.parsePriorityArgument("remove", "prio"), "off")
+  assert.equal(mod.parsePriorityArgument("anything else", "prio"), "toggle")
+  // a client that hands over the whole line instead of only the arguments
+  assert.equal(mod.parsePriorityArgument("/prio", "prio"), "toggle")
+  assert.equal(mod.parsePriorityArgument("prio", "prio"), "toggle")
+  assert.equal(mod.parsePriorityArgument("/prio off", "prio"), "off")
+  assert.equal(mod.parsePriorityArgument("  /PRIO on ", "prio"), "on")
+})
+
+test("/prio with the command name still in the text turns priority off", async () => {
+  const harness = await setup({}, { titles: { ses_1: "one" } })
+  try {
+    await harness.context("ses_1")
+    await harness.command("ses_1", "prio", "on")
+    assert.equal(harness.titles.get("ses_1"), "⚡ one")
+    await harness.command("ses_1", "prio", "/prio off")
+    assert.equal(harness.titles.get("ses_1"), "one", "the whole line is parsed, not treated as a toggle")
+    assert.deepEqual(harness.prioFiles(), [])
   } finally {
     await harness.teardown()
   }

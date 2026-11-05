@@ -13,5 +13,8 @@
   "releaseOnPermission": true,
   "remindEveryMs": 60000,
   "markWaitingTitle": true,
+  "priorityEnabled": true,
+  "priorityCommand": "prio",
+  "priorityTtlMs": 86400000,
   "logLevel": "info"
 }

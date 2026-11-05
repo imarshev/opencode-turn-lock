@@ -12,6 +12,8 @@
 // @grant        none
 // @run-at       document-start
 // @noframes
+// @updateURL    https://raw.githubusercontent.com/imarshev/opencode-turn-lock/main/userscript/turn-lock-prio.user.js
+// @downloadURL  https://raw.githubusercontent.com/imarshev/opencode-turn-lock/main/userscript/turn-lock-prio.user.js
 // ==/UserScript==
 
 // Why this exists: the web client ships the GUI-plugin loader but its host object

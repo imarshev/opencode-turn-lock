@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.2.1
+// @version      0.2.2
 // @description  Пилюля приоритета для opencode-turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
@@ -166,48 +166,65 @@
 
   // --------------------------------------------------------------------- view
 
+  // The web client draws its own "N shells" chip in a row above the composer
+  // (`session-activity-chips`), and it already reserves a slot in that same row
+  // for plugin pills (`session-plugin-pills`) -- the place the desktop build
+  // puts a ComposerPill. So the pill mounts there and flows with the row
+  // instead of floating over it. The fixed position is only a fallback for the
+  // case where the slot is gone (markup change).
+  const SLOT = '[data-component="session-plugin-pills"]'
+  const LANE = '[data-component="session-composer-lane"]'
+
   let host = null
   let root = null
   let button = null
   let label = null
+  let inline = null // true: the host lives in the composer row
+  let hidden = false
+
+  const BASE =
+    "pointer-events:none;max-width:calc(100vw - 32px);font:13px/1.2 system-ui,-apple-system,'Segoe UI',sans-serif"
+  const INLINE_CSS = `${BASE};display:flex;align-items:center;flex:0 0 auto`
+  const FIXED_CSS = `${BASE};position:fixed;right:16px;bottom:96px;z-index:2147483000`
+
+  const paint = () => {
+    if (!host) return
+    host.style.cssText = (inline ? INLINE_CSS : FIXED_CSS) + (hidden ? ";display:none" : "")
+    host.toggleAttribute("data-floating", !inline)
+  }
 
   const mount = () => {
     if (host || !document.body) return
     host = document.createElement("div")
     host.setAttribute("data-turn-lock-prio", "")
-    host.style.cssText = [
-      "position:fixed",
-      "right:16px",
-      "bottom:96px",
-      "z-index:2147483000",
-      "pointer-events:none",
-      "max-width:calc(100vw - 32px)",
-      "font:13px/1.2 system-ui,-apple-system,'Segoe UI',sans-serif",
-    ].join(";")
     root = host.attachShadow({ mode: "open" })
+    // Sized and rounded like the client's own chips (32px tall, 8px radius,
+    // 13px text, same muted surface) so the row stays visually uniform.
     root.innerHTML = `
       <style>
         button {
           pointer-events:auto;
-          display:flex; align-items:center; gap:6px;
-          max-width: 100%;
-          box-sizing: border-box;
-          padding:6px 12px;
-          border-radius:999px;
-          border:1px solid color-mix(in oklab, CanvasText 22%, transparent);
-          background: color-mix(in oklab, Canvas 92%, CanvasText 8%);
+          display:inline-flex; align-items:center; gap:6px;
+          height:32px; max-width:100%;
+          box-sizing:border-box;
+          padding:0 10px;
+          border-radius:8px;
+          border:1px solid transparent;
+          background: color-mix(in oklab, CanvasText 11%, Canvas);
           color: CanvasText;
-          font:inherit; font-weight:500;
+          font:inherit; font-size:13px; font-weight:500;
           cursor:pointer;
-          box-shadow: 0 2px 10px color-mix(in oklab, CanvasText 18%, transparent);
-          opacity:.92;
+          opacity:.94;
           transition: opacity .15s, border-color .15s, background .15s;
         }
-        button:hover { opacity:1; border-color: color-mix(in oklab, CanvasText 40%, transparent) }
+        :host([data-floating]) button {
+          box-shadow: 0 2px 10px color-mix(in oklab, CanvasText 18%, transparent);
+        }
+        button:hover { opacity:1; border-color: color-mix(in oklab, CanvasText 30%, transparent) }
         button:disabled { cursor:progress; opacity:.6 }
         button[data-on="true"] {
           border-color: color-mix(in oklab, #f5a524 65%, transparent);
-          background: color-mix(in oklab, #f5a524 18%, Canvas);
+          background: color-mix(in oklab, #f5a524 20%, Canvas);
         }
         button[data-state="error"] { border-color:#e5484d; color:#e5484d }
         .mark { font-size:14px; line-height:1 }
@@ -222,15 +239,31 @@
       event.stopPropagation()
       void onClick()
     })
-    document.body.appendChild(host)
-    place()
+    paint()
+    attach()
   }
 
-  // The composer is anchored to the bottom and changes height with the window
-  // (and with the platform), so a fixed offset ends up on top of it. Anchor the
-  // pill just above the composer instead.
-  const place = () => {
+  // Re-assert the home of the host: the row is re-created by the client on
+  // navigation, and appending once at mount would leave the pill orphaned.
+  const attach = () => {
     if (!host) return
+    const slot = document.querySelector(SLOT) || document.querySelector(LANE)
+    const parent = slot || document.body
+    if (!parent) return
+    if (host.parentElement !== parent) parent.appendChild(host)
+    const want = Boolean(slot)
+    if (want !== inline) {
+      inline = want
+      paint()
+    }
+    if (!inline) place()
+  }
+
+  // Fallback position: the composer is anchored to the bottom and changes
+  // height with the window, so a fixed offset ends up on top of it. Anchor the
+  // pill just above the composer instead of at a constant height.
+  const place = () => {
+    if (!host || inline) return
     let top = null
     for (const el of document.querySelectorAll('[contenteditable="true"], textarea')) {
       const rect = el.getBoundingClientRect()
@@ -253,10 +286,12 @@
   }
 
   const hide = () => {
-    if (host) host.style.display = "none"
+    hidden = true
+    paint()
   }
   const show = () => {
-    if (host) host.style.display = ""
+    hidden = false
+    paint()
   }
 
   // --------------------------------------------------------------------- loop
@@ -273,6 +308,7 @@
     }
     mount()
     if (!host) return
+    attach()
     show()
     if (reading) return
     if (!force && Date.now() - lastRead < 2000) return
@@ -346,11 +382,12 @@
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") void refresh(true)
     })
-    // React re-renders into #root; the pill lives on body and only needs a
-    // nudge if something removed it. The composer also moves (a growing prompt,
-    // a window resize), so its offset is re-measured here.
+    // The client re-renders the composer row and can drop or replace the node
+    // the pill sits in, so its home is re-asserted here; the composer also
+    // moves (a growing prompt, a window resize), so the fallback offset is
+    // re-measured.
     setInterval(() => {
-      if (host && !host.isConnected) document.body.appendChild(host)
+      attach()
       place()
     }, 5000)
     window.addEventListener("resize", place)

@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.1.0
+// @version      0.2.0
 // @description  Пилюля приоритета для opencode-turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://127.0.0.1/*
 // @match        http://localhost/*
 // @match        http://[::1]/*
+// @include      http://192.168.*/*
+// @include      http://10.*/*
 // @grant        none
 // @run-at       document-start
 // @noframes
@@ -26,9 +28,13 @@
 // document-start and reuses the `Authorization` header the app itself sends to
 // /api/*. Nothing is stored and nothing leaves this origin.
 //
-// To use it from a phone or another host, add that origin to @match, e.g.
-//   // @match http://192.168.31.100:28894/*
-// (match patterns cannot contain wildcards inside a host, so list it explicitly).
+// To use it from a phone or another machine, the origin has to be listed here:
+// match patterns cannot contain wildcards inside a host, so a LAN address is
+// covered by the glob lines above (192.168.* and 10.*) rather than by @match.
+// Add e.g.
+//   // @include http://172.16.*/*
+// if your network uses the 172.16/12 range (172.16-172.31), and an explicit
+// @match for a hostname such as http://mac.local:28894/*.
 
 ;(() => {
   "use strict"
@@ -310,7 +316,7 @@
   }
 
   const start = () => {
-    mount()
+    // No pill off-route: refresh() mounts it only when the URL is a session.
     void refresh(true)
     setInterval(() => {
       // SPA navigation changes the path without a load, so the route is checked

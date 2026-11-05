@@ -1,14 +1,11 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.2.0
+// @version      0.2.1
 // @description  Пилюля приоритета для opencode-turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
-// @match        http://127.0.0.1/*
-// @match        http://localhost/*
-// @match        http://[::1]/*
-// @include      http://192.168.*/*
-// @include      http://10.*/*
+// @match        http://*/*
+// @match        https://*/*
 // @grant        none
 // @run-at       document-start
 // @noframes
@@ -30,16 +27,31 @@
 // document-start and reuses the `Authorization` header the app itself sends to
 // /api/*. Nothing is stored and nothing leaves this origin.
 //
-// To use it from a phone or another machine, the origin has to be listed here:
-// match patterns cannot contain wildcards inside a host, so a LAN address is
-// covered by the glob lines above (192.168.* and 10.*) rather than by @match.
-// Add e.g.
-//   // @include http://172.16.*/*
-// if your network uses the 172.16/12 range (172.16-172.31), and an explicit
-// @match for a hostname such as http://mac.local:28894/*.
+// Scope: match patterns cannot wildcard inside a host, so the manifest above is
+// deliberately broad (@match http://*/*) and the guard below keeps it inert
+// outside local networks. Do not "fix" this by writing @include globs for LAN
+// ranges: Tampermonkey converts a trailing `.*` in a glob host into its `.tld`
+// marker and then swaps it for a top-level-domain alternation, so
+// `@include http://192.168.*/*` matches only hosts like `192.168.com` -- never
+// an IP address. That is exactly why 0.2.0 showed "script not running" on a LAN
+// origin.
 
 ;(() => {
   "use strict"
+
+  // The broad @match above is the only way to reach a LAN IP (see the header),
+  // so this guard is the real scope. Outside loopback / RFC1918 / mDNS names
+  // the script does nothing at all.
+  const hostname = location.hostname.replace(/^\[|\]$/g, "").toLowerCase()
+  const local =
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    /^127\./.test(hostname) ||
+    /^10\./.test(hostname) ||
+    /^192\.168\./.test(hostname) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+    /\.(local|lan|home\.arpa)$/.test(hostname)
+  if (!local) return
 
   const MARK = "⚡"
   const ROUTE = /^\/server\/[^/]+\/session\/([^/?#]+)/

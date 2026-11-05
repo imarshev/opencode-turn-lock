@@ -162,6 +162,18 @@ export const RELEASE_EVENTS = [
 
 const EVENT_TYPES = [...RELEASE_EVENTS] as string[]
 
+/** Events after which this session's run is over, so a wait it queued must not
+ *  outlive it. `form.*` and `permission.*` are deliberately absent: there the
+ *  agent is paused for the human and continues afterwards. */
+const END_OF_RUN_EVENTS = new Set<string>([
+  "session.status", // only `idle` reaches here: eventSessionID drops busy/retry
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.deleted",
+  "session.archived",
+])
+
 /** Fields of an OpenCode V2 event the lock cares about. */
 type AnyEvent = {
   type?: string
@@ -440,6 +452,11 @@ export default Plugin.define({
     // cannot leave a session labelled forever.
     const marked = new Set<string>()
     const marking = new Set<string>()
+    // Sessions this instance is queueing right now. A wait lives in its own
+    // polling loop, not in a lease: it ends on a grant, on the 4h timeout, or
+    // when someone cancels it. So both ends of that loop have to be owned —
+    // the turn ending (see END_OF_RUN_EVENTS) and this instance unloading.
+    const waiting = new Set<string>()
     const waitEpoch = new Map<string, number>()
     const epochOf = (sid: string) => waitEpoch.get(sid) ?? 0
     const waitPath = (sid: string) => join(config.dir, `${sid.replace(/[^A-Za-z0-9_.-]/g, "_")}.wait.json`)
@@ -894,7 +911,8 @@ export default Plugin.define({
           }
         }
 
-        const result = await lock.acquire(sid)
+        waiting.add(sid)
+        const result = await lock.acquire(sid).finally(() => waiting.delete(sid))
         if (!result.granted) {
           log("debug", `skip ${sid}: ${result.reason ?? "not granted"}`)
           return
@@ -942,6 +960,11 @@ export default Plugin.define({
           if (!sid) continue
           held.delete(sid)
           lock.release(sid, type)
+          // `release` only frees a slot this session held; a queued one has no
+          // lease. Its wait is a separate polling loop, and the reminder tick
+          // would keep re-marking the title and take the next free slot for a
+          // run that will never happen.
+          if (END_OF_RUN_EVENTS.has(type)) lock.cancelWait(sid, type)
           // A session that no longer runs cannot be the one the user needs now.
           if (type === "session.deleted" || type === "session.archived") dropPriority(sid)
           // A queued session has no lease, so a terminal event for it (deleted,
@@ -983,6 +1006,11 @@ export default Plugin.define({
       controller.abort()
       clearInterval(sweeper)
       if (heartbeat) clearInterval(heartbeat)
+      // This instance's queue loops must die with it: after a hot reload they
+      // would keep polling the shared store, re-mark titles and take slots for
+      // hooks nobody awaits any more.
+      for (const sid of waiting) lock.cancelWait(sid, "unload")
+      waiting.clear()
       for (const sid of held) lock.release(sid, "unload")
       held.clear()
       for (const sid of [...marked]) await unmarkWaiting(sid, "unload")

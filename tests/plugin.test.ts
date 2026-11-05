@@ -331,6 +331,47 @@ test("releases: idle, succeeded, failed, interrupted, deleted, form.created, per
   }
 })
 
+test("a queued session whose run ends stops waiting: no re-mark, no phantom lease", async () => {
+  const harness = await setup({ remindEveryMs: 30 }, { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } })
+  try {
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+
+    let thirdDone = false
+    const third = harness.context("ses_3").then(() => {
+      thirdDone = true
+    })
+
+    await until(() => harness.titles.get("ses_3")?.startsWith("⏳") === true, "waiting mark")
+    assert.equal(thirdDone, false, "the third session is queued")
+
+    // The user stops that turn while it is still queued. Nothing will ever run
+    // for it, so its place in the queue must be given up.
+    harness.bus.emit({ type: "session.execution.interrupted", data: { sessionID: "ses_3", reason: "user" } })
+    await third
+
+    // A waiting loop that outlived its run re-marks the title on every reminder.
+    await wait(200)
+    assert.equal(harness.titles.get("ses_3"), "three", "the finished turn keeps its own title")
+    assert.equal(
+      readdirSync(harness.dir).filter((name) => name === "ses_3.wait.json").length,
+      0,
+      "no wait sidecar is left behind",
+    )
+
+    // ...and it would take the first slot that frees, for a turn that never runs.
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await wait(200)
+    const held = fileStore(harness.dir)
+      .list()
+      .map((lease: { sid: string }) => lease.sid)
+      .sort()
+    assert.deepEqual(held, ["ses_2"], "a finished turn never takes a slot")
+  } finally {
+    await harness.teardown()
+  }
+})
+
 test("a busy/retry status update does not free the slot", async () => {
   const harness = await setup()
   try {
@@ -416,6 +457,31 @@ test("unload releases everything this process held", async () => {
   await harness.cleanup()
   assert.equal(fileStore(harness.dir).list().length, 0)
   rmSync(harness.dir, { recursive: true, force: true })
+})
+
+test("unload ends a queued wait instead of leaving it polling", async () => {
+  const harness = await setup({ remindEveryMs: 30 }, { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } })
+  try {
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+    let thirdDone = false
+    const third = harness.context("ses_3").then(() => {
+      thirdDone = true
+    })
+    await until(() => harness.titles.get("ses_3")?.startsWith("⏳") === true, "waiting mark")
+
+    await harness.cleanup()
+    await third
+    const updates = harness.updates.length
+
+    // An orphaned loop would keep polling the shared store and re-mark the title.
+    await wait(150)
+    assert.equal(thirdDone, true, "the pending hook is let go")
+    assert.equal(harness.updates.length, updates, "nothing re-marks the title after unload")
+    assert.equal(fileStore(harness.dir).list().length, 0, "no lease is left behind")
+  } finally {
+    await harness.teardown()
+  }
 })
 
 test("disabled config registers no hook and never blocks", async () => {

@@ -2,9 +2,9 @@
 
 [![tests](https://github.com/imarshev/opencode-turn-lock/actions/workflows/test.yml/badge.svg)](https://github.com/imarshev/opencode-turn-lock/actions/workflows/test.yml)
 
-Плагин для **OpenCode V2**, который держит на локальном движке не больше N агентских сессий одновременно, а остальные ставит в очередь на уровне модели — и говорит сессии, что она ждёт.
+Плагин для **OpenCode V2**, который держит на локальном движке не больше N агентских сессий одновременно, а остальные ставит в очередь на уровне модели — и говорит сессии, что она ждёт. В комплекте — userscript для Tampermonkey/Violentmonkey, который добавляет пилюлю `/prio` в веб-клиент.
 
-> **EN.** An OpenCode V2 plugin that serialises agent *turns* against a local model engine: at most N sessions may call the local model, everyone else waits before the request is sent. Cloud providers are never gated, subagents inherit their parent's verdict, and a queued session gets an in-transcript notice with the queue state. Leases survive across plugin instances (per-location) and processes, are refreshed by a heartbeat, and are released on every terminal event of a turn.
+> **EN.** An OpenCode V2 plugin that serialises agent *turns* against a local model engine: at most N sessions may call the local model, everyone else waits before the request is sent. Cloud providers are never gated, subagents inherit their parent's verdict, and a queued session gets an in-transcript notice with the queue state. Leases survive across plugin instances (per-location) and processes, are refreshed by a heartbeat, and are released on every terminal event of a turn. A bundled Tampermonkey userscript puts the same `/prio` pill into the web client.
 
 ---
 

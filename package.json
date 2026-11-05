@@ -1,7 +1,7 @@
 {
   "name": "opencode-turn-lock",
   "version": "0.1.0",
-  "description": "OpenCode V2 plugin that keeps at most N local agent sessions on the model engine, queues the rest per turn, and marks a waiting session with a ⏳ title prefix.",
+  "description": "OpenCode V2 plugin that keeps at most N local agent sessions on the model engine, queues the rest per turn, and marks a waiting session with a ⏳ title prefix. Ships a Tampermonkey/Violentmonkey userscript that adds the /prio priority pill to the web UI.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",

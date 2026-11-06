@@ -16,7 +16,7 @@
 // with the same title would share the first match. The alternative — no click
 // at all — loses the useful part, so the caller decides by passing `cycle`.
 
-import { rowOrder, stateFromTitle, type TurnLockState } from "./state.ts"
+import { rowOrder, stateFromTitle, waitLabel, waitSentence, type Lang, type TurnLockState } from "./state.ts"
 
 export type InboxLevel = "high" | "normal" | "low"
 
@@ -46,6 +46,8 @@ export type InboxViewOptions = {
   load?: () => Promise<readonly InboxRowData[]>
   /** Called when a badge is clicked; the caller cycles the level. */
   cycle?: (row: InboxRowData) => void
+  /** The language of the badge text; reactive so a language switch redraws. */
+  lang?: () => Lang
 }
 
 const WORKING = '[data-slot="sidebar-inbox-working"]'
@@ -79,6 +81,7 @@ export const BADGE_CSS = `
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-cloud="true"] { color: #38bdf8; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}:hover { filter: brightness(1.25); }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS} svg { width: 9px; height: 9px; }
+[data-slot="sidebar-inbox-item"] .${BADGE_CLASS} .tl-wait { font-variant-numeric: tabular-nums; white-space: nowrap; }
 `
 
 const ICON = {
@@ -86,28 +89,47 @@ const ICON = {
   low: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3.5 6.5 8 11l4.5-4.5"/></svg>',
   cloud:
     '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4.6 12a2.9 2.9 0 0 1 .3-5.8 3.9 3.9 0 0 1 7.4 1.2A2.3 2.3 0 0 1 11.7 12z"/></svg>',
+  clock:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.9V8l2.2 1.4"/></svg>',
 } as const
 
-/** Human-readable description of a state, used as the badge's tooltip. */
-export function describeState(state: TurnLockState): string {
+const WORDS = {
+  ru: { cloud: "облачная модель", high: "высокий приоритет", low: "низкий приоритет", place: (p: string) => `${p} в очереди` },
+  en: { cloud: "cloud model", high: "high priority", low: "low priority", place: (p: string) => `${p} in queue` },
+} as const
+
+/**
+ * Human-readable description of a state, used as the badge's tooltip. The wait
+ * is spelled out here in full ("ждёт 9 минут") while the badge itself only has
+ * room for the short form ("9 мин").
+ */
+export function describeState(state: TurnLockState, now = Date.now(), lang: Lang = "ru"): string {
+  const words = WORDS[lang]
   const parts: string[] = []
-  if (state.cloud) parts.push("облачная модель")
-  if (state.level === "high") parts.push("высокий приоритет")
-  if (state.level === "low") parts.push("низкий приоритет")
-  if (state.position !== undefined && state.total !== undefined) parts.push(`${state.position}/${state.total} в очереди`)
+  if (state.cloud) parts.push(words.cloud)
+  if (state.level === "high") parts.push(words.high)
+  if (state.level === "low") parts.push(words.low)
+  if (state.position !== undefined && state.total !== undefined) parts.push(words.place(`${state.position}/${state.total}`))
+  if (state.since !== undefined) parts.push(waitSentence(now - state.since, lang))
   return parts.join(" · ")
 }
 
 /** A row needs a badge only when it has something to say. */
 function hasBadge(state: TurnLockState | undefined): state is TurnLockState {
   if (!state) return false
-  return state.cloud === true || state.level !== "normal" || state.position !== undefined
+  return state.cloud === true || state.level !== "normal" || state.position !== undefined || state.since !== undefined
 }
 
-function badgeHtml(state: TurnLockState): string {
+function badgeHtml(state: TurnLockState, now: number, lang: Lang): string {
   const icons = `${state.cloud ? ICON.cloud : ""}${state.level === "high" ? ICON.high : state.level === "low" ? ICON.low : ""}`
   const place = state.position !== undefined && state.total !== undefined ? `${state.position}/${state.total}` : ""
-  return `${icons}${place ? `<span>${place}</span>` : ""}`
+  // The wait is the one part that changes on its own, so it is drawn from the
+  // start time on every pass instead of being rewritten by the server.
+  const wait =
+    state.since !== undefined
+      ? `${ICON.clock}<span class="tl-wait">${waitLabel(now - state.since, lang)}</span>`
+      : ""
+  return `${icons}${place ? `<span>${place}</span>` : ""}${wait}`
 }
 
 /** The row's title, as the client renders it. */
@@ -140,11 +162,17 @@ function mountBadge(row: Element, doc: Document): HTMLElement {
   return element
 }
 
-/** Sort the working rows and draw a badge on each. Returns true on any change. */
+/**
+ * Sort the working rows and draw a badge on each. Returns true on any change.
+ * `now` and `lang` default to the current time and Russian; the view passes
+ * both so a badge's wait label ticks without a second `Date.now()` per row.
+ */
 export function applyInboxView(
   root: ParentNode,
   rows: readonly InboxRowData[],
   cycle?: (row: InboxRowData) => void,
+  now = Date.now(),
+  lang: Lang = "ru",
 ): boolean {
   const section = root.querySelector(WORKING)
   if (!section) return false
@@ -196,7 +224,7 @@ export function applyInboxView(
     }
 
     const badge = badges.get(entry.element) ?? mountBadge(entry.element, doc)
-    const html = badgeHtml(state)
+    const html = badgeHtml(state, now, lang)
     if (badge.innerHTML !== html) {
       badge.innerHTML = html
       changed = true
@@ -204,7 +232,7 @@ export function applyInboxView(
     const cloud = state.cloud ? "true" : "false"
     if (badge.dataset.level !== state.level) badge.dataset.level = state.level
     if (badge.dataset.cloud !== cloud) badge.dataset.cloud = cloud
-    badge.title = describeState(state)
+    badge.title = describeState(state, now, lang)
     badge.onclick = (event: Event) => {
       event.preventDefault()
       event.stopPropagation()
@@ -229,6 +257,7 @@ export function startInboxView(options: InboxViewOptions = {}): () => void {
   // once every `reloadMs` is enough — and the read is skipped while the section
   // is not on screen, so a session route costs nothing.
   const reloadMs = options.reloadMs ?? 2_000
+  const lang = options.lang ?? (() => "ru" as const)
   let rows: readonly InboxRowData[] = []
   let loading = false
   let attemptedAt = 0
@@ -236,7 +265,7 @@ export function startInboxView(options: InboxViewOptions = {}): () => void {
     if (!visible()) return
     const node = root()
     if (!node) return
-    applyInboxView(node, rows, options.cycle)
+    applyInboxView(node, rows, options.cycle, Date.now(), lang())
     if (!options.load || loading) return
     if (!node.querySelector(WORKING)) return
     if (attemptedAt !== 0 && Date.now() - attemptedAt < reloadMs) return
@@ -247,7 +276,7 @@ export function startInboxView(options: InboxViewOptions = {}): () => void {
       .then((next) => {
         rows = next
         const again = root()
-        if (again) applyInboxView(again, rows, options.cycle)
+        if (again) applyInboxView(again, rows, options.cycle, Date.now(), lang())
       })
       .catch(() => {
         // A failed read keeps the last known state; the next tick retries.

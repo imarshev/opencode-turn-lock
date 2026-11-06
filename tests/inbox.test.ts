@@ -152,6 +152,42 @@ test("rows are ordered by metadata: cloud, level, queue place, then the client's
   assert.ok(order(ordinary) < order(low), "ordinary goes before low")
 })
 
+test("a waiting row shows how long it waits, in words and without a title change", () => {
+  const doc = document()
+  const waiting = row(doc, "waiting")
+  const lonely = row(doc, "lonely")
+  const { root } = mount([waiting, lonely])
+
+  const since = 1_700_000_000_000
+  const now = since + 2 * 3_600_000 + 5 * 60_000
+  const rows: InboxRowData[] = [
+    { title: "waiting", state: { level: "normal", position: 2, total: 5, since } },
+    // A wait without a place still has something to say: the clock.
+    { title: "lonely", state: { level: "normal", since } },
+  ]
+
+  assert.equal(applyInboxView(root as unknown as ParentNode, rows, undefined, now), true)
+  const badgeOf = (element: Fake) => element.firstElementChild?.children.find((child) => child.className === BADGE_CLASS)
+
+  const badge = badgeOf(waiting)
+  assert.ok(badge, "a waiting row is badged even at the ordinary level")
+  assert.match(badge.innerHTML, /tl-wait/)
+  assert.match(badge.innerHTML, /2 ч 5 мин/)
+  assert.match(badge.title, /ждёт 2 часа 5 минут/)
+  assert.match(badge.title, /2\/5 в очереди/)
+  assert.ok(badgeOf(lonely), "the wait alone is enough for a badge")
+
+  // The label is derived from `since`, so the next pass ticks it without a
+  // server write and without a new state object.
+  applyInboxView(root as unknown as ParentNode, rows, undefined, now + 60_000)
+  assert.match(badgeOf(waiting)!.innerHTML, /2 ч 6 мин/)
+
+  // English, when the interface is English.
+  applyInboxView(root as unknown as ParentNode, rows, undefined, now, "en")
+  assert.match(badgeOf(waiting)!.innerHTML, /2 h 5 min/)
+  assert.match(badgeOf(waiting)!.title, /waiting 2 h 5 min/)
+})
+
 test("a badge is drawn only where there is something to say", () => {
   const doc = document()
   const high = row(doc, "high")

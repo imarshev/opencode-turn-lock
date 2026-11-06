@@ -61,7 +61,7 @@
 //     "releaseOnPermission": true,      // a permission prompt frees the slot
 //     "remindEveryMs": 60000,           // title countdown tick + log line for a long wait
 //     "markWaitingTitle": true,         // prefix the session title with "⏳ " while it waits
-//     "titleMarks": "waiting",          // "all" (⚡/▽/☁️/⏳) | "waiting" (⏳ only) | "none"
+//     "titleMarks": "none",             // "all" (⚡/▽/☁️/⏳) | "waiting" (⏳ only) | "none"
 //     "stateMetadata": true,            // write level/cloud/place into session.metadata
 //     "priorityEnabled": true,          // /prio: ⚡ cuts the queue, ▽ stands at the back of it
 //     "priorityCommand": "prio",        // the slash command that sets the level
@@ -141,9 +141,11 @@ export const DEFAULTS: TurnLockConfig = {
   releaseOnPermission: true,
   remindEveryMs: 60_000,
   markWaitingTitle: true,
-  // The UI reads the state from metadata; the title keeps only the wait label,
-  // so a phone (or any client without the plugin) still sees the queue place.
-  titleMarks: "waiting",
+  // The UI draws the wait from `metadata.since` (badge with a live label), so by
+  // default the title stays the user's own text. `"waiting"` keeps the old
+  // `⏳ 2/5 · 9m ·` prefix for clients without the plugin (phone, TUI), and
+  // `"all"` also restores the `⚡`/`▽`/`☁️` marks.
+  titleMarks: "none",
   stateMetadata: true,
   priorityEnabled: true,
   priorityCommand: "prio",

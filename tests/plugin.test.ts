@@ -338,7 +338,10 @@ test("releases: idle, succeeded, failed, interrupted, deleted, form.created, per
 })
 
 test("a queued session whose run ends stops waiting: no re-mark, no phantom lease", async () => {
-  const harness = await setup({ remindEveryMs: 30 }, { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } })
+  const harness = await setup(
+    { remindEveryMs: 30, titleMarks: "waiting" },
+    { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } },
+  )
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
@@ -466,7 +469,10 @@ test("unload releases everything this process held", async () => {
 })
 
 test("unload ends a queued wait instead of leaving it polling", async () => {
-  const harness = await setup({ remindEveryMs: 30 }, { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } })
+  const harness = await setup(
+    { remindEveryMs: 30, titleMarks: "waiting" },
+    { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } },
+  )
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
@@ -523,7 +529,7 @@ test("releaseOnForm/releaseOnPermission can be turned off", async () => {
 })
 
 test("a queued session is marked in the session list and unmarked on grant", async () => {
-  const harness = await setup({}, { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } })
+  const harness = await setup({ titleMarks: "waiting" }, { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } })
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
@@ -547,7 +553,7 @@ test("a queued session is marked in the session list and unmarked on grant", asy
 })
 
 test("only one mark is written while a session keeps waiting", async () => {
-  const harness = await setup({ remindEveryMs: 60 }, { titles: { ses_3: "three" } })
+  const harness = await setup({ remindEveryMs: 60, titleMarks: "waiting" }, { titles: { ses_3: "three" } })
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
@@ -569,7 +575,7 @@ test("only one mark is written while a session keeps waiting", async () => {
 
 test("two waiters see their place in the queue", async () => {
   const harness = await setup(
-    { remindEveryMs: 40 },
+    { remindEveryMs: 40, titleMarks: "waiting" },
     { titles: { ses_3: "three", ses_4: "four" } },
   )
   try {
@@ -605,7 +611,7 @@ test("two waiters see their place in the queue", async () => {
 })
 
 test("a title regenerated while waiting is marked again", async () => {
-  const harness = await setup({ remindEveryMs: 60 }, { titles: { ses_3: "three" } })
+  const harness = await setup({ remindEveryMs: 60, titleMarks: "waiting" }, { titles: { ses_3: "three" } })
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
@@ -969,7 +975,7 @@ test("/prio low marks the session with ▽ and records the level", async () => {
   }
 })
 
-test("by default the level lives in metadata, not in the title", async () => {
+test("by default the level and the wait live in metadata, not in the title", async () => {
   const harness = await setup({ limit: 1 }, { titles: { ses_1: "one", ses_2: "two" } })
   try {
     await harness.context("ses_1") // the only slot is held
@@ -981,11 +987,12 @@ test("by default the level lives in metadata, not in the title", async () => {
     const waiting = harness.context("ses_2").then(() => {
       done = true
     })
-    await until(() => harness.titles.get("ses_2") === "⏳ two", "the wait label is the only title mark")
+    await until(() => readState(harness.metadata.get("ses_2"))?.since !== undefined, "the wait start is stored")
     const state = readState(harness.metadata.get("ses_2"))
     assert.equal(state?.level, "high", "the level survives the wait")
     assert.equal(state?.position, 1)
     assert.equal(state?.total, 1)
+    assert.equal(harness.titles.get("ses_2"), "two", "the title is never touched: the badge draws the wait")
 
     harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
     await waiting

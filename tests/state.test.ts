@@ -12,6 +12,8 @@ import {
   rowOrder,
   stateFromTitle,
   STATE_KEY,
+  waitLabel,
+  waitSentence,
   withState,
   type TurnLockState,
 } from "../src/state.ts"
@@ -47,6 +49,27 @@ test("a title from an older version still reads as a state", () => {
   assert.deepEqual(stateFromTitle("☁️ Облачная сессия"), { level: "normal", cloud: true })
   assert.equal(stateFromTitle("Поправить отчёт"), undefined)
   assert.equal(stateFromTitle(undefined), undefined)
+})
+
+test("a wait reads as words, not as the old compact label", () => {
+  assert.equal(waitLabel(0), "0 с")
+  assert.equal(waitLabel(-5_000), "0 с", "a clock skew must not print a negative wait")
+  assert.equal(waitLabel(42_000), "42 с")
+  assert.equal(waitLabel(9 * 60_000), "9 мин")
+  assert.equal(waitLabel(60 * 60_000), "1 ч")
+  assert.equal(waitLabel(2 * 3_600_000 + 5 * 60_000), "2 ч 5 мин")
+  assert.equal(waitLabel(9 * 60_000, "en"), "9 min")
+  assert.equal(waitLabel(2 * 3_600_000 + 5 * 60_000, "en"), "2 h 5 min")
+
+  assert.equal(waitSentence(30_000), "ждёт 30 секунд")
+  assert.equal(waitSentence(60_000), "ждёт 1 минуту")
+  assert.equal(waitSentence(2 * 60_000), "ждёт 2 минуты")
+  assert.equal(waitSentence(5 * 60_000), "ждёт 5 минут")
+  assert.equal(waitSentence(11 * 60_000), "ждёт 11 минут")
+  assert.equal(waitSentence(21 * 60_000), "ждёт 21 минуту")
+  assert.equal(waitSentence(3_600_000), "ждёт 1 час")
+  assert.equal(waitSentence(2 * 3_600_000 + 5 * 60_000), "ждёт 2 часа 5 минут")
+  assert.equal(waitSentence(90_000, "en"), "waiting 1 min")
 })
 
 test("cloud sessions come first, then the level, then the queue place", () => {

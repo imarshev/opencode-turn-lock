@@ -135,6 +135,52 @@ export function stateFromTitle(title: string | null | undefined): TurnLockState 
   return found ? state : undefined
 }
 
+/** The two label languages this plugin speaks. */
+export type Lang = "ru" | "en"
+
+/** Russian plural form: 1 минута, 2 минуты, 5 минут. */
+function ruPlural(count: number, one: string, few: string, many: string): string {
+  const mod10 = count % 10
+  const mod100 = count % 100
+  if (mod10 === 1 && mod100 !== 11) return one
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few
+  return many
+}
+
+/** Seconds, minutes and hours of a wait, floored and never negative. */
+function waitParts(waitedMs: number): { seconds: number; minutes: number; hours: number; rest: number } {
+  const seconds = Math.max(0, Math.floor((Number.isFinite(waitedMs) ? waitedMs : 0) / 1_000))
+  const minutes = Math.floor(seconds / 60)
+  return { seconds, minutes, hours: Math.floor(minutes / 60), rest: minutes % 60 }
+}
+
+/**
+ * A wait as a badge-sized label: `42 с`, `9 мин`, `2 ч 5 мин`. This is what the
+ * title used to carry as `9m`, but readable — the badge is a UI element, not a
+ * string the user has to decode.
+ */
+export function waitLabel(waitedMs: number, lang: Lang = "ru"): string {
+  const { seconds, minutes, hours, rest } = waitParts(waitedMs)
+  if (seconds < 60) return lang === "ru" ? `${seconds} с` : `${seconds} s`
+  if (minutes < 60) return lang === "ru" ? `${minutes} мин` : `${minutes} min`
+  if (rest === 0) return lang === "ru" ? `${hours} ч` : `${hours} h`
+  return lang === "ru" ? `${hours} ч ${rest} мин` : `${hours} h ${rest} min`
+}
+
+/** The same wait as a sentence, for a tooltip: `ждёт 9 минут`. */
+export function waitSentence(waitedMs: number, lang: Lang = "ru"): string {
+  const { seconds, minutes, hours, rest } = waitParts(waitedMs)
+  if (lang === "en") {
+    if (seconds < 60) return `waiting ${seconds} s`
+    if (minutes < 60) return `waiting ${minutes} min`
+    return rest === 0 ? `waiting ${hours} h` : `waiting ${hours} h ${rest} min`
+  }
+  if (seconds < 60) return `ждёт ${seconds} ${ruPlural(seconds, "секунду", "секунды", "секунд")}`
+  if (minutes < 60) return `ждёт ${minutes} ${ruPlural(minutes, "минуту", "минуты", "минут")}`
+  const head = `ждёт ${hours} ${ruPlural(hours, "час", "часа", "часов")}`
+  return rest === 0 ? head : `${head} ${rest} ${ruPlural(rest, "минуту", "минуты", "минут")}`
+}
+
 /**
  * Sort key of one row: cloud first (a cloud session is never gated, so it is
  * never in the queue), then the level, then the place in the queue — a session

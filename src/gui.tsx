@@ -176,6 +176,9 @@ export default Plugin.define({
     // interval is cleared when the window closes or the plugin is reloaded.
     const stopInboxSort = sortInbox
       ? startInboxView({
+          // The badge text follows the interface language, and a language switch
+          // redraws it on the next tick.
+          lang: () => (ctx.locale.locale().toLowerCase().startsWith("ru") ? "ru" : "en"),
           load: async () => {
             const list = await ctx.client.session.list()
             const data = (list?.data ?? []) as Array<{ id?: string; title?: string; metadata?: unknown }>

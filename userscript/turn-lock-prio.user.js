@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.5.0
-// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и бейджи приоритета/облака/места в очереди для working-сессий в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
+// @version      0.5.1
+// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и бейджи приоритета/облака/места и времени ожидания для working-сессий в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
 // @match        https://*/*
@@ -28,8 +28,9 @@
 //
 // It also draws the "Working" section of the inbox: rows are ordered with CSS
 // `order` (the DOM is not moved: the list is a Solid keyed `For`) and each row
-// gets a badge — level icon, cloud, place in the queue. Set INBOX_UI to false
-// below to turn both off.
+// gets a badge — level icon, cloud, place in the queue and how long it has been
+// waiting ("9 мин"), read from `metadata.since` so the label ticks on its own
+// between session updates. Set INBOX_UI to false below to turn both off.
 //
 // Auth: the script never asks for the password. It wraps `fetch` at
 // document-start and reuses the `Authorization` header the app itself sends to
@@ -93,6 +94,8 @@
     low: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3.5 6.5 8 11l4.5-4.5"/></svg>',
     cloud:
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4.6 12a2.9 2.9 0 0 1 .3-5.8 3.9 3.9 0 0 1 7.4 1.2A2.3 2.3 0 0 1 11.7 12z"/></svg>',
+    clock:
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.9V8l2.2 1.4"/></svg>',
   }
   const BADGE_CSS = `
 [data-slot="sidebar-inbox-item"] .${BADGE} {
@@ -118,6 +121,7 @@
 [data-slot="sidebar-inbox-item"] .${BADGE}[data-cloud="true"] { color: #38bdf8; }
 [data-slot="sidebar-inbox-item"] .${BADGE}:hover { filter: brightness(1.25); }
 [data-slot="sidebar-inbox-item"] .${BADGE} svg { width: 9px; height: 9px; }
+[data-slot="sidebar-inbox-item"] .${BADGE} .tl-wait { font-variant-numeric: tabular-nums; white-space: nowrap; }
 `
 
   const positive = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Math.trunc(Number(value)) : undefined)
@@ -134,6 +138,7 @@
       state.position = position
       state.total = total
     }
+    if (Number.isFinite(Number(raw.since)) && Number(raw.since) > 0) state.since = Number(raw.since)
     return state
   }
 
@@ -188,7 +193,42 @@
     return 0
   }
 
-  const describe = (state) => {
+  // A wait as a badge-sized label ("42 с", "9 мин", "2 ч 5 мин") and as a
+  // sentence for the tooltip ("ждёт 9 минут"). The badge is a UI element, so it
+  // says the wait in words instead of the old compact `9m` in the title.
+  const plural = (n, one, few, many) => {
+    const mod10 = n % 10
+    const mod100 = n % 100
+    if (mod10 === 1 && mod100 !== 11) return one
+    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few
+    return many
+  }
+  const waitParts = (waitedMs) => {
+    const seconds = Math.max(0, Math.floor((Number.isFinite(waitedMs) ? waitedMs : 0) / 1000))
+    const minutes = Math.floor(seconds / 60)
+    return { seconds, minutes, hours: Math.floor(minutes / 60), rest: minutes % 60 }
+  }
+  const waitLabel = (waitedMs) => {
+    const { seconds, minutes, hours, rest } = waitParts(waitedMs)
+    if (seconds < 60) return RU ? `${seconds} с` : `${seconds} s`
+    if (minutes < 60) return RU ? `${minutes} мин` : `${minutes} min`
+    if (rest === 0) return RU ? `${hours} ч` : `${hours} h`
+    return RU ? `${hours} ч ${rest} мин` : `${hours} h ${rest} min`
+  }
+  const waitSentence = (waitedMs) => {
+    const { seconds, minutes, hours, rest } = waitParts(waitedMs)
+    if (!RU) {
+      if (seconds < 60) return `waiting ${seconds} s`
+      if (minutes < 60) return `waiting ${minutes} min`
+      return rest === 0 ? `waiting ${hours} h` : `waiting ${hours} h ${rest} min`
+    }
+    if (seconds < 60) return `ждёт ${seconds} ${plural(seconds, "секунду", "секунды", "секунд")}`
+    if (minutes < 60) return `ждёт ${minutes} ${plural(minutes, "минуту", "минуты", "минут")}`
+    const head = `ждёт ${hours} ${plural(hours, "час", "часа", "часов")}`
+    return rest === 0 ? head : `${head} ${rest} ${plural(rest, "минуту", "минуты", "минут")}`
+  }
+
+  const describe = (state, now) => {
     const parts = []
     if (state.cloud) parts.push(RU ? "облачная модель" : "cloud model")
     if (state.level === "high") parts.push(RU ? "высокий приоритет" : "high priority")
@@ -196,18 +236,22 @@
     if (state.position !== undefined) {
       parts.push(RU ? `${state.position}/${state.total} в очереди` : `${state.position}/${state.total} in queue`)
     }
+    if (state.since !== undefined) parts.push(waitSentence(now - state.since))
     return parts.join(" · ")
   }
 
   const hasBadge = (state) =>
-    Boolean(state && (state.cloud || state.level !== "normal" || state.position !== undefined))
+    Boolean(state && (state.cloud || state.level !== "normal" || state.position !== undefined || state.since !== undefined))
 
-  const badgeHtml = (state) => {
+  const badgeHtml = (state, now) => {
     const icons = `${state.cloud ? ICONS.cloud : ""}${
       state.level === "high" ? ICONS.high : state.level === "low" ? ICONS.low : ""
     }`
     const place = state.position !== undefined ? `<span>${state.position}/${state.total}</span>` : ""
-    return `${icons}${place}`
+    // The wait ticks on its own: it is computed from `since`, so the server does
+    // not have to rewrite anything once a minute.
+    const wait = state.since !== undefined ? `${ICONS.clock}<span class="tl-wait">${waitLabel(now - state.since)}</span>` : ""
+    return `${icons}${place}${wait}`
   }
 
   const ensureStyle = () => {
@@ -263,6 +307,7 @@
           left.index - right.index,
       )
 
+    const now = Date.now()
     ordered.forEach((entry, order) => {
       const value = String(order)
       if (entry.row.style.order !== value) entry.row.style.order = value
@@ -278,11 +323,11 @@
         if (header) header.insertBefore(badge, header.lastElementChild)
         else entry.row.appendChild(badge)
       }
-      const html = badgeHtml(entry.state)
+      const html = badgeHtml(entry.state, now)
       if (badge.innerHTML !== html) badge.innerHTML = html
       badge.dataset.level = entry.state.level
       badge.dataset.cloud = entry.state.cloud ? "true" : "false"
-      badge.title = describe(entry.state)
+      badge.title = describe(entry.state, now)
       badge.onclick = (event) => {
         event.preventDefault()
         event.stopPropagation()

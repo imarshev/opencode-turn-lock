@@ -2,9 +2,9 @@
 
 [![tests](https://github.com/imarshev/opencode-turn-lock/actions/workflows/test.yml/badge.svg)](https://github.com/imarshev/opencode-turn-lock/actions/workflows/test.yml)
 
-Плагин для **OpenCode V2**, который держит на локальном движке не больше N агентских сессий одновременно, а остальные ставит в очередь на уровне модели — и говорит сессии, что она ждёт, и на каком месте (`⏳ 2/3 · 3h10m · …`). Порядок очереди настраивается уровнем: `⚡` приоритет, обычная, `▽` низкий. В комплекте — userscript для Tampermonkey/Violentmonkey, который добавляет пилюлю `/prio` в веб-клиент. Обе половины ещё и показывают состояние в инбоксе: облачные сессии и `⚡` сверху, `▽` снизу, ждущие — по номеру места, и бейдж с уровнем, облаком и очередью на каждой строке.
+Плагин для **OpenCode V2**, который держит на локальном движке не больше N агентских сессий одновременно, а остальные ставит в очередь на уровне модели. Состояние сессии — уровень, облако, место и время ожидания — живёт в метаданных и показывается в инбоксе бейджем; заголовок сессии остаётся текстом пользователя. Порядок очереди настраивается уровнем: `⚡` приоритет, обычная, `▽` низкий. В комплекте — userscript для Tampermonkey/Violentmonkey, который добавляет пилюлю `/prio` в веб-клиент. Обе половины ещё и показывают состояние в инбоксе: облачные сессии и `⚡` сверху, `▽` снизу, ждущие — по номеру места, и бейдж с уровнем, облаком, очередью и временем ожидания на каждой строке.
 
-> **EN.** An OpenCode V2 plugin that serialises agent *turns* against a local model engine: at most N sessions may call the local model, everyone else waits before the request is sent. Cloud providers are never gated, subagents inherit their parent's verdict, and a queued session is marked in its own title with its place in the queue. Three levels reorder that queue — `⚡` high, ordinary, `▽` low: a session takes a free slot only while no session of a higher level waits, and a holder yields its slot at the next step boundary to a higher-level waiter. Leases survive across plugin instances (per-location) and processes, are refreshed by a heartbeat, and are released on every terminal event of a turn. A bundled Tampermonkey userscript puts the same `/prio` pill into the web client. Both halves also read `session.metadata` to order the inbox (cloud first, then the level, then the queue place) and to draw a badge with the level, the cloud and the place on every row.
+> **EN.** An OpenCode V2 plugin that serialises agent *turns* against a local model engine: at most N sessions may call the local model, everyone else waits before the request is sent. Cloud providers are never gated, subagents inherit their parent's verdict, and a queued session keeps its place, its level and its wait time in `session.metadata` instead of its title. Three levels reorder that queue — `⚡` high, ordinary, `▽` low: a session takes a free slot only while no session of a higher level waits, and a holder yields its slot at the next step boundary to a higher-level waiter. Leases survive across plugin instances (per-location) and processes, are refreshed by a heartbeat, and are released on every terminal event of a turn. A bundled Tampermonkey userscript puts the same `/prio` pill into the web client. Both halves also read `session.metadata` to order the inbox (cloud first, then the level, then the queue place) and to draw a badge with the level, the cloud, the place and the wait time on every row.
 
 ---
 
@@ -36,7 +36,7 @@
 | **Субагенты** | не занимают слот: наследуют решение родителя (`covered` / `exempt`) |
 | **Видимость очереди** | заголовок ожидающей сессии: `⏳ 2/3 · 3h10m · <title>` — место в очереди и время ожидания; снимается при выдаче слота |
 | **Приоритет** | `/prio` в композере сессии — три уровня очереди: `⚡` приоритет (забирает следующий свободный слот), обычный и `▽` низкий (ждёт за всеми). Держатель слота уступает его ждущему **более высокого** уровня на границе своего следующего шага. Пометка в заголовке. В десктопе там же пилюля над композером |
-| **Сортировка инбокса** | В режиме Inbox секция **Working** идёт по метаданным: облачные → `⚡` → обычные → `▽`, внутри уровня работающие выше ждущих, ждущие строго `1/5 → 2/5 → 3/5`. На каждой строке — бейдж с уровнем, облаком и местом в очереди (клик переключает уровень). Веб — userscript, десктоп — GUI-плагин |
+| **Сортировка инбокса** | В режиме Inbox секция **Working** идёт по метаданным: облачные → `⚡` → обычные → `▽`, внутри уровня работающие выше ждущих, ждущие строго `1/5 → 2/5 → 3/5`. На каждой строке — бейдж с уровнем, облаком, местом в очереди и временем ожидания (клик переключает уровень). Веб — userscript, десктоп — GUI-плагин |
 | **Тайм-аут** | 4 часа ожидания (настраивается), дальше — `proceed` сверх лимита или `hold` |
 | **Отказоустойчивость** | heartbeat, stale-лизаренс, boot-cleanup по мёртвому pid, fail-open на любых ошибках |
 | **Служебные вызовы** | `title`, `compaction`/`summary`, `generate` не гейтятся вообще |
@@ -303,8 +303,8 @@ Eсли строки `ready` нет — плагин не загрузился (
 `effect`, `@opencode/*` остаются внешними — приложение подставляет свои). Опции те же:
 `priorityCommand` (имя команды, по умолчанию `prio`), `priorityEnabled`,
 `sortInbox` (сортировка и бейджи в инбоксе, по умолчанию `true`), `titleMarks`
-(`"all"` | `"waiting"` | `"none"`, по умолчанию `"waiting"`) и `stateMetadata`
-(писать состояние в `session.metadata`, по умолчанию `true`).
+(`"all"` | `"waiting"` | `"none"`, по умолчанию `"none"` — заголовок не трогаем) и
+`stateMetadata` (писать состояние в `session.metadata`, по умолчанию `true`).
 
 ### Пилюля в веб-UI (userscript, хак)
 
@@ -314,18 +314,18 @@ Violentmonkey в десктопном браузере, либо Firefox на An
 обходной путь до тех пор, пока веб-хост не начнёт отдавать `platform.plugins` (черновик issue с
 доказательствами — `docs/upstream/web-gui-plugins.md`).
 
-- Состояние — те же `⚡`/`▽` в заголовке (`GET /api/session/{id}`), переключение — тот же
-  `POST /api/session/{id}/command {"name":"prio","text":"high"|"low"|"normal"}`, один клик — один шаг
-  по лесенке (обычная → `⚡` → `▽` → обычная). Расходиться с `/prio` и со списком сессий не может:
-  источник один.
+- Состояние — `metadata["turn-lock"]` из `GET /api/session` (уровень, облако, место, время начала
+  ожидания), переключение — тот же `POST /api/session/{id}/command`
+  с `{"name":"prio","text":"high"|"low"|"normal"}`; один клик — один шаг по лесенке (обычная → `⚡` →
+  `▽` → обычная). Расходиться с `/prio` и со списком сессий не может: источник один.
 - Пароль не спрашивается: скрипт перехватывает `fetch` на document-start и переиспользует
   `Authorization`, который клиент сам шлёт на `/api/*` (а при входе по pairing-ссылке работает и
   cookie). Ничего не сохраняет и никуда не отправляет.
 - Прячется на не-сессионных маршрутах, в саб-сессиях (`parentID` в ответе `/api/session/{id}`:
   приоритет там родительский, свой флаг планировщик не читает) и когда `/prio` не зарегистрирован
   (`priorityEnabled: false`) — как десктопная.
-- Показывает состояние в инбоксе: порядок строк и бейдж с уровнем, облаком и местом в очереди
-  (см. ниже «Приоритет в инбоксе»); выключается константой `INBOX_UI`.
+- Показывает состояние в инбоксе: порядок строк и бейдж с уровнем, облаком, местом в очереди и
+  временем ожидания (`9 мин`, в подсказке — «ждёт 9 минут»); выключается константой `INBOX_UI`.
 - Область действия: `localhost`, `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
   `::1` и имена `*.local` / `*.lan` / `*.home.arpa`. Задаётся не `@include`-масками (в
   манифесте стоит широкий `@match http://*/*`), а проверкой `location.hostname` в начале
@@ -351,23 +351,26 @@ Violentmonkey в десктопном браузере, либо Firefox на An
 сервер отдаёт в `GET /api/session`:
 
 ```json
-{ "turn-lock": { "level": "high", "cloud": true, "position": 2, "total": 5 } }
+{ "turn-lock": { "level": "high", "cloud": true, "position": 2, "total": 5, "since": 1793972715735 } }
 ```
 
-Пишет его серверная половина: уровень — по `/prio`, место в очереди — на каждом тике ожидания,
-`cloud` — по провайдеру последнего запроса модели. Читают обе половины: веб — `GET /api/session`,
-десктоп — `ctx.client.session.list()`. Заголовки при этом остаются чистыми: `⚡`/`▽`/`☁️` из них
-убраны, остаётся только `⏳ 2/5 · 9m ·` — единственный сигнал, который видит клиент без плагина
-(телефон, TUI). Режим задаётся `titleMarks`: `"all"` возвращает прежние метки, `"none"` убирает
-и ожидание.
+Пишет его серверная половина: уровень — по `/prio`, место и время начала ожидания — на каждом тике
+очереди, `cloud` — по провайдеру последнего запроса модели. Читают обе половины: веб —
+`GET /api/session`, десктоп — `ctx.client.session.list()`. Заголовок при этом остаётся текстом
+пользователя: по умолчанию `titleMarks: "none"`, ни `⚡`/`▽`/`☁️`, ни `⏳ 2/5 · 9m ·` в нём нет.
+Режимы: `"waiting"` возвращает `⏳`-метку (для клиента без плагина — телефон, TUI), `"all"` —
+все прежние метки.
 
 Порядок строк: облачные сессии первыми (они не гейтятся вообще), затем уровень, затем место в
 очереди — работающие выше ждущих, ждущие строго `1/5 → 2/5 → 3/5`, — затем прежний порядок
 клиента. DOM не двигается: строке ставится CSS `order`, поэтому keyed-список Solid не ломается.
 
 Бейдж — настоящий элемент, а не текст: иконка уровня (молния / шеврон / облако), место в очереди,
-подсказка при наведении и клик-переключение. Для обычной сессии без очереди и облака бейджа нет,
-чтобы список не шумел.
+время ожидания, подсказка при наведении и клик-переключение. Время берётся из `since` и считается
+на клиенте, поэтому бейдж тикает сам, не дожидаясь следующего обновления сессии (место в очереди
+сервер пересчитывает на каждом тике `remindEveryMs`, а `since` при этом не меняется). Формат —
+человеческий, а не `9m`: `42 с`, `9 мин`, `2 ч 5 мин`; в подсказке — словами (`ждёт 2 часа
+5 минут`). Для обычной сессии без очереди, облака и ожидания бейджа нет, чтобы список не шумел.
 
 - **Веб**: `userscript/turn-lock-prio.user.js`, выключатель — константа `INBOX_UI`.
 - **Десктоп**: GUI-половина, `plugins[].options.sortInbox: false` выключает (по умолчанию
@@ -417,7 +420,10 @@ Get-Content "$env:TEMP\opencode\turn-lock\*.lease.json"
 - **Клик по бейджу ищет сессию по заголовку.** В DOM строки нет id, поэтому два одинаковых заголовка делят первый матч. Если это мешает — `sortInbox: false` и пилюля над композером остаются.
 - **`cloud` — это последний запрос, а не модель сессии.** Метка ставится на облачном шаге и снимается на локальном; сессия, которая ещё ни разу не ходила в модель, облачной не считается.
 - **Метаданные — наши только по ключу.** Плагин пишет `metadata["turn-lock"]`, остальные ключи сохраняет. Если сессию форкнули или импортировали и метаданные не скопировались, бейдж пропадёт до следующего `/prio` или ожидания — заголовок как фолбэк остаётся.
-- **Без UI приоритет не виден.** По умолчанию `titleMarks: "waiting"`: `⚡`/`▽`/`☁️` живут только в метаданных, поэтому клиент без плагина (телефон, TUI) и десктоп без установленной пакетом GUI-половины показывают только `⏳`. Нужна видимость везде — `titleMarks: "all"`.
+- **Без UI состояние не видно.** По умолчанию `titleMarks: "none"`: уровень, облако, место и время
+  ожидания живут только в метаданных, поэтому клиент без плагина (телефон, TUI) и десктоп без
+  установленной пакетом GUI-половины не показывают ничего. Нужна видимость везде — `titleMarks:
+  "waiting"` (метка `⏳ 2/5 · 9m ·`) или `"all"`.
 - **Сортировка не меняет очередь.** Она только рисует список; слот по-прежнему выдаёт планировщик по `/prio` и `holdBack`. `⚡` сверху не значит «уже работает» — ждущая сессия тоже стоит в Working (`⏳`).
 - **Windows/pid.** Boot-cleanup проверяет живость процесса через `process.kill(pid, 0)`; на Windows это поддерживается, но если сервер запущен под другим пользователем, ответ будет `EPERM` — лизаренс остаётся (и убирается по `leaseTimeoutMs`).
 
@@ -429,8 +435,8 @@ Get-Content "$env:TEMP\opencode\turn-lock\*.lease.json"
 src/
   index.ts        плагин: конфиг, хук, события, метки заголовков, лог
   gui.tsx         десктоп-половина: пилюля очереди над композером, три уровня (Solid)
-  state.ts        состояние сессии в metadata: уровень, облако, место; разбор старых заголовков
-  inbox.ts        инбокс: порядок строк по состоянию, бейдж уровня/облака/очереди, тик
+  state.ts        состояние сессии в metadata: уровень, облако, место, время; разбор старых заголовков
+  inbox.ts        инбокс: порядок строк по состоянию, бейдж уровня/облака/очереди/времени, тик
   core.ts         чистое ядро: лизаренсы, acquire/refresh/release/cancel, sweep (без fs и без OpenCode)
   store-file.ts   файловый стор: атомарная запись, терпимое чтение, boot-cleanup
 vite.config.ts    сборка GUI-бандла пресетом @opencode/plugin/gui/vite → dist/gui-experimental.cjs
@@ -438,13 +444,13 @@ tests/
   core.test.ts    планировщик: лимит, тайм-ауты, stale, cancel, две «процесса» на одном сторе
   store.test.ts   файловый стор: round-trip, битые файлы, pruneDead, общий лимит
   plugin.test.ts  плагин целиком через фейковый ctx (хук, события, метки, субагенты)
-  state.test.ts   метаданные: форма, мусор, фолбэк из заголовка, ключ сортировки
+  state.test.ts   метаданные: форма, мусор, фолбэк из заголовка, ключ сортировки, подписи ожидания
   inbox.test.ts   инбокс: порядок, бейджи, клик, контракт userscript
   stubs/          заглушка @opencode/plugin для node --test
 ```
 
 ```powershell
-npm test          # 67 тестов, Node >= 22.18 (type stripping, сборки нет)
+npm test          # 69 тестов, Node >= 22.18 (type stripping, сборки нет)
 npm run check     # tsc --noEmit: серверная часть, тесты и gui.tsx
 npm run build     # dist/gui-experimental.cjs — бандл пилюли (его же коммитим)
 ```

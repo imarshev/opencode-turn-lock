@@ -96,6 +96,8 @@ type Behavior = {
   failUpdate?: boolean
   parents?: Record<string, string>
   titles?: Record<string, string>
+  /** Sessions the server answers with "not found" (deleted, archived). */
+  missing?: Set<string>
 }
 
 function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
@@ -123,6 +125,7 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
         }
       },
       get: async ({ sessionID }: { sessionID: string }) => {
+        if (behavior.missing?.has(sessionID)) throw new Error(`session ${sessionID} not found`)
         return { id: sessionID, parentID: parents[sessionID], title: titleOf(sessionID), metadata: metadata.get(sessionID) }
       },
       update: async ({ sessionID, title, metadata: next }: { sessionID: string; title?: string; metadata?: Record<string, unknown> }) => {
@@ -684,6 +687,66 @@ test("boot restores a mark left by a dead process", async () => {
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("a wait mark left by a session that is gone never takes the first place", async () => {
+  const harness = await setup({ remindEveryMs: 60 }, { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } })
+  try {
+    // A session deleted while it was queued leaves its sidecar behind: the
+    // terminal event cannot restore a title for a session that no longer
+    // exists. Nothing but the mark's age says the wait is over — and the
+    // reminder tick refreshes that age on every pass, so an hour-old mark is a
+    // phantom, not a waiter. It must not hold place 1 forever.
+    writeFileSync(
+      join(harness.dir, "ses_gone.wait.json"),
+      JSON.stringify({
+        sid: "ses_gone",
+        pid: process.pid,
+        owner: "C:/work",
+        since: Date.now() - 3_600_000,
+        markedAt: Date.now() - 3_600_000,
+      }),
+      "utf8",
+    )
+
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+    const third = harness.context("ses_3")
+    await until(() => readState(harness.metadata.get("ses_3"))?.position === 1, "the first free place")
+    assert.equal(readState(harness.metadata.get("ses_3"))?.total, 1, "the phantom is not counted")
+    assert.equal(readdirSync(harness.dir).includes("ses_gone.wait.json"), false, "the phantom is pruned")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await third
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("deleting a queued session drops its sidecar instead of leaving a phantom", async () => {
+  const missing = new Set<string>()
+  const harness = await setup(
+    { remindEveryMs: 60 },
+    { titles: { ses_1: "one", ses_2: "two", ses_3: "three" }, missing },
+  )
+  try {
+    await harness.context("ses_1")
+    await harness.context("ses_2")
+    const third = harness.context("ses_3")
+    await until(() => readState(harness.metadata.get("ses_3"))?.since !== undefined, "the wait is recorded")
+
+    // The user deletes the queued session. There is no title left to restore,
+    // so the sidecar must go right away rather than wait for the age check.
+    missing.add("ses_3")
+    harness.bus.emit({ type: "session.deleted", data: { sessionID: "ses_3" } })
+    await third
+    await until(
+      () => readdirSync(harness.dir).includes("ses_3.wait.json") === false,
+      "the sidecar of a deleted session is dropped",
+    )
+  } finally {
+    await harness.teardown()
   }
 })
 

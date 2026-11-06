@@ -713,6 +713,14 @@ export default Plugin.define({
       } catch {
         return []
       }
+      // A waiter rewrites its sidecar on every reminder tick, so `markedAt` is
+      // its heartbeat. A mark that has not moved for several ticks belongs to a
+      // wait that ended without a terminal event — a session deleted while it
+      // was queued, a turn killed from another client — and must not keep
+      // holding place 1 (or a high-priority reservation) forever. With
+      // `remindEveryMs: 0` there is no heartbeat, so age proves nothing and the
+      // liveness of the process stays the only signal.
+      const staleAfterMs = config.remindEveryMs > 0 ? Math.max(config.remindEveryMs * 3, 5 * 60_000) : Infinity
       const waiters: Array<{ sid: string; since: number }> = []
       for (const name of names) {
         if (!name.endsWith(".wait.json")) continue
@@ -722,6 +730,11 @@ export default Plugin.define({
         const pid = typeof mark.pid === "number" ? mark.pid : undefined
         if (pid !== undefined && pid !== process.pid && !processAlive(pid)) continue
         const since = typeof mark.since === "number" ? mark.since : typeof mark.markedAt === "number" ? mark.markedAt : 0
+        const markedAt = typeof mark.markedAt === "number" ? mark.markedAt : since
+        if (Date.now() - markedAt > staleAfterMs) {
+          dropWaitMark(sid)
+          continue
+        }
         waiters.push({ sid, since })
       }
       return waiters.sort((a, b) => a.since - b.since || a.sid.localeCompare(b.sid))
@@ -927,6 +940,13 @@ export default Plugin.define({
       void syncState(sid, { position: null, total: null, since: null })
       const wasMarked = marked.delete(sid)
       if (!wasMarked && !readWaitMark(sid)) return
+      // A session that no longer exists has no title to restore, so the usual
+      // "keep the sidecar, retry on the next boot" would keep a phantom waiter
+      // in the queue for good. Drop it now.
+      if (reason === "session.deleted" || reason === "session.archived") {
+        dropWaitMark(sid)
+        return
+      }
       if (!canEditTitle()) {
         dropWaitMark(sid)
         return

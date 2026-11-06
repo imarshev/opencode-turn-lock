@@ -113,6 +113,25 @@ test("trace: disabled writes nothing and reports no file", () => {
   }
 })
 
+test("trace: a payload field cannot overwrite the envelope", () => {
+  const dir = tempDir()
+  try {
+    const at = 1_800_000_000_000
+    const trace = createTrace({ dir, now: () => at })
+    // A handoff duration used to be written as `ms` and clobbered the
+    // timestamp; the envelope must win.
+    trace.write("handoff.arm", { sid: "ses_a", delayMs: 1000, ms: 1000, ev: "fake", t: "fake" })
+    const file = join(dir, `lock-${dayKey(at)}.jsonl`)
+    const line = JSON.parse(readFileSync(file, "utf8").trim())
+    assert.equal(line.ms, at)
+    assert.equal(line.ev, "handoff.arm")
+    assert.equal(line.t, new Date(at).toISOString())
+    assert.equal(line.delayMs, 1000)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test("trace: dayKey is the local calendar day", () => {
   const at = new Date(2026, 10, 7, 1, 30, 0).getTime()
   assert.equal(dayKey(at), "2026-11-07")

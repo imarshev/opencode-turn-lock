@@ -487,6 +487,13 @@ jq -c 'select(.ev=="stream.open" or .ev=="stream.closed")' lock-*.jsonl
 jq -c 'select(.ev=="snapshot")' lock-*.jsonl | tail -5
 ```
 
+Полный формат полей, PowerShell-рецепты без jq и **чек-лист надёжности** (восемь вопросов с нормой и аномалией) — `docs/logs.md`. Сводка одной командой:
+
+```powershell
+python tools\trace-report.py          # сегодняшний файл
+python tools\trace-report.py <файл>   # конкретный день
+```
+
 - **Метки ожидания**: `%TEMP%/opencode/turn-lock/*.wait.json`, внутри `{ sid, pid, owner, since, createdAt, markedAt }` — кто ждёт, с какого момента, когда создана сессия (ключ сортировки очереди, нужен другим инстансам) и когда заголовок обновлялся. Набор этих файлов и есть очередь.
 - **Флаги очереди**: `%TEMP%/opencode/turn-lock/*.prio.json`, внутри `{ sid, pid, owner, since, level }` — `level` (`high`/`low`) и с какого момента; обычной сессии файла нет.
 - **Заголовки ожидающих сессий** (то, что видит телефон): `opencode api get /api/session` — у ждущих `title` начинается с `⏳ `.
@@ -549,7 +556,7 @@ tests/
 ```
 
 ```powershell
-npm test          # 129 тестов, Node >= 22.18 (type stripping, сборки нет)
+npm test          # 131 тест, Node >= 22.18 (type stripping, сборки нет)
 npm run check     # tsc --noEmit: серверная часть, тесты и gui.tsx
 npm run build     # dist/gui-experimental.cjs — бандл пилюли (его же коммитим)
 ```

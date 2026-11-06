@@ -1472,10 +1472,10 @@ export default Plugin.define({
       const previous = handoffs.get(sid)
       if (previous?.timer) clearTimeout(previous.timer)
       const ms = Math.max(config.handoffMs, config.pollMs * 2)
-      t("handoff.arm", { sid, kind, ms, replaced: previous?.kind ?? null })
+      t("handoff.arm", { sid, kind, delayMs: ms, replaced: previous?.kind ?? null })
       const timer = setTimeout(() => {
         handoffs.delete(sid)
-        t("handoff.fire", { sid, kind, ms })
+        t("handoff.fire", { sid, kind, delayMs: ms })
         if (!held.delete(sid)) return
         lock.release(sid, kind === "tool" ? "no tool started" : "no continuation")
         void syncState(sid, { holding: null })
@@ -1634,6 +1634,22 @@ export default Plugin.define({
             void refreshPlaces()
           })
         }
+        // The iterator ended without throwing. On unload that is the normal
+        // path (the abort signal stops the loop); at any other time it means
+        // the subscription is over and this instance will never see a step
+        // boundary again. Either way the line must exist: `stream.open`
+        // without a matching `closed` is itself the symptom.
+        t("stream.closed", {
+          events: stream.events,
+          livedMs: Date.now() - stream.openedAt,
+          lastEventAgoMs: stream.lastAt ? Date.now() - stream.lastAt : null,
+          aborted: controller.signal.aborted,
+          how: "ended",
+          error: null,
+        })
+        if (!controller.signal.aborted) {
+          log("warn", `event stream ended unexpectedly after ${stream.events} events`)
+        }
       } catch (error) {
         // The stream closed: on unload that is expected, at any other time it
         // means this instance will never see a step boundary again. The trace
@@ -1643,6 +1659,7 @@ export default Plugin.define({
           livedMs: Date.now() - stream.openedAt,
           lastEventAgoMs: stream.lastAt ? Date.now() - stream.lastAt : null,
           aborted: controller.signal.aborted,
+          how: "threw",
           error: String((error as { message?: string })?.message ?? error),
         }
         t("stream.closed", closed)
@@ -1727,6 +1744,7 @@ export default Plugin.define({
       scope: config.lockScope,
       limit: config.limit,
       handoffMs: config.handoffMs,
+      leaseTimeoutMs: config.leaseTimeoutMs,
       pollMs: config.pollMs,
       refreshEveryMs: config.refreshEveryMs,
       sweepMs: config.sweepMs,

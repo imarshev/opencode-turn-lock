@@ -101,7 +101,10 @@ export function createTrace(options: TraceOptions): Trace {
           currentFile = fileFor(day)
           prune(at)
         }
-        const line = JSON.stringify({ t: new Date(at).toISOString(), ms: at, ...base, ev: event, ...fields })
+        // The envelope fields are authoritative: a payload field named `ms`
+        // (a duration) must never overwrite the timestamp. Spread the fields
+        // first, then the envelope.
+        const line = JSON.stringify({ ...fields, ...base, ev: event, t: new Date(at).toISOString(), ms: at })
         appendFileSync(currentFile, `${line}\n`, "utf8")
       } catch {
         // diagnosis must never break the agent

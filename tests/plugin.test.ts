@@ -2235,6 +2235,7 @@ test("request scope: the trace records a handoff and the tool that ends it", asy
     const arm = lines.find((line) => line.ev === "handoff.arm")
     assert.equal(arm?.sid, "ses_a")
     assert.equal(arm?.kind, "tool")
+    assert.equal(typeof arm?.delayMs, "number", "the handoff delay is delayMs, not the envelope ms")
     const tool = lines.find((line) => line.ev === "tool.release")
     assert.equal(tool?.sid, "ses_a")
     assert.equal(typeof tool?.gapMs, "number", "the tool line says how long the gap lasted")
@@ -2269,6 +2270,26 @@ test("request scope: a sibling instance traces why it left the lease alone", asy
   } finally {
     await sibling.teardown()
     await holder.teardown()
+  }
+})
+
+test("request scope: unloading the plugin closes the stream line", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1 })
+  try {
+    await harness.context("ses_a")
+    await harness.cleanup?.()
+    await until(
+      () => harness.traceLines().some((line) => line.ev === "stream.closed"),
+      "the trace records the closed subscription",
+    )
+    const lines = harness.traceLines()
+    const closed = lines.find((line) => line.ev === "stream.closed")
+    assert.equal(closed?.aborted, true, "unload is an aborted stream")
+    assert.equal(closed?.how, "ended", "the iterator ended rather than throwing")
+    assert.equal(typeof closed?.events, "number")
+    assert.ok(lines.some((line) => line.ev === "shutdown"), "shutdown says what the instance held")
+  } finally {
+    await harness.teardown()
   }
 })
 

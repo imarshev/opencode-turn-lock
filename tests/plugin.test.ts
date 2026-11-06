@@ -925,6 +925,27 @@ test("boot clears a place left in metadata by a waiter that is gone", async () =
   }
 })
 
+test("boot clears a hold left in metadata by a session that no longer holds", async () => {
+  const harness = await setup(
+    {},
+    {
+      titles: { ses_stale: "stale" },
+      metadata: {
+        ses_stale: { "turn-lock": { level: "high", holding: Date.now() - 600_000 } },
+      },
+    },
+  )
+  try {
+    await until(
+      () => readState(harness.metadata.get("ses_stale"))?.holding === undefined,
+      "a hold with no lease behind it is cleared on boot",
+    )
+    assert.equal(readState(harness.metadata.get("ses_stale"))?.level, "high", "the level is kept")
+  } finally {
+    await harness.teardown()
+  }
+})
+
 test("turn-lock notices from an older version never reach the model", async () => {
   const harness = await setup({ limit: 1 })
   try {

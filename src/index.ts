@@ -1141,6 +1141,11 @@ export default Plugin.define({
     async function clearOrphanPlaces(): Promise<number> {
       if (!config.stateMetadata || !canEditTitle() || typeof ctx.session.list !== "function") return 0
       const waiting = new Set(readWaiters().map((waiter) => waiter.sid))
+      // A `holding` with no lease behind it belongs to a session that stopped
+      // holding while this instance was not watching (another instance served
+      // the release, or the plugin reloaded and lost its `held` set). The badge
+      // must not keep saying "держит слот" about a session that is not running.
+      const leased = new Set(lock.snapshot().leases.map((lease) => lease.sid))
       let cleared = 0
       let cursor: string | undefined
       for (let page = 0; page < 50; page += 1) {
@@ -1157,8 +1162,14 @@ export default Plugin.define({
           const sid = typeof info.id === "string" ? info.id : ""
           if (!sid || waiting.has(sid)) continue
           const state = readState(info.metadata)
-          if (!state || (state.position === undefined && state.total === undefined && state.since === undefined)) continue
-          await syncState(sid, { position: null, total: null, since: null })
+          if (!state) continue
+          const place = state.position !== undefined || state.total !== undefined || state.since !== undefined
+          const hold = state.holding !== undefined && !leased.has(sid)
+          if (!place && !hold) continue
+          await syncState(sid, {
+            ...(place ? { position: null, total: null, since: null } : {}),
+            ...(hold ? { holding: null } : {}),
+          })
           cleared += 1
         }
         const next = listed?.cursor?.next
@@ -1515,19 +1526,22 @@ export default Plugin.define({
             // cloud session's step must not reserve a local slot.
             const released = held.delete(sid)
             lock.release(sid, type)
-            if (released) void syncState(sid, { holding: null })
+            // The step is over, so nobody holds the slot any more — clear the
+            // badge even when another instance served the request and this one
+            // has no `held` entry for it.
+            void syncState(sid, { holding: null })
             // The fory: this session may ask for the next step at once, so its
             // turn keeps the head of the queue for `requeueGraceMs` (the ticket
             // it already has carries the window).
             if (released) await setGrace(sid)
             continue
           }
-          // Only the instance that granted the lease clears the badge: a queued
-          // session has no `holding`, and another instance's holder must not be
-          // un-highlighted by an event this one merely observed.
-          const dropped = held.delete(sid)
+          // A terminal event ends the request or turn for good; the lease is
+          // released here and the badge must go with it. A queued session has no
+          // `holding`, so this write is a no-op for it.
+          held.delete(sid)
           lock.release(sid, type)
-          if (dropped) void syncState(sid, { holding: null })
+          void syncState(sid, { holding: null })
           // `release` only frees a slot this session held; a queued one has no
           // lease. Its wait is a separate polling loop, and the reminder tick
           // would keep re-marking the title and take the next free slot for a

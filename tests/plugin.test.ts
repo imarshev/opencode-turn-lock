@@ -598,16 +598,41 @@ test("two waiters see their place in the queue", async () => {
     await until(() => harness.titles.get("ses_4") === "⏳ 2/2 · four", "second in queue")
 
     harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
-    await until(() => thirdDone || fourthDone, "a waiter got the slot")
+    await until(() => thirdDone, "the older waiter got the slot")
+    assert.equal(fourthDone, false, "the younger waiter is still queued")
 
-    // Which waiter wins is the lease race, not the displayed order: the place
-    // is a hint, the lock has no FIFO. Whoever is left must drop the "N/M".
-    const remaining = thirdDone ? "ses_4" : "ses_3"
-    const remainingTitle = thirdDone ? "⏳ four" : "⏳ three"
-    await until(() => harness.titles.get(remaining) === remainingTitle, "queue shrank after a grant")
+    // The place is now enforced, so the older waiter is the one served and the
+    // younger one drops its "N/M" and stays at the head of the remaining queue.
+    await until(() => harness.titles.get("ses_4") === "⏳ four", "queue shrank after a grant")
 
     harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
     await Promise.all([third, fourth])
+    assert.equal(fourthDone, true)
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a head that stopped polling does not hold the slot past the grace", async () => {
+  const harness = await setup({ limit: 1, remindEveryMs: 0, fifoGraceMs: 40 }, { titles: { ses_1: "one", ses_2: "two" } })
+  try {
+    await harness.context("ses_1")
+    let secondDone = false
+    const second = harness.context("ses_2").then(() => {
+      secondDone = true
+    })
+    await until(() => readState(harness.metadata.get("ses_2"))?.position === 1, "the waiter is marked")
+
+    // Alive (its pid is this process) but never polls: it owns place 1 and will
+    // never take the slot. After one grace window the slot must go to place 2.
+    writeFileSync(
+      join(harness.dir, "ses_ghost.wait.json"),
+      JSON.stringify({ sid: "ses_ghost", pid: process.pid, owner: "C:/work", since: Date.now() - 60_000, markedAt: Date.now() }),
+      "utf8",
+    )
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await until(() => secondDone, "the next place took the slot after the grace")
   } finally {
     await harness.teardown()
   }

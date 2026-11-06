@@ -55,6 +55,7 @@
 //     "onTimeout": "proceed",           // "proceed" (fail-open) | "hold"
 //     "leaseTimeoutMs": 7200000,        // lease without refresh = abandoned
 //     "pollMs": 1000,
+//     "fifoGraceMs": 2000,              // how long place 1 may take a freed slot before place 2 gets it
 //     "refreshEveryMs": 20000,
 //     "sweepMs": 60000,
 //     "releaseOnForm": true,            // a `question` tool form frees the slot
@@ -102,6 +103,9 @@ export type TurnLockConfig = {
   onTimeout: "proceed" | "hold"
   leaseTimeoutMs: number
   pollMs: number
+  /** How long the head of a level may take a freed slot before the next waiter
+   *  of the same level is let through. 0 disables the FIFO order (first awake wins). */
+  fifoGraceMs: number
   refreshEveryMs: number
   sweepMs: number
   releaseOnForm: boolean
@@ -135,6 +139,9 @@ export const DEFAULTS: TurnLockConfig = {
   onTimeout: "proceed",
   leaseTimeoutMs: 2 * 60 * 60_000,
   pollMs: 1_000,
+  // The head of a level gets two poll ticks to take a freed slot; if it does not
+  // (dead process, wedged event loop), the next place is served instead.
+  fifoGraceMs: 2_000,
   refreshEveryMs: 20_000,
   sweepMs: 60_000,
   releaseOnForm: true,
@@ -254,6 +261,7 @@ function mergeConfig(base: TurnLockConfig, raw: unknown): TurnLockConfig {
     onTimeout: value.onTimeout === "hold" ? "hold" : value.onTimeout === "proceed" ? "proceed" : base.onTimeout,
     leaseTimeoutMs: asNumber(value.leaseTimeoutMs, base.leaseTimeoutMs, 1_000),
     pollMs: Math.max(5, asNumber(value.pollMs, base.pollMs, 5)),
+    fifoGraceMs: Math.max(0, asNumber(value.fifoGraceMs, base.fifoGraceMs, 0)),
     refreshEveryMs: Math.max(0, asNumber(value.refreshEveryMs, base.refreshEveryMs, 0)),
     sweepMs: Math.max(1_000, asNumber(value.sweepMs, base.sweepMs, 1_000)),
     releaseOnForm: asBoolean(value.releaseOnForm, base.releaseOnForm),
@@ -836,19 +844,52 @@ export default Plugin.define({
     const waitingAbove = (rank: number, except?: string) =>
       rankedWaiters().filter((waiter) => waiter.sid !== except && waiter.rank > rank)
 
-    /** May `sid` take a free slot? No, while anyone goes before it: a better level,
-     *  or the older flag inside the level it is flagged at. Two ordinary waiters
-     *  have never been ordered against each other — the slot is the first one awake. */
-    const holdsBack = (sid: string): boolean => {
+    /** When a slot last freed. The head of a level may take it at once; the next
+     *  place is let through only after another `fifoGraceMs`, so a head that
+     *  stopped polling cannot hold the slot. */
+    const slotFreePath = join(config.dir, "slot-free.json")
+
+    const readFreeAt = (): number => {
+      try {
+        const value = JSON.parse(readFileSync(slotFreePath, "utf8"))
+        return typeof value?.at === "number" ? value.at : 0
+      } catch {
+        return 0
+      }
+    }
+
+    const writeFreeAt = (at: number): void => {
+      try {
+        mkdirSync(config.dir, { recursive: true })
+        writeFileSync(slotFreePath, JSON.stringify({ at }), "utf8")
+      } catch {
+        // best-effort: without the file the queue falls back to the first awake
+      }
+    }
+
+    /** May `sid` take a free slot? No, while anyone goes before it: a better level
+     *  always, and an older waiter of its own level until the head has had its
+     *  `fifoGraceMs`. `since` is when this wait began; a flagged session is
+     *  ordered by when it asked for the level, exactly like `orderedWaiters`. */
+    const holdsBack = (sid: string, since: number): boolean => {
       const flag = readPriority(sid)
       const mine = flag ? PRIORITY_RANK[flag.level] : PRIORITY_RANK.normal
-      for (const waiter of rankedWaiters()) {
-        if (waiter.sid === sid) continue
-        if (waiter.rank > mine) return true
-        if (!flag || waiter.rank !== mine) continue
-        if (waiter.age < flag.since || (waiter.age === flag.since && waiter.sid < sid)) return true
-      }
-      return false
+      const age = flag ? flag.since : since
+      const waiters = rankedWaiters()
+      if (waiters.some((waiter) => waiter.sid !== sid && waiter.rank > mine)) return true
+      if (config.fifoGraceMs <= 0) return false
+      const ahead = waiters.filter(
+        (waiter) =>
+          waiter.sid !== sid &&
+          waiter.rank === mine &&
+          (waiter.age < age || (waiter.age === age && waiter.sid < sid)),
+      )
+      if (!ahead.length) return false
+      // Each place ahead gets one grace window: the head takes the slot at once,
+      // place 2 after one window, place 3 after two, and so on. The window is at
+      // least two polls, so a head always gets a real chance to wake up.
+      const grace = Math.max(config.fifoGraceMs, config.pollMs * 2)
+      return Date.now() - readFreeAt() < ahead.length * grace
     }
 
     /** The queue in the order it will actually be served: the best level first
@@ -1024,8 +1065,8 @@ export default Plugin.define({
           log(
             "info",
             `wait ${event.sid}: ${
-              event.blocked === "priority"
-                ? `a session of a higher priority takes the next free slot (${event.held}/${event.limit} busy)`
+              event.blocked === "ahead"
+                ? `a session ahead in the queue takes the next free slot (${event.held}/${event.limit} busy)`
                 : `${event.held}/${event.limit} local sessions are busy`
             }${event.waitedMs ? ` (already ${Math.round(event.waitedMs / 1000)}s)` : ""}`,
           )
@@ -1111,6 +1152,7 @@ export default Plugin.define({
       owner,
       onChange,
       holdBack: config.priorityEnabled ? holdsBack : undefined,
+      onFree: writeFreeAt,
     })
 
     // Provider locality, cached until config/provider updates.

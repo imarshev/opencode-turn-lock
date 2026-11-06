@@ -22,6 +22,7 @@ registerHooks({
 const mod = await import("../src/index.ts")
 const plugin = mod.default
 const { fileStore } = await import("../src/store-file.ts")
+const { readState } = await import("../src/state.ts")
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
@@ -103,6 +104,7 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
   const updates: Array<{ sessionID: string; title: string }> = []
   const parents = behavior.parents ?? {}
   const titles = new Map<string, string>(Object.entries(behavior.titles ?? {}))
+  const metadata = new Map<string, Record<string, unknown>>()
   const titleOf = (sessionID: string) => titles.get(sessionID) ?? "test session"
   const commands: Array<{ name: string; description?: string; execute: (input: unknown) => Promise<void> }> = []
   const ctx = {
@@ -121,12 +123,15 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
         }
       },
       get: async ({ sessionID }: { sessionID: string }) => {
-        return { id: sessionID, parentID: parents[sessionID], title: titleOf(sessionID) }
+        return { id: sessionID, parentID: parents[sessionID], title: titleOf(sessionID), metadata: metadata.get(sessionID) }
       },
-      update: async ({ sessionID, title }: { sessionID: string; title: string }) => {
+      update: async ({ sessionID, title, metadata: next }: { sessionID: string; title?: string; metadata?: Record<string, unknown> }) => {
         if (behavior.failUpdate) throw new Error("session update failed")
-        titles.set(sessionID, title)
-        updates.push({ sessionID, title })
+        if (typeof title === "string") {
+          titles.set(sessionID, title)
+          updates.push({ sessionID, title })
+        }
+        if (next !== undefined) metadata.set(sessionID, next)
       },
     },
     provider: {
@@ -151,7 +156,7 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
     },
     event: { subscribe: bus.subscribe },
   }
-  return { ctx, hooks, bus, titles, updates, commands }
+  return { ctx, hooks, bus, titles, metadata, updates, commands }
 }
 
 type Harness = Awaited<ReturnType<typeof setup>>
@@ -159,7 +164,7 @@ type Harness = Awaited<ReturnType<typeof setup>>
 async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior = {}) {
   const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
   const logFile = join(dir, "turn-lock.log")
-  const { ctx, hooks, bus, titles, updates, commands } = makeCtx(
+  const { ctx, hooks, bus, titles, metadata, updates, commands } = makeCtx(
     {
       dir,
       logFile,
@@ -183,6 +188,7 @@ async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior
     hooks,
     bus,
     titles,
+    metadata,
     updates,
     commands,
     cleanup,
@@ -777,7 +783,7 @@ test("priority mark composes with the waiting prefix", () => {
 })
 
 test("/prio marks the session and writes the flag; a second call clears both", async () => {
-  const harness = await setup({}, { titles: { ses_1: "one" } })
+  const harness = await setup({ titleMarks: "all" }, { titles: { ses_1: "one" } })
   try {
     await harness.context("ses_1")
     assert.equal(harness.titles.get("ses_1"), "one", "an ordinary session keeps its title")
@@ -801,7 +807,7 @@ test("/prio marks the session and writes the flag; a second call clears both", a
 })
 
 test("a priority waiter takes the next free slot ahead of an older ordinary waiter", async () => {
-  const harness = await setup({}, { titles: { ses_3: "three", ses_4: "four" } })
+  const harness = await setup({ titleMarks: "all" }, { titles: { ses_3: "three", ses_4: "four" } })
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
@@ -833,7 +839,7 @@ test("a priority waiter takes the next free slot ahead of an older ordinary wait
 })
 
 test("an active session yields its slot at the next step, without breaking the running one", async () => {
-  const harness = await setup({}, { titles: { ses_1: "one", ses_3: "three" } })
+  const harness = await setup({ titleMarks: "all" }, { titles: { ses_1: "one", ses_3: "three" } })
   try {
     await harness.context("ses_1") // one step done, the slot is held
     await harness.context("ses_2")
@@ -868,7 +874,7 @@ test("an active session yields its slot at the next step, without breaking the r
 })
 
 test("priority off leaves nobody holding a slot back", async () => {
-  const harness = await setup({}, { titles: { ses_3: "three" } })
+  const harness = await setup({ titleMarks: "all" }, { titles: { ses_3: "three" } })
   try {
     await harness.context("ses_1")
     await harness.context("ses_2")
@@ -911,7 +917,7 @@ test("the command argument survives both shapes a client may send", () => {
 })
 
 test("/prio with the command name still in the text turns priority off", async () => {
-  const harness = await setup({}, { titles: { ses_1: "one" } })
+  const harness = await setup({ titleMarks: "all" }, { titles: { ses_1: "one" } })
   try {
     await harness.context("ses_1")
     await harness.command("ses_1", "prio", "on")
@@ -943,7 +949,7 @@ test("the low mark composes with the waiting prefix", () => {
 })
 
 test("/prio low marks the session with ▽ and records the level", async () => {
-  const harness = await setup({}, { titles: { ses_1: "one" } })
+  const harness = await setup({ titleMarks: "all" }, { titles: { ses_1: "one" } })
   try {
     await harness.context("ses_1")
 
@@ -963,8 +969,51 @@ test("/prio low marks the session with ▽ and records the level", async () => {
   }
 })
 
+test("by default the level lives in metadata, not in the title", async () => {
+  const harness = await setup({ limit: 1 }, { titles: { ses_1: "one", ses_2: "two" } })
+  try {
+    await harness.context("ses_1") // the only slot is held
+    await harness.command("ses_2", "prio", "high")
+    assert.equal(harness.titles.get("ses_2"), "two", "no ⚡ in the title")
+    await until(() => readState(harness.metadata.get("ses_2"))?.level === "high", "the level is stored")
+
+    let done = false
+    const waiting = harness.context("ses_2").then(() => {
+      done = true
+    })
+    await until(() => harness.titles.get("ses_2") === "⏳ two", "the wait label is the only title mark")
+    const state = readState(harness.metadata.get("ses_2"))
+    assert.equal(state?.level, "high", "the level survives the wait")
+    assert.equal(state?.position, 1)
+    assert.equal(state?.total, 1)
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await waiting
+    await until(() => readState(harness.metadata.get("ses_2"))?.position === undefined, "the place is cleared on grant")
+    assert.equal(harness.titles.get("ses_2"), "two")
+    assert.equal(done, true)
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a cloud request is recorded in metadata and leaves the title alone", async () => {
+  const harness = await setup({}, { titles: { ses_cloud: "cloud" } })
+  try {
+    await harness.context("ses_cloud", "polzaai")
+    await until(() => readState(harness.metadata.get("ses_cloud"))?.cloud === true, "the cloud flag is stored")
+    assert.equal(harness.titles.get("ses_cloud"), "cloud", "no ☁️ in the title by default")
+
+    await harness.context("ses_cloud", "strata")
+    await until(() => readState(harness.metadata.get("ses_cloud"))?.cloud === undefined, "switching back clears it")
+    assert.equal(harness.titles.get("ses_cloud"), "cloud")
+  } finally {
+    await harness.teardown()
+  }
+})
+
 test("the queue is served by level: ⚡ first, then ordinary, then ▽", async () => {
-  const harness = await setup({ limit: 1 }, { titles: { ses_2: "two", ses_3: "three", ses_4: "four" } })
+  const harness = await setup({ limit: 1, titleMarks: "all" }, { titles: { ses_2: "two", ses_3: "three", ses_4: "four" } })
   try {
     await harness.context("ses_1") // the only slot is held
 
@@ -1010,7 +1059,7 @@ test("the queue is served by level: ⚡ first, then ordinary, then ▽", async (
 })
 
 test("a low session gives its slot up to an ordinary waiter", async () => {
-  const harness = await setup({}, { titles: { ses_1: "one", ses_3: "three" } })
+  const harness = await setup({ titleMarks: "all" }, { titles: { ses_1: "one", ses_3: "three" } })
   try {
     await harness.command("ses_1", "prio", "low")
     assert.equal(harness.titles.get("ses_1"), "▽ one", "the flag marks the session before it runs")
@@ -1050,7 +1099,7 @@ test("a low session gives its slot up to an ordinary waiter", async () => {
 })
 
 test("a flag file written before levels existed still means ⚡", async () => {
-  const harness = await setup({ limit: 1 }, { titles: { ses_2: "two", ses_3: "three" } })
+  const harness = await setup({ limit: 1, titleMarks: "all" }, { titles: { ses_2: "two", ses_3: "three" } })
   try {
     await harness.context("ses_1")
     // the shape 0.1 wrote: no `level` field at all

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.4.0
-// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и сортировка working-сессий в инбоксе по приоритету для turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
+// @version      0.5.0
+// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и бейджи приоритета/облака/места в очереди для working-сессий в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
 // @match        https://*/*
@@ -18,16 +18,18 @@
 // (see docs/upstream/web-gui-plugins.md). Until that is fixed upstream, this
 // script draws the same pill the desktop app gets from ./gui-experimental.
 //
-// It is deliberately dumb, exactly like the desktop pill: the state is the "⚡"
-// or "▽" prefix of the session title, and the switch is the server-side `/prio`
-// command. So it cannot disagree with the session list, and a change made on
-// the phone shows up here on the next refresh. One click moves one step down
-// the ladder: ordinary → `⚡` → `▽` → ordinary.
+// It is deliberately dumb, exactly like the desktop pill: the state is the
+// `turn-lock` key of `session.metadata` (the server writes `{level, cloud,
+// position, total}` there), and the switch is the server-side `/prio` command.
+// So it cannot disagree with the scheduler, and a change made on the phone shows
+// up here on the next refresh. One click moves one step down the ladder:
+// ordinary → `⚡` → `▽` → ordinary. Titles written by an older version still
+// read as marks, so nothing has to be migrated by hand.
 //
-// It also sorts the "Working" section of the inbox by the same marks. The web
-// client orders that section by `time.busy` and knows nothing about /prio, so
-// the rows are re-ordered visually with CSS `order` (the DOM is not moved: the
-// list is a Solid keyed `For`). Set SORT_WORKING to false below to turn it off.
+// It also draws the "Working" section of the inbox: rows are ordered with CSS
+// `order` (the DOM is not moved: the list is a Solid keyed `For`) and each row
+// gets a badge — level icon, cloud, place in the queue. Set INBOX_UI to false
+// below to turn both off.
 //
 // Auth: the script never asks for the password. It wraps `fetch` at
 // document-start and reuses the `Authorization` header the app itself sends to
@@ -68,31 +70,225 @@
     return text.startsWith(MARKS.high) ? "high" : text.startsWith(MARKS.low) ? "low" : "normal"
   }
 
-  // ---------------------------------------------------------------- inbox sort
+  // ------------------------------------------------------------------ inbox
   //
-  // The web client renders the "Working" section as a flex column and sorts it
-  // by `time.busy` (oldest first); it has no concept of /prio. The marks are
-  // already in the title, so we only set CSS `order` on the existing rows:
-  //   ⚡ → 0, ordinary → 1, ▽ → 2, then the row's current index.
-  // Moving DOM nodes would fight Solid's keyed list, so we never move them.
-  // The same algorithm lives in src/inbox.ts (covered by tests/inbox.test.ts).
-  const SORT_WORKING = true
+  // The web client renders the "Working" section as a flex column, sorted by
+  // `time.busy`, and knows nothing about the queue. The state now lives in
+  // `session.metadata` (the server writes `{level, cloud, position, total}`), so
+  // this half reads the same `/api/session` list and draws a real badge: an icon
+  // for the level, a cloud for a session that is not gated, and the place in the
+  // queue. Nothing is moved in the DOM: the order is CSS `order` on the flex row
+  // and the badge is one extra node in the row's header line, which Solid does
+  // not recreate when the title changes.
+  //
+  // A row carries no session id in the DOM, so a click is routed by title; two
+  // sessions with the same title would share the first match.
+  const INBOX_UI = true
+  const STATE_KEY = "turn-lock"
   const WORKING = '[data-slot="sidebar-inbox-working"]'
   const INBOX_ROW = '[data-slot="sidebar-inbox-item"]'
-  const RANK = { high: 0, normal: 1, low: 2 }
-  const inboxOrder = (title, index) => (RANK[levelOf(title)] ?? 1) * 1e6 + index
+  const BADGE = "tl-badge"
+  const ICONS = {
+    high: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M9.5 1 3 9h3.8L6 15l6.5-8H8.6L9.5 1z"/></svg>',
+    low: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3.5 6.5 8 11l4.5-4.5"/></svg>',
+    cloud:
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4.6 12a2.9 2.9 0 0 1 .3-5.8 3.9 3.9 0 0 1 7.4 1.2A2.3 2.3 0 0 1 11.7 12z"/></svg>',
+  }
+  const BADGE_CSS = `
+[data-slot="sidebar-inbox-item"] .${BADGE} {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 14px;
+  padding: 0 4px;
+  margin-inline-start: 2px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, currentColor 35%, transparent);
+  background: color-mix(in oklab, currentColor 12%, transparent);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  flex: 0 0 auto;
+  cursor: pointer;
+  user-select: none;
+}
+[data-slot="sidebar-inbox-item"] .${BADGE}[data-level="high"] { color: #f59e0b; }
+[data-slot="sidebar-inbox-item"] .${BADGE}[data-level="low"] { color: #94a3b8; }
+[data-slot="sidebar-inbox-item"] .${BADGE}[data-cloud="true"] { color: #38bdf8; }
+[data-slot="sidebar-inbox-item"] .${BADGE}:hover { filter: brightness(1.25); }
+[data-slot="sidebar-inbox-item"] .${BADGE} svg { width: 9px; height: 9px; }
+`
+
+  const positive = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Math.trunc(Number(value)) : undefined)
+
+  // The same shape src/state.ts reads and writes; a malformed value is ordinary.
+  const readState = (metadata) => {
+    const raw = metadata && typeof metadata === "object" ? metadata[STATE_KEY] : null
+    if (!raw || typeof raw !== "object") return undefined
+    const state = { level: ["high", "normal", "low"].includes(raw.level) ? raw.level : "normal" }
+    if (raw.cloud === true) state.cloud = true
+    const position = positive(raw.position)
+    const total = positive(raw.total)
+    if (position !== undefined && total !== undefined && position <= total) {
+      state.position = position
+      state.total = total
+    }
+    return state
+  }
+
+  // The fallback for sessions marked by an older version.
+  const stateFromTitle = (title) => {
+    let text = String(title || "")
+    const state = { level: "normal" }
+    let found = false
+    if (/^☁️ ?/.test(text)) {
+      state.cloud = true
+      text = text.replace(/^☁️ ?/, "")
+      found = true
+    }
+    if (/^⚡ ?/.test(text)) {
+      state.level = "high"
+      text = text.replace(/^⚡ ?/, "")
+      found = true
+    } else if (/^▽ ?/.test(text)) {
+      state.level = "low"
+      text = text.replace(/^▽ ?/, "")
+      found = true
+    }
+    const wait = /^⏳ (?:(\d+)\/(\d+) · )?/.exec(text)
+    if (wait) {
+      const position = Number(wait[1])
+      const total = Number(wait[2])
+      if (position > 0 && total >= position) {
+        state.position = position
+        state.total = total
+      }
+      found = true
+    }
+    return found ? state : undefined
+  }
+
+  // Cloud first (it is never gated), then the level, then the place in the
+  // queue — running sessions (no place) before the waiters, waiters by number —
+  // then the client's own order.
+  const rankOf = (state, title, index) => {
+    const value = state || stateFromTitle(title) || { level: "normal" }
+    return [
+      value.cloud ? 0 : 1,
+      value.level === "high" ? 0 : value.level === "low" ? 2 : 1,
+      value.position !== undefined ? value.position : -1,
+      index,
+    ]
+  }
+  const compareRank = (left, right) => {
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return left[index] - right[index]
+    }
+    return 0
+  }
+
+  const describe = (state) => {
+    const parts = []
+    if (state.cloud) parts.push(RU ? "облачная модель" : "cloud model")
+    if (state.level === "high") parts.push(RU ? "высокий приоритет" : "high priority")
+    if (state.level === "low") parts.push(RU ? "низкий приоритет" : "low priority")
+    if (state.position !== undefined) {
+      parts.push(RU ? `${state.position}/${state.total} в очереди` : `${state.position}/${state.total} in queue`)
+    }
+    return parts.join(" · ")
+  }
+
+  const hasBadge = (state) =>
+    Boolean(state && (state.cloud || state.level !== "normal" || state.position !== undefined))
+
+  const badgeHtml = (state) => {
+    const icons = `${state.cloud ? ICONS.cloud : ""}${
+      state.level === "high" ? ICONS.high : state.level === "low" ? ICONS.low : ""
+    }`
+    const place = state.position !== undefined ? `<span>${state.position}/${state.total}</span>` : ""
+    return `${icons}${place}`
+  }
+
+  const ensureStyle = () => {
+    if (document.querySelector("style[data-turn-lock]")) return
+    const style = document.createElement("style")
+    style.setAttribute("data-turn-lock", "badge")
+    style.textContent = BADGE_CSS
+    ;(document.head || document.documentElement).appendChild(style)
+  }
+
+  // title -> { id, state }, refreshed from the list the client itself reads.
+  // Two seconds is enough: a level change is a metadata write, not a stream.
+  const rowsByTitle = new Map()
+  let statesAt = 0
+  let statesBusy = false
+  const loadStates = async () => {
+    if (statesBusy) return
+    statesBusy = true
+    try {
+      const response = await api("/api/session")
+      if (!response.ok) return
+      const body = await response.json()
+      const list = (body && body.data) || []
+      rowsByTitle.clear()
+      for (const session of list) {
+        if (!session || typeof session.title !== "string") continue
+        rowsByTitle.set(session.title, { id: session.id, state: readState(session.metadata) })
+      }
+      statesAt = Date.now()
+    } catch {
+      // keep the last known map; the next tick retries
+    } finally {
+      statesBusy = false
+    }
+  }
 
   const sortInbox = () => {
-    if (!SORT_WORKING) return
+    if (!INBOX_UI) return
     const section = document.querySelector(WORKING)
     if (!section) return
-    // The section header is a sibling of the scroll box, so find the rows by
-    // their own marker rather than as `firstElementChild`.
     const rows = [...section.querySelectorAll(INBOX_ROW)]
-    rows.forEach((row, index) => {
-      const title = row.querySelector('span[dir="auto"]')?.textContent || ""
-      const order = String(inboxOrder(title, index))
-      if (row.style.order !== order) row.style.order = order
+    if (!rows.length) return
+    ensureStyle()
+    const ordered = rows
+      .map((row, index) => {
+        const title = row.querySelector('span[dir="auto"]')?.textContent || ""
+        const entry = rowsByTitle.get(title)
+        return { row, title, index, data: entry, state: (entry && entry.state) || stateFromTitle(title) }
+      })
+      .sort(
+        (left, right) =>
+          compareRank(rankOf(left.state, left.title, left.index), rankOf(right.state, right.title, right.index)) ||
+          left.index - right.index,
+      )
+
+    ordered.forEach((entry, order) => {
+      const value = String(order)
+      if (entry.row.style.order !== value) entry.row.style.order = value
+      let badge = entry.row.querySelector(`.${BADGE}`)
+      if (!hasBadge(entry.state)) {
+        if (badge) badge.remove()
+        return
+      }
+      if (!badge) {
+        badge = document.createElement("span")
+        badge.className = BADGE
+        const header = entry.row.firstElementChild
+        if (header) header.insertBefore(badge, header.lastElementChild)
+        else entry.row.appendChild(badge)
+      }
+      const html = badgeHtml(entry.state)
+      if (badge.innerHTML !== html) badge.innerHTML = html
+      badge.dataset.level = entry.state.level
+      badge.dataset.cloud = entry.state.cloud ? "true" : "false"
+      badge.title = describe(entry.state)
+      badge.onclick = (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        if (!entry.data || !entry.data.id) return
+        void setLevel(entry.data.id, CYCLE[entry.state.level] || "normal").catch(() => {})
+      }
     })
   }
 
@@ -179,7 +375,7 @@
     const body = await response.json()
     const info = body && body.data ? body.data : body
     return {
-      level: levelOf(info && info.title),
+      level: (readState(info && info.metadata) || {}).level || levelOf(info && info.title),
       directory: info && info.location ? info.location.directory : undefined,
       // A subagent session is judged by its parent's verdict, not its own: a
       // `/prio` there would write a flag the scheduler never reads.
@@ -436,11 +632,20 @@
   const start = () => {
     // No pill off-route: refresh() mounts it only when the URL is a session.
     void refresh(true)
-    // The inbox is on the home route, not on a session route, so the sort is a
-    // separate tick rather than part of refresh().
-    sortInbox()
+    // The inbox is on the home route, not on a session route, so the view is a
+    // separate tick rather than part of refresh(). The state comes from the
+    // session list, refreshed at most every two seconds while the section is up.
+    if (INBOX_UI) {
+      void loadStates().then(() => sortInbox())
+      sortInbox()
+    }
     setInterval(() => {
-      if (document.visibilityState === "visible") sortInbox()
+      if (document.visibilityState === "visible") {
+        if (INBOX_UI && Date.now() - statesAt > 2000 && document.querySelector(WORKING)) {
+          void loadStates().then(() => sortInbox())
+        }
+        sortInbox()
+      }
       // SPA navigation changes the path without a load, so the route is checked
       // every tick; the title is re-read less often.
       const id = sessionID()
@@ -453,6 +658,7 @@
     }, 1000)
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
+        if (INBOX_UI) void loadStates().then(() => sortInbox())
         sortInbox()
         void refresh(true)
       }

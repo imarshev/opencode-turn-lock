@@ -61,6 +61,8 @@
 //     "releaseOnPermission": true,      // a permission prompt frees the slot
 //     "remindEveryMs": 60000,           // title countdown tick + log line for a long wait
 //     "markWaitingTitle": true,         // prefix the session title with "⏳ " while it waits
+//     "titleMarks": "waiting",          // "all" (⚡/▽/☁️/⏳) | "waiting" (⏳ only) | "none"
+//     "stateMetadata": true,            // write level/cloud/place into session.metadata
 //     "priorityEnabled": true,          // /prio: ⚡ cuts the queue, ▽ stands at the back of it
 //     "priorityCommand": "prio",        // the slash command that sets the level
 //     "priorityTtlMs": 86400000,        // a forgotten ⚡ or ▽ stops working after this long
@@ -77,6 +79,7 @@ import { fileURLToPath } from "node:url"
 import { Plugin } from "@opencode/plugin"
 
 import { createTurnLock, type ChangeEvent } from "./core.ts"
+import { CLOUD_MARK, readState, withState, type TurnLockState } from "./state.ts"
 import { fileStore, processAlive } from "./store-file.ts"
 
 // Which copy of the plugin is running. A loose file in ~/.config/opencode/plugins
@@ -105,6 +108,12 @@ export type TurnLockConfig = {
   releaseOnPermission: boolean
   remindEveryMs: number
   markWaitingTitle: boolean
+  /** Which marks the server writes into the title. `waiting` keeps `⏳ 2/5 · 9m ·`
+   *  (the only queue signal a client without the plugin can see) and leaves the
+   *  priority and cloud marks to the UI, which reads them from metadata. */
+  titleMarks: "all" | "waiting" | "none"
+  /** Write `{level, cloud, position, total}` into `session.metadata`. */
+  stateMetadata: boolean
   priorityEnabled: boolean
   priorityCommand: string
   priorityTtlMs: number
@@ -132,6 +141,10 @@ export const DEFAULTS: TurnLockConfig = {
   releaseOnPermission: true,
   remindEveryMs: 60_000,
   markWaitingTitle: true,
+  // The UI reads the state from metadata; the title keeps only the wait label,
+  // so a phone (or any client without the plugin) still sees the queue place.
+  titleMarks: "waiting",
+  stateMetadata: true,
   priorityEnabled: true,
   priorityCommand: "prio",
   // A forgotten mark must not skew the queue forever: after a day it stops having
@@ -244,6 +257,11 @@ function mergeConfig(base: TurnLockConfig, raw: unknown): TurnLockConfig {
     releaseOnForm: asBoolean(value.releaseOnForm, base.releaseOnForm),
     releaseOnPermission: asBoolean(value.releaseOnPermission, base.releaseOnPermission),
     markWaitingTitle: asBoolean(value.markWaitingTitle, base.markWaitingTitle),
+    titleMarks:
+      value.titleMarks === "all" || value.titleMarks === "none" || value.titleMarks === "waiting"
+        ? value.titleMarks
+        : base.titleMarks,
+    stateMetadata: asBoolean(value.stateMetadata, base.stateMetadata),
     remindEveryMs: asNumber(value.remindEveryMs, base.remindEveryMs, 0),
     priorityEnabled: asBoolean(value.priorityEnabled, base.priorityEnabled),
     priorityCommand:
@@ -337,29 +355,63 @@ export function markFor(level: PriorityLevel): string {
 /** The level mark plus the space the two marks are joined by, if any. */
 const PRIORITY_PREFIX = /^⚡ ?/
 const LOW_PREFIX = /^▽ ?/
+/** The cloud mark the server writes ahead of everything (`titleMarks: "all"`). */
+const CLOUD_PREFIX = /^☁️ ?/
 
-/** The level a title carries: its leading mark, or ordinary when it has none. */
-export function levelOfTitle(title: string): PriorityLevel {
-  if (PRIORITY_PREFIX.test(title)) return "high"
-  if (LOW_PREFIX.test(title)) return "low"
-  return "normal"
+/** Does this title carry the cloud mark? */
+export function hasCloudMark(title: string): boolean {
+  return CLOUD_PREFIX.test(title)
 }
 
-/** Title with every level mark removed (idempotent, touches nothing else). */
-export function withoutLevelMark(title: string): string {
+/** Title with every cloud mark removed (idempotent, touches nothing else). */
+export function withoutCloudMark(title: string): string {
   let result = title
   for (;;) {
-    const next = result.replace(PRIORITY_PREFIX, "").replace(LOW_PREFIX, "")
+    const next = result.replace(CLOUD_PREFIX, "")
     if (next === result) return result
     result = next
   }
 }
 
+/** Title carrying (or not) the cloud mark, with every other mark left in place. */
+export function withCloudMark(title: string, cloud: boolean): string {
+  const base = withoutCloudMark(title)
+  return cloud ? `${CLOUD_MARK}${base}` : base
+}
+
+/** Run `transform` on the title after the cloud mark, then put the mark back. */
+function afterCloud(title: string, transform: (text: string) => string): string {
+  const cloud = hasCloudMark(title)
+  const next = transform(withoutCloudMark(title))
+  return cloud ? `${CLOUD_MARK}${next}` : next
+}
+
+/** The level a title carries: its leading mark, or ordinary when it has none. */
+export function levelOfTitle(title: string): PriorityLevel {
+  const text = withoutCloudMark(title)
+  if (PRIORITY_PREFIX.test(text)) return "high"
+  if (LOW_PREFIX.test(text)) return "low"
+  return "normal"
+}
+
+/** Title with every level mark removed (idempotent, touches nothing else). */
+export function withoutLevelMark(title: string): string {
+  return afterCloud(title, (text) => {
+    let result = text
+    for (;;) {
+      const next = result.replace(PRIORITY_PREFIX, "").replace(LOW_PREFIX, "")
+      if (next === result) return result
+      result = next
+    }
+  })
+}
+
 /** Title carrying exactly this level's mark (idempotent; `normal` removes both). */
 export function withLevelMark(title: string, level: PriorityLevel): string {
+  const cloud = hasCloudMark(title) ? CLOUD_MARK : ""
   const mark = markFor(level)
-  const base = withoutLevelMark(title)
-  return mark ? `${mark} ${base}` : base
+  const base = withoutLevelMark(withoutCloudMark(title))
+  return `${cloud}${mark ? `${mark} ` : ""}${base}`
 }
 
 /** Title with the priority mark added (idempotent). A `▽` is replaced: a session
@@ -370,12 +422,12 @@ export function withPriorityMark(title: string): string {
 
 /** Title with the priority mark removed (idempotent, touches nothing else). */
 export function withoutPriorityMark(title: string): string {
-  return title.replace(PRIORITY_PREFIX, "")
+  return afterCloud(title, (text) => text.replace(PRIORITY_PREFIX, ""))
 }
 
 /** Does this title carry the priority mark? */
 export function hasPriorityMark(title: string): boolean {
-  return PRIORITY_PREFIX.test(title)
+  return PRIORITY_PREFIX.test(withoutCloudMark(title))
 }
 
 /** Title with the low-priority mark added (idempotent; replaces a `⚡`). */
@@ -385,12 +437,12 @@ export function withLowMark(title: string): string {
 
 /** Title with the low-priority mark removed (idempotent, touches nothing else). */
 export function withoutLowMark(title: string): string {
-  return title.replace(LOW_PREFIX, "")
+  return afterCloud(title, (text) => text.replace(LOW_PREFIX, ""))
 }
 
 /** Does this title carry the low-priority mark? */
 export function hasLowMark(title: string): boolean {
-  return LOW_PREFIX.test(title)
+  return LOW_PREFIX.test(withoutCloudMark(title))
 }
 
 /**
@@ -419,10 +471,11 @@ export function formatWait(waitedMs: number, place?: QueuePlace): string {
 /** Original title with every waiting prefix removed. A leading level mark is not
  *  a waiting prefix: it stays where it is. */
 export function stripWaitPrefix(title: string): string {
+  const cloud = hasCloudMark(title)
   const mark = markFor(levelOfTitle(title))
-  let result = withoutLevelMark(title)
+  let result = withoutLevelMark(withoutCloudMark(title))
   while (WAIT_PREFIX.test(result)) result = result.replace(WAIT_PREFIX, "")
-  return mark ? `${mark} ${result}` : result
+  return `${cloud ? CLOUD_MARK : ""}${mark ? `${mark} ${result}` : result}`
 }
 
 /** Title of a waiting session: `⏳ 2/3 · 3h10m · <title>`, or `⚡ ⏳ …` / `▽ ⏳ …`
@@ -435,10 +488,11 @@ export function withWaitPrefix(
   place?: QueuePlace,
   level: PriorityLevel | boolean = levelOfTitle(title),
 ): string {
-  const base = withoutLevelMark(stripWaitPrefix(title))
+  const cloud = hasCloudMark(title)
+  const base = withoutCloudMark(withoutLevelMark(stripWaitPrefix(title)))
   const label = formatWait(waitedMs, place)
   const mark = markFor(level === true ? "high" : level === false ? "normal" : level)
-  return `${mark ? `${mark} ` : ""}${WAITING_MARK}${label ? `${label} · ` : ""}${base}`
+  return `${cloud ? CLOUD_MARK : ""}${mark ? `${mark} ` : ""}${WAITING_MARK}${label ? `${label} · ` : ""}${base}`
 }
 
 /**
@@ -528,6 +582,90 @@ export default Plugin.define({
 
     const canEditTitle = (): boolean =>
       typeof ctx?.session?.get === "function" && typeof ctx?.session?.update === "function"
+
+    // Machine-readable state, next to the title. `session.metadata` is a real
+    // field (`GET /api/session` returns it), so the UI can read a structured
+    // value instead of parsing a title, and the user's title stays clean. The
+    // cache keeps the per-step hook from re-reading the session on every
+    // request; an error drops the entry, so the next call starts from the
+    // server's copy again. A session's metadata is ours to extend, not to own:
+    // every other key is carried over untouched.
+    type StatePatch = {
+      level?: PriorityLevel
+      cloud?: boolean | null
+      position?: number | null
+      total?: number | null
+      since?: number | null
+    }
+    const metaCache = new Map<string, { metadata: Record<string, unknown>; state: TurnLockState }>()
+
+    const applyPatch = (state: TurnLockState, patch: StatePatch): TurnLockState => {
+      const next: TurnLockState = { ...state }
+      if (patch.level) next.level = patch.level
+      for (const key of ["cloud", "position", "total", "since"] as const) {
+        const value = patch[key]
+        if (value === undefined) continue
+        if (value === null) delete next[key]
+        else (next as Record<string, unknown>)[key] = value
+      }
+      return next
+    }
+
+    // Two writers can race on one session (a level switch while the wait tick
+    // writes the place), and each writes the whole metadata object. Chaining the
+    // writes per session makes every patch land on the previous result instead
+    // of overwriting it with a stale copy.
+    const stateQueue = new Map<string, Promise<void>>()
+
+    const writeState = async (sid: string, patch: StatePatch): Promise<void> => {
+      try {
+        let entry = metaCache.get(sid)
+        if (!entry) {
+          const info: any = await ctx.session.get({ sessionID: sid })
+          const metadata =
+            info?.metadata && typeof info.metadata === "object" ? { ...(info.metadata as Record<string, unknown>) } : {}
+          entry = { metadata, state: readState(metadata) ?? { level: "normal" } }
+          metaCache.set(sid, entry)
+        }
+        const next = applyPatch(entry.state, patch)
+        if (JSON.stringify(next) === JSON.stringify(entry.state)) return
+        const metadata = withState(entry.metadata, next)
+        await ctx.session.update({ sessionID: sid, metadata })
+        metaCache.set(sid, { metadata, state: next })
+      } catch (error) {
+        metaCache.delete(sid)
+        log("debug", `state ${sid}: ${String(error)}`)
+      }
+    }
+
+    const syncState = (sid: string, patch: StatePatch): Promise<void> => {
+      if (!config.stateMetadata || !canEditTitle()) return Promise.resolve()
+      const previous = stateQueue.get(sid) ?? Promise.resolve()
+      const next = previous.then(() => writeState(sid, patch))
+      stateQueue.set(sid, next)
+      void next.finally(() => {
+        if (stateQueue.get(sid) === next) stateQueue.delete(sid)
+      })
+      return next
+    }
+
+    // The cloud mark in the title is only for `titleMarks: "all"`; the metadata
+    // flag is written either way, so the UI always knows.
+    const cloudMarked = new Map<string, boolean>()
+    const applyCloudTitle = async (sid: string, cloud: boolean): Promise<void> => {
+      if (config.titleMarks !== "all" || cloudMarked.get(sid) === cloud || !canEditTitle()) return
+      cloudMarked.set(sid, cloud)
+      try {
+        const info: any = await ctx.session.get({ sessionID: sid })
+        const title = typeof info?.title === "string" ? info.title : ""
+        if (!title) return
+        const next = withCloudMark(title, cloud)
+        if (next !== title) await ctx.session.update({ sessionID: sid, title: next })
+      } catch (error) {
+        cloudMarked.delete(sid)
+        log("debug", `cloud ${sid}: ${String(error)}`)
+      }
+    }
 
     const readWaitMark = (sid: string): { pid?: number; owner?: string; since?: number; markedAt?: number } | undefined => {
       try {
@@ -718,6 +856,7 @@ export default Plugin.define({
     async function applyLevel(sid: string, level: PriorityLevel): Promise<void> {
       waitEpoch.set(sid, epochOf(sid) + 1) // an in-flight title update must not win
       writePriority(sid, level)
+      void syncState(sid, { level })
       const waiting = readWaitMark(sid)
       const waitedMs = waiting && typeof waiting.since === "number" ? Date.now() - waiting.since : undefined
       if (waitedMs !== undefined) {
@@ -726,7 +865,9 @@ export default Plugin.define({
         try {
           const info: any = await ctx.session.get({ sessionID: sid })
           const title = typeof info?.title === "string" ? info.title : ""
-          const next = withLevelMark(title, level)
+          // With `titleMarks: "waiting"` the level lives only in the metadata,
+          // so a mark left by an older version is removed on the next switch.
+          const next = config.titleMarks === "all" ? withLevelMark(title, level) : withoutLevelMark(title)
           if (title && next !== title) await ctx.session.update({ sessionID: sid, title: next })
         } catch (error) {
           log("debug", `priority ${sid}: title update failed: ${String(error)}`)
@@ -744,7 +885,13 @@ export default Plugin.define({
     async function markWaiting(sid: string, waitedMs: number): Promise<void> {
       const since = Date.now() - waitedMs
       writeWaitMark(sid, since)
-      if (!config.markWaitingTitle || marking.has(sid) || !canEditTitle()) return
+      const place = placeOf(sid, since)
+      void syncState(sid, {
+        position: place?.position ?? null,
+        total: place?.total ?? null,
+        since,
+      })
+      if (!config.markWaitingTitle || config.titleMarks === "none" || marking.has(sid) || !canEditTitle()) return
       marking.add(sid)
       const epoch = epochOf(sid)
       try {
@@ -752,10 +899,10 @@ export default Plugin.define({
         if (epochOf(sid) !== epoch) return // the slot was granted while we looked
         const title = typeof info?.title === "string" ? info.title : ""
         if (!title) return
-        const place = placeOf(sid, since)
         // The flag, not the title, decides the mark: /prio can be typed while
         // this session is already queued, and the next tick has to notice.
-        const next = withWaitPrefix(title, waitedMs, place, levelOf(sid))
+        const level = config.titleMarks === "all" ? levelOf(sid) : "normal"
+        const next = withWaitPrefix(title, waitedMs, place, level)
         if (next === title) {
           marked.add(sid)
           return
@@ -775,6 +922,7 @@ export default Plugin.define({
     /** Restore the original title once the wait is over. */
     async function unmarkWaiting(sid: string, reason: string): Promise<void> {
       waitEpoch.set(sid, epochOf(sid) + 1)
+      void syncState(sid, { position: null, total: null, since: null })
       const wasMarked = marked.delete(sid)
       if (!wasMarked && !readWaitMark(sid)) return
       if (!canEditTitle()) {
@@ -981,7 +1129,12 @@ export default Plugin.define({
             if (isTurnLockNotice(event.messages[index])) event.messages.splice(index, 1)
           }
         }
-        if (!(await isLocalProvider(event?.model?.providerID))) return
+        const local = await isLocalProvider(event?.model?.providerID)
+        // The cloud flag is the UI's "this session is not gated" signal; it is
+        // re-asserted on every request, so switching the model fixes the row.
+        void syncState(sid, { cloud: local ? null : true })
+        void applyCloudTitle(sid, !local)
+        if (!local) return
 
         const gate = await resolveGate(sid)
         if (gate.kind !== "root") {

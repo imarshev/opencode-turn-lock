@@ -22,7 +22,8 @@
 import { createSignal } from "solid-js"
 import { ComposerPill, Plugin, type ComposerPillProps, type MountedSession } from "@opencode/plugin/gui"
 
-import { inboxLevel, startInboxSort } from "./inbox.ts"
+import { inboxLevel, startInboxView } from "./inbox.ts"
+import { readState } from "./state.ts"
 
 /** The queue levels, in the order one click moves through them. */
 type Level = "normal" | "high" | "low"
@@ -101,7 +102,9 @@ export default Plugin.define({
     const read = async (session: MountedSession) => {
       try {
         const info = await ctx.client.session.get({ sessionID: session.id })
-        remember(session.key, levelOf(String(info?.title ?? "")))
+        // The level lives in metadata; the title is the fallback for sessions
+        // marked by an older version.
+        remember(session.key, readState(info?.metadata)?.level ?? levelOf(String(info?.title ?? "")))
         probe(session.key, Boolean((info as { parentID?: string } | undefined)?.parentID))
       } catch {
         // keep the last known state: the server may be restarting
@@ -126,15 +129,22 @@ export default Plugin.define({
       }
     }
 
-    // The title is the state, so follow renames from any client — the phone, the
-    // CLI, and this pill's own click.
+    // The state lives in metadata now; a rename is only a fallback for marks
+    // written by an older version. Both events carry enough to update the pill
+    // without re-reading the session.
     void (async () => {
       try {
-        for await (const event of ctx.client.event.subscribe({ types: ["session.renamed"], signal: ctx.signal })) {
-          const data = event?.data as { sessionID?: string; title?: string } | undefined
+        for await (const event of ctx.client.event.subscribe({
+          types: ["session.renamed", "session.metadata.updated"],
+          signal: ctx.signal,
+        })) {
+          const data = event?.data as { sessionID?: string; title?: string; metadata?: unknown } | undefined
           const sessionID = data?.sessionID
           if (!sessionID) continue
-          const level = levelOf(String(data?.title ?? ""))
+          const level =
+            (event as { type?: string }).type === "session.metadata.updated"
+              ? (readState(data?.metadata)?.level ?? "normal")
+              : levelOf(String(data?.title ?? ""))
           setState((current) => {
             let touched = false
             const next = new Map(current)
@@ -161,10 +171,31 @@ export default Plugin.define({
       })
     }
 
-    // The host re-renders the list on its own schedule, so the sorter keeps
-    // re-applying the order while the plugin is loaded. The interval is cleared
-    // when the window closes or the plugin is reloaded.
-    const stopInboxSort = sortInbox ? startInboxSort() : undefined
+    // The host re-renders the list on its own schedule, so the view keeps
+    // re-applying the order and the badges while the plugin is loaded. The
+    // interval is cleared when the window closes or the plugin is reloaded.
+    const stopInboxSort = sortInbox
+      ? startInboxView({
+          load: async () => {
+            const list = await ctx.client.session.list()
+            const data = (list?.data ?? []) as Array<{ id?: string; title?: string; metadata?: unknown }>
+            return data.map((session) => ({
+              id: session.id,
+              title: String(session.title ?? ""),
+              state: readState(session.metadata),
+            }))
+          },
+          cycle: (row) => {
+            // A row carries no session id in the DOM, so the loader's id is the
+            // only route back; without it the badge stays read-only.
+            if (!row.id) return
+            const from = row.state?.level ?? inboxLevel(row.title)
+            void ctx.client.session.command({ sessionID: row.id, name: command, text: CYCLE[from] }).catch(() => {
+              ctx.toast.show({ title: ctx.t("failed"), variant: "error" })
+            })
+          },
+        })
+      : undefined
 
     ctx.add(ComposerPill, () => ({
       id: "priority",

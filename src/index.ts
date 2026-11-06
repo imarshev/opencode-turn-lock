@@ -1445,11 +1445,16 @@ export default Plugin.define({
           // step is not a release at all.
           if (type === "session.step.ended" || type === "session.step.failed") {
             if (config.lockScope !== "request") continue
-            // Only a request this instance actually served is a handoff: a cloud
-            // session's step must not reserve a local slot.
-            const released = held.has(sid)
+            // The event stream is server-wide, so every instance of every
+            // location sees this step — but only the instance that served the
+            // request may decide what its boundary means. Releasing here
+            // unconditionally would drop the lease the owner is keeping for the
+            // tool that is about to start (the handoff), so a sibling instance
+            // would silently defeat it. A lease left by a dead instance is the
+            // stale sweep's job, not a sibling's.
+            if (!held.has(sid)) continue
             const finish = type === "session.step.ended" ? String((event as AnyEvent).data?.finish ?? "") : ""
-            if (released && config.handoffMs > 0 && (finish === "tool-calls" || finish === "length")) {
+            if (config.handoffMs > 0 && (finish === "tool-calls" || finish === "length")) {
               armHandoff(sid, finish === "tool-calls" ? "tool" : "continue")
               continue
             }

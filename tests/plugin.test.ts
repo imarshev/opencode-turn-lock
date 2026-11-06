@@ -106,9 +106,11 @@ type Behavior = {
   created?: Record<string, number>
 }
 
-function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
+function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}, sharedBus?: ReturnType<typeof makeEventBus>) {
   const hooks: Hook[] = []
-  const bus = makeEventBus()
+  // The real server hands the same event stream to every plugin instance (one
+  // per location), so a test that models two locations must share one bus.
+  const bus = sharedBus ?? makeEventBus()
   const updates: Array<{ sessionID: string; title: string }> = []
   const parents = behavior.parents ?? {}
   const titles = new Map<string, string>(Object.entries(behavior.titles ?? {}))
@@ -191,8 +193,13 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
 
 type Harness = Awaited<ReturnType<typeof setup>>
 
-async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior = {}, before?: (dir: string) => void) {
-  const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
+async function setup(
+  overrides: Record<string, unknown> = {},
+  behavior: Behavior = {},
+  before?: (dir: string) => void,
+  shared: { dir?: string; bus?: ReturnType<typeof makeEventBus> } = {},
+) {
+  const dir = shared.dir ?? mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
   before?.(dir)
   const logFile = join(dir, "turn-lock.log")
   const { ctx, hooks, bus, titles, metadata, updates, commands } = makeCtx(
@@ -215,6 +222,7 @@ async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior
       ...overrides,
     },
     behavior,
+    shared.bus,
   )
   const returned = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0])
   // `setup` may return nothing (a disabled plugin), so the cleanup is optional
@@ -2012,6 +2020,36 @@ test("request scope: a tool-calls step keeps the slot until the tool starts", as
     void b
   } finally {
     await harness.teardown()
+  }
+})
+
+test("request scope: a sibling instance does not free a lease it did not take", async () => {
+  // Every plugin instance (one per location) receives every server event. The
+  // holder keeps the lease across a tool-calls boundary; the other instance must
+  // not drop it just because it also saw the step end.
+  const bus = makeEventBus()
+  const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
+  const holder = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 }, {}, undefined, { dir, bus })
+  const sibling = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 }, {}, undefined, { dir, bus })
+  try {
+    await holder.context("ses_1")
+    assert.ok(existsSync(join(dir, "ses_1.lease.json")), "the holder took the slot")
+
+    bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "tool-calls" },
+    })
+    await wait(80)
+    assert.ok(existsSync(join(dir, "ses_1.lease.json")), "the sibling leaves the held lease alone")
+
+    bus.emit({
+      type: "session.tool.called",
+      data: { sessionID: "ses_1", assistantMessageID: "msg_1", id: "tool_1", input: {}, executed: true },
+    })
+    await until(() => !existsSync(join(dir, "ses_1.lease.json")), "the holder frees the slot at the tool")
+  } finally {
+    await sibling.teardown()
+    await holder.teardown()
   }
 })
 

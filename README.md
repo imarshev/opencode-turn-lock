@@ -516,7 +516,7 @@ tests/
 ```
 
 ```powershell
-npm test          # 119 тестов, Node >= 22.18 (type stripping, сборки нет)
+npm test          # 120 тестов, Node >= 22.18 (type stripping, сборки нет)
 npm run check     # tsc --noEmit: серверная часть, тесты и gui.tsx
 npm run build     # dist/gui-experimental.cjs — бандл пилюли (его же коммитим)
 ```

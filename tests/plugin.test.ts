@@ -823,6 +823,37 @@ test("serving the head republishes the place of everyone behind it", async () =>
   }
 })
 
+test("a place-only write keeps what another instance wrote in between", async () => {
+  const harness = await setup(
+    { limit: 1, remindEveryMs: 0 },
+    { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } },
+  )
+  try {
+    await harness.context("ses_1")
+    const second = harness.context("ses_2")
+    await until(() => readState(harness.metadata.get("ses_2"))?.position === 1, "the first waiter")
+
+    // Another plugin instance (one per location, same state directory) records
+    // the cloud flag. Republishing the place from here must not wipe it.
+    const stored = harness.metadata.get("ses_2") ?? {}
+    harness.metadata.set("ses_2", {
+      ...stored,
+      "turn-lock": { ...(stored["turn-lock"] as Record<string, unknown>), cloud: true },
+    })
+
+    const third = harness.context("ses_3")
+    await until(() => readState(harness.metadata.get("ses_2"))?.total === 2, "the first waiter sees the longer queue")
+    assert.equal(readState(harness.metadata.get("ses_2"))?.cloud, true, "the external flag survives")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await second
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+    await third
+  } finally {
+    await harness.teardown()
+  }
+})
+
 test("a new waiter updates the total of the ones ahead of it", async () => {
   const harness = await setup(
     { limit: 1, remindEveryMs: 0 },
@@ -1534,7 +1565,7 @@ test("request scope: the turn ticket outlives a step and dies with the turn", as
   }
 })
 
-test("request scope: a subagent takes its own slot instead of sharing the parent's", async () => {
+test("request scope: a covered subagent leaves the second slot to an unrelated session", async () => {
   const harness = await setup({ lockScope: "request", limit: 2 }, { parents: { ses_child: "ses_parent" } })
   try {
     await harness.context("ses_parent")
@@ -1544,23 +1575,33 @@ test("request scope: a subagent takes its own slot instead of sharing the parent
         .list()
         .map((lease: { sid: string }) => lease.sid)
         .sort(),
-      ["ses_child", "ses_parent"],
-      "each request holds a slot of its own",
+      ["ses_parent"],
+      "the child rides the parent's slot instead of taking a second one",
     )
 
-    let thirdDone = false
-    const third = harness.context("ses_third").then(() => {
-      thirdDone = true
+    await harness.context("ses_third")
+    assert.deepEqual(
+      fileStore(harness.dir)
+        .list()
+        .map((lease: { sid: string }) => lease.sid)
+        .sort(),
+      ["ses_parent", "ses_third"],
+      "the second slot goes to an unrelated session, not to the covered child",
+    )
+
+    let fourthDone = false
+    const fourth = harness.context("ses_fourth").then(() => {
+      fourthDone = true
     })
     await wait(150)
-    assert.equal(thirdDone, false, "both slots are in use")
+    assert.equal(fourthDone, false, "both slots are in use")
 
     harness.bus.emit({
       type: "session.step.ended",
       data: { sessionID: "ses_parent", assistantMessageID: "msg_p", finish: "tool-calls" },
     })
-    await until(() => thirdDone, "the parent's step end frees a slot for the third session")
-    void third
+    await until(() => fourthDone, "the parent's step end frees a slot for the fourth session")
+    void fourth
   } finally {
     await harness.teardown()
   }
@@ -1652,6 +1693,57 @@ test("request scope: the ticket orders the queue even with /prio off", async () 
     void a
     void c
     void d
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: a subagent rides the slot its parent holds", async () => {
+  const harness = await setup(
+    { lockScope: "request", limit: 1 },
+    { parents: { ses_child: "ses_parent" } },
+  )
+  try {
+    await harness.context("ses_parent")
+    assert.ok(existsSync(join(harness.dir, "ses_parent.lease.json")), "the parent holds the slot")
+
+    // The parent's step cannot end until this child answers, so the child must
+    // not queue for a slot of its own: that is a deadlock, not a wait.
+    let childDone = false
+    const child = harness.context("ses_child").then(() => {
+      childDone = true
+    })
+    await until(() => childDone, "the subagent is served under the parent's slot")
+    assert.equal(existsSync(join(harness.dir, "ses_child.wait.json")), false, "the subagent never queues")
+    assert.equal(existsSync(join(harness.dir, "ses_child.lease.json")), false, "the subagent takes no second slot")
+    await child
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: the subagent queues again once the parent's slot is gone", async () => {
+  const harness = await setup(
+    { lockScope: "request", limit: 1 },
+    { parents: { ses_child: "ses_parent" } },
+  )
+  try {
+    await harness.context("ses_parent")
+    await harness.context("ses_child")
+    harness.bus.emit({ type: "session.step.ended", data: { sessionID: "ses_parent" } })
+    await until(() => !existsSync(join(harness.dir, "ses_parent.lease.json")), "the parent's step freed the slot")
+
+    await harness.context("ses_other")
+    let childDone = false
+    const child = harness.context("ses_child").then(() => {
+      childDone = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_child.wait.json")), "the uncovered child queues for its own slot")
+    assert.equal(childDone, false, "no free slot, so the child waits")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_other" } })
+    await child
+    assert.equal(childDone, true, "the child is served when the slot frees")
   } finally {
     await harness.teardown()
   }

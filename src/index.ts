@@ -646,8 +646,6 @@ export default Plugin.define({
       total?: number | null
       since?: number | null
     }
-    const metaCache = new Map<string, { metadata: Record<string, unknown>; state: TurnLockState }>()
-
     const applyPatch = (state: TurnLockState, patch: StatePatch): TurnLockState => {
       const next: TurnLockState = { ...state }
       if (patch.level) next.level = patch.level
@@ -661,28 +659,23 @@ export default Plugin.define({
     }
 
     // Two writers can race on one session (a level switch while the wait tick
-    // writes the place), and each writes the whole metadata object. Chaining the
-    // writes per session makes every patch land on the previous result instead
-    // of overwriting it with a stale copy.
+    // writes the place), and each write replaces the whole metadata object.
+    // Chaining the writes per session serializes them inside this instance;
+    // every write still re-reads the session first, because another instance
+    // (one plugin per location, all sharing the state directory) may have
+    // written `since` or `cloud` in between, and a cached copy would drop it.
     const stateQueue = new Map<string, Promise<void>>()
 
     const writeState = async (sid: string, patch: StatePatch): Promise<void> => {
       try {
-        let entry = metaCache.get(sid)
-        if (!entry) {
-          const info: any = await ctx.session.get({ sessionID: sid })
-          const metadata =
-            info?.metadata && typeof info.metadata === "object" ? { ...(info.metadata as Record<string, unknown>) } : {}
-          entry = { metadata, state: readState(metadata) ?? { level: "normal" } }
-          metaCache.set(sid, entry)
-        }
-        const next = applyPatch(entry.state, patch)
-        if (JSON.stringify(next) === JSON.stringify(entry.state)) return
-        const metadata = withState(entry.metadata, next)
-        await ctx.session.update({ sessionID: sid, metadata })
-        metaCache.set(sid, { metadata, state: next })
+        const info: any = await ctx.session.get({ sessionID: sid })
+        const metadata =
+          info?.metadata && typeof info.metadata === "object" ? { ...(info.metadata as Record<string, unknown>) } : {}
+        const state = readState(metadata) ?? { level: "normal" }
+        const next = applyPatch(state, patch)
+        if (JSON.stringify(next) === JSON.stringify(state)) return
+        await ctx.session.update({ sessionID: sid, metadata: withState(metadata, next) })
       } catch (error) {
-        metaCache.delete(sid)
         log("debug", `state ${sid}: ${String(error)}`)
       }
     }
@@ -1495,6 +1488,20 @@ export default Plugin.define({
       return current
     }
 
+    /** The ancestor whose *live* lease covers `sid`, if any. Unlike `resolveGate`
+     *  this is never cached: in `request` scope the parent's lease comes and goes
+     *  with its steps, so the child has to ask again on every request. */
+    const coveredBy = async (sid: string): Promise<string | null> => {
+      let current = await parentOf(sid)
+      let depth = 0
+      while (current && depth < 8) {
+        if (store.read(current)) return current
+        current = await parentOf(current)
+        depth += 1
+      }
+      return null
+    }
+
     const resolveGate = async (
       sid: string,
     ): Promise<{ kind: "root" } | { kind: "covered" | "exempt"; root: string }> => {
@@ -1584,9 +1591,8 @@ export default Plugin.define({
 
         if (config.lockScope === "request") {
           // One lease per model request. The turn keeps a ticket across steps,
-          // so the session is ahead of everyone who queued while it worked; the
-          // slot itself is free while a tool runs. The root is cached here so a
-          // subagent inherits its parent's level.
+          // so the session is ahead of everyone who queued while it worked. The
+          // root is cached here so a subagent inherits its parent's level.
           await rootOf(sid)
           if (held.has(sid)) {
             // A step event was lost: this is a new context, so the previous
@@ -1595,6 +1601,20 @@ export default Plugin.define({
             lock.release(sid, "step-boundary")
           }
           writeTicket(sid)
+          // A step of the parent covers its subagents. While a `task` tool runs,
+          // the parent still holds the slot and its step cannot end until the
+          // child answers, so a child that queued for a slot of its own would
+          // deadlock the pair until the timeout. The child rides the parent's
+          // lease instead: one request in flight, no second slot.
+          const cover = await coveredBy(sid)
+          if (cover) {
+            lock.refresh(cover)
+            log("info", `subagent ${sid}: covered by ${cover}`)
+            void unmarkWaiting(sid, "covered").finally(() => {
+              void refreshPlaces()
+            })
+            return
+          }
         } else {
           const gate = await resolveGate(sid)
           if (gate.kind !== "root") {

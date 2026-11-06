@@ -52,3 +52,23 @@
   `createdAt` в `*.wait.json`, «соседний инстанс не отпускает чужой лиз»
   (два инстанса на общем каталоге и общем потоке событий).
 - Старые тесты про билет и фору переписать или удалить.
+
+## Трасса решений (следующий шаг)
+
+Проверка вживую показала, что человеческого лога не хватает: видно `release`,
+но не видно, доставили ли событие, знал ли инстанс, что держит лиз, и почему
+отпустил. Поэтому добавлен второй, машинный лог — `src/trace.ts`:
+
+- `%TEMP%/opencode/turn-lock-trace/lock-YYYY-MM-DD.jsonl`, строка JSON на
+  решение, файл на сутки, старые удаляются (`traceKeepMs`, по умолчанию сутки).
+- Пишется всё, что нужно для разбора надёжности: `stream.open`/`stream.closed`
+  (жив ли поток событий), `event.recv` (доставлено ли событие и что инстанс о
+  нём думал), `event.ignore` (почему пропустил), `context.*` (какой путь в
+  гейте), `acquire.*`/`lease.taken`/`wait`/`grant`/`timeout`, `step.handoff`/
+  `handoff.arm`/`handoff.fire`/`tool.release`/`step.release`, `release` с
+  `ageMs`, `stale`, `heartbeat`/`refresh`/`sweep`, `snapshot` раз в минуту
+  (лизаренсы, очередь, `held`, `handoffs`, счётчик событий потока).
+- Конфиг: `traceEnabled`, `traceDir`, `traceKeepMs`, `traceEveryMs`.
+- Тесты: `tests/trace.test.ts` (JSON-строка, ротация по дню, retention,
+  выключение) и три e2e-теста в `tests/plugin.test.ts` (гейт/шаг/отпускание,
+  handoff и инструмент, соседний инстанс объясняет, почему не тронул лиз).

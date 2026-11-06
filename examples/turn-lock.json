@@ -8,7 +8,8 @@
   "leaseTimeoutMs": 7200000,
   "lockScope": "request",
   "pollMs": 200,
-  "requeueGraceMs": 10000,
+  "handoffMs": 1000,
+  "fifoGraceMs": 2000,
   "refreshEveryMs": 20000,
   "sweepMs": 60000,
   "releaseOnForm": true,
@@ -18,5 +19,8 @@
   "priorityEnabled": true,
   "priorityCommand": "prio",
   "priorityTtlMs": 86400000,
-  "logLevel": "info"
+  "logLevel": "info",
+  "traceEnabled": true,
+  "traceKeepMs": 86400000,
+  "traceEveryMs": 60000
 }

@@ -207,6 +207,10 @@ Eсли строки `ready` нет — плагин не загрузился (
 | `dir` | `%TEMP%/opencode/turn-lock` | каталог лизаренсов (общий для всех инстансов и процессов) |
 | `logFile` | `%TEMP%/opencode/turn-lock.log` | лог; ротация на 2 МБ |
 | `logLevel` | `"info"` | `off` / `info` / `debug` |
+| `traceEnabled` | `true` | JSON-lines трасса решений (см. «Наблюдаемость»); выключить, если диск дорог |
+| `traceDir` | `%TEMP%/opencode/turn-lock-trace` | каталог трассы, общий для всех инстансов |
+| `traceKeepMs` | `86400000` (сутки) | сколько хранить дневные файлы трассы; старые удаляются при первой записи нового дня |
+| `traceEveryMs` | `60000` | период строки `snapshot` (лизаренсы, очередь, что инстанс считает своим); `0` — выключить |
 
 Пример `turn-lock.json` — в [`examples/turn-lock.json`](examples/turn-lock.json).
 
@@ -447,11 +451,40 @@ Violentmonkey в десктопном браузере, либо Firefox на An
 ## Наблюдаемость
 
 - **Лог**: `%TEMP%/opencode/turn-lock.log` (уровень `debug` добавляет причины пропусков и lookup провайдеров).
+- **Трасса решений**: `%TEMP%/opencode/turn-lock-trace/lock-YYYY-MM-DD.jsonl` — по строке JSON на каждое решение, файл на сутки, старые удаляются (`traceKeepMs`). Это то, по чему разбирают надёжность: доставлено ли событие, знал ли инстанс, что держит лиз, чем и через сколько он его отпустил. Поля строки: `t`, `ms`, `pid`, `owner` (каталог локации), `ev` (тип) и дальше поля события.
 - **Лизаренсы**: `%TEMP%/opencode/turn-lock/*.lease.json`, внутри `{ sid, since, seen, pid, owner, over? }`. `owner` — каталог локации, `pid` — процесс сервера.
 - **Проверить очередь руками**:
 
 ```powershell
 Get-Content "$env:TEMP\opencode\turn-lock\*.lease.json"
+```
+
+- **Что искать в трассе**:
+
+| `ev` | Когда пишется |
+|---|---|
+| `boot` / `shutdown` | инстанс поднялся (конфиг, `pruned`, `restored`) / выгружается (что держал) |
+| `stream.open` / `stream.closed` | подписка на события открылась / закрылась (с `error`, `events`, `lastEventAgoMs`) — молча умерший поток виден здесь |
+| `event.recv` | каждое полученное событие: `type`, `sid`, `finish`, и что инстанс про него думал (`held`, `handoff`, `waiting`) |
+| `event.ignore` / `event.drop` | событие проигнорировано и почему (`not our lease`, `turn scope`, `no handoff armed`, нет `sid`) |
+| `context.enter` / `context.continue` / `context.reacquire` / `context.covered` / `context.cloud` | вход в гейт и выбранный путь |
+| `acquire.start` / `acquire.result` / `lease.taken` / `wait` / `grant` / `timeout` / `cancel` | очередь: кто ждал, сколько, чем кончилось, с каким `since` взят лиз |
+| `step.handoff` / `handoff.arm` / `handoff.fire` / `tool.release` / `step.release` | граница шага: взведён handoff, сработал таймер, отпустил инструмент или сам шаг (`gapMs` — сколько длился зазор) |
+| `release` / `stale` | лиз отпущен (`reason`, `ageMs` — сколько держали) или выброшен как просроченный |
+| `heartbeat` / `refresh` / `sweep` | кто обновляет `seen` и когда |
+| `snapshot` | раз в `traceEveryMs`: лизаренсы, очередь, `held`, `handoffs`, счётчик событий потока |
+
+Типовые запросы (jq):
+
+```bash
+# кто держал слот и сколько
+jq -r 'select(.ev=="release") | [.t,.sid,.reason,.ageMs] | @tsv' lock-*.jsonl
+# чем закончилась каждая граница шага
+jq -r 'select(.ev=="step.handoff" or .ev=="tool.release" or .ev=="handoff.fire") | [.t,.sid,.ev,(.finish//.kind)] | @tsv' lock-*.jsonl
+# поток событий жив?
+jq -c 'select(.ev=="stream.open" or .ev=="stream.closed")' lock-*.jsonl
+# минута за минутой
+jq -c 'select(.ev=="snapshot")' lock-*.jsonl | tail -5
 ```
 
 - **Метки ожидания**: `%TEMP%/opencode/turn-lock/*.wait.json`, внутри `{ sid, pid, owner, since, createdAt, markedAt }` — кто ждёт, с какого момента, когда создана сессия (ключ сортировки очереди, нужен другим инстансам) и когда заголовок обновлялся. Набор этих файлов и есть очередь.
@@ -516,7 +549,7 @@ tests/
 ```
 
 ```powershell
-npm test          # 120 тестов, Node >= 22.18 (type stripping, сборки нет)
+npm test          # 129 тестов, Node >= 22.18 (type stripping, сборки нет)
 npm run check     # tsc --noEmit: серверная часть, тесты и gui.tsx
 npm run build     # dist/gui-experimental.cjs — бандл пилюли (его же коммитим)
 ```

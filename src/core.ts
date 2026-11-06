@@ -41,7 +41,7 @@ export type ChangeEvent =
       /** A slot was free but reserved: `holdBack` kept this session waiting. */
       blocked?: "ahead"
     }
-  | { type: "release"; sid: string; reason: string; held: number }
+  | { type: "release"; sid: string; reason: string; held: number; /** When the lease was taken, so a reader can tell how long it was held. */ since?: number }
   | { type: "cancel"; sid: string; reason: string }
   | { type: "stale"; sid: string; ageMs: number }
   | { type: "timeout"; sid: string; waitedMs: number }
@@ -244,7 +244,7 @@ export function createTurnLock(options: TurnLockOptions): TurnLock {
     if (!mine) return
     freed(now())
     store.remove(sid)
-    emit({ type: "release", sid, reason, held: Math.max(0, freshLeases(now()).length - 1) })
+    emit({ type: "release", sid, reason, held: Math.max(0, freshLeases(now()).length - 1), since: mine.since })
   }
 
   const cancelWait = (sid: string, reason: string): void => {

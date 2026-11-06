@@ -74,7 +74,11 @@
 //     "priorityTtlMs": 86400000,        // a forgotten ⚡ or ▽ stops working after this long
 //     "dir": "%TEMP%/opencode/turn-lock",
 //     "logFile": "%TEMP%/opencode/turn-lock.log",
-//     "logLevel": "info"                // "off" | "info" | "debug"
+//     "logLevel": "info",               // "off" | "info" | "debug"
+//     "traceEnabled": true,             // JSON-lines decision trace (see trace.ts)
+//     "traceDir": "%TEMP%/opencode/turn-lock-trace",
+//     "traceKeepMs": 86400000,          // a day of trace files, older ones are deleted
+//     "traceEveryMs": 60000             // queue/lease snapshot cadence, 0 = off
 //   }
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs"
@@ -98,6 +102,7 @@ import {
 import { createPriorityFlags } from "./priority-store.ts"
 import { readState, withState, type TurnLockState } from "./state.ts"
 import { fileStore, processAlive } from "./store-file.ts"
+import { createTrace, type TraceFields } from "./trace.ts"
 import {
   formatWait,
   stripWaitPrefix,
@@ -165,6 +170,13 @@ export type TurnLockConfig = {
   dir: string
   logFile: string
   logLevel: "off" | "info" | "debug"
+  /** Structured JSON-lines trace of every gate decision (trace.ts). */
+  traceEnabled: boolean
+  traceDir: string
+  /** How long trace day files are kept. One day by default. */
+  traceKeepMs: number
+  /** Cadence of the `snapshot` line (leases + queue + held set). 0 = off. */
+  traceEveryMs: number
 }
 
 export const DEFAULTS: TurnLockConfig = {
@@ -216,6 +228,13 @@ export const DEFAULTS: TurnLockConfig = {
   dir: join(tmpdir(), "opencode", "turn-lock"),
   logFile: join(tmpdir(), "opencode", "turn-lock.log"),
   logLevel: "info",
+  // The trace is what a post-mortem reads: one JSON line per decision, kept for
+  // a day so a night of traffic can be replayed. It is cheap (append-only, one
+  // small line per event) and off only when asked for.
+  traceEnabled: true,
+  traceDir: join(tmpdir(), "opencode", "turn-lock-trace"),
+  traceKeepMs: 24 * 60 * 60_000,
+  traceEveryMs: 60_000,
 }
 
 /** Leases are released on any of these: the run ended, the session is gone, or
@@ -358,6 +377,10 @@ function mergeConfig(base: TurnLockConfig, raw: unknown): TurnLockConfig {
     dir: typeof value.dir === "string" && value.dir ? value.dir : base.dir,
     logFile: typeof value.logFile === "string" && value.logFile ? value.logFile : base.logFile,
     logLevel: value.logLevel === "off" || value.logLevel === "debug" ? value.logLevel : base.logLevel,
+    traceEnabled: asBoolean(value.traceEnabled, base.traceEnabled),
+    traceDir: typeof value.traceDir === "string" && value.traceDir ? value.traceDir : base.traceDir,
+    traceKeepMs: asNumber(value.traceKeepMs, base.traceKeepMs, 0),
+    traceEveryMs: asNumber(value.traceEveryMs, base.traceEveryMs, 0),
   }
 }
 
@@ -461,8 +484,25 @@ export default Plugin.define({
      *  step starts (or a continuation request arrives). Not a queue reservation:
      *  the slot is freed at the tool event, and the timer only covers a step
      *  that never continues. */
-    const handoffs = new Map<string, { kind: "tool" | "continue"; timer?: ReturnType<typeof setTimeout> }>()
+    const handoffs = new Map<
+      string,
+      { kind: "tool" | "continue"; timer?: ReturnType<typeof setTimeout>; at: number }
+    >()
     const owner = String(ctx?.location?.directory ?? "")
+
+    // The decision trace (trace.ts). Every line carries the instance's pid and
+    // location, so a night of lines from several plugin instances can be split
+    // by process and by location afterwards.
+    const trace = createTrace({
+      dir: config.traceDir,
+      prefix: "lock",
+      keepMs: config.traceKeepMs,
+      enabled: config.traceEnabled,
+      base: { pid: process.pid, owner },
+    })
+    const t = (event: string, fields?: TraceFields) => trace.write(event, fields)
+    /** Wall-clock age of a lease, for the "how long did this hold" question. */
+    const leaseAge = (since: number): number => Math.max(0, Math.round(Date.now() - since))
 
     // Queue visibility. Session lists render a title, and the server reports a
     // queued session exactly like a working one (`running`), so the wait is
@@ -878,6 +918,7 @@ export default Plugin.define({
         }
       }
       log("info", `priority ${sid}: ${level}`)
+      t("priority", { sid, level, waitedMs: waitedMs ?? null })
     }
 
     /** Records that `sid` is waiting (the sidecar is the only shared record of
@@ -1074,6 +1115,14 @@ export default Plugin.define({
     const onChange = (event: ChangeEvent) => {
       switch (event.type) {
         case "grant":
+          t("grant", {
+            sid: event.sid,
+            waited: event.waited,
+            waitedMs: event.waitedMs,
+            overLimit: event.overLimit,
+            held: event.held,
+            limit: event.limit,
+          })
           if (event.waited) {
             log(
               "info",
@@ -1089,6 +1138,13 @@ export default Plugin.define({
           })
           break
         case "wait":
+          t("wait", {
+            sid: event.sid,
+            held: event.held,
+            limit: event.limit,
+            waitedMs: event.waitedMs,
+            blocked: event.blocked ?? null,
+          })
           log(
             "info",
             `wait ${event.sid}: ${
@@ -1103,21 +1159,31 @@ export default Plugin.define({
           void refreshPlaces()
           break
         case "release":
+          t("release", {
+            sid: event.sid,
+            reason: event.reason,
+            held: event.held,
+            since: event.since ?? null,
+            ageMs: event.since === undefined ? null : leaseAge(event.since),
+          })
           log("info", `release ${event.sid}: ${event.reason} (held ${event.held}/${config.limit})`)
           void unmarkWaiting(event.sid, "release").finally(() => {
             void refreshPlaces()
           })
           break
         case "cancel":
+          t("cancel", { sid: event.sid, reason: event.reason })
           log("debug", `cancel wait ${event.sid}: ${event.reason}`)
           void unmarkWaiting(event.sid, "cancel").finally(() => {
             void refreshPlaces()
           })
           break
         case "stale":
+          t("stale", { sid: event.sid, ageMs: event.ageMs })
           log("warn", `drop stale lease ${event.sid} (no refresh for ${Math.round(event.ageMs / 1000)}s)`)
           break
         case "timeout":
+          t("timeout", { sid: event.sid, waitedMs: event.waitedMs, onTimeout: config.onTimeout })
           log(
             "warn",
             `waited ${Math.round(event.waitedMs / 1000)}s for a slot; ${
@@ -1256,6 +1322,7 @@ export default Plugin.define({
       async (event: { sessionID?: string; model?: { providerID?: string }; messages?: unknown[] }) => {
         const sid = event?.sessionID
         if (!sid) return
+        t("context.enter", { sid, providerID: event?.model?.providerID ?? null, scope: config.lockScope })
         // Defence in depth: a "turn-lock" notice posted by an older version may
         // still be sitting in this session's inbox. It is UI noise, not input —
         // never let the model answer it.
@@ -1269,7 +1336,10 @@ export default Plugin.define({
         // re-asserted on every request, so switching the model fixes the row.
         void syncState(sid, { cloud: local ? null : true })
         void applyCloudTitle(sid, !local)
-        if (!local) return
+        if (!local) {
+          t("context.cloud", { sid, providerID: event?.model?.providerID ?? null })
+          return
+        }
 
         if (config.lockScope === "request") {
           // One lease per model request. The root is cached here so a subagent
@@ -1285,9 +1355,11 @@ export default Plugin.define({
             if (handoff.timer) clearTimeout(handoff.timer)
             handoffs.delete(sid)
             lock.refresh(sid)
+            t("context.continue", { sid, handoff: handoff.kind })
           } else if (held.has(sid)) {
             // A step event was lost: this is a new context, so the previous
             // request is over and the lease must not turn back into a turn lease.
+            t("context.reacquire", { sid, why: "no step event for the held lease" })
             held.delete(sid)
             lock.release(sid, "step-boundary")
             void syncState(sid, { holding: null })
@@ -1300,6 +1372,7 @@ export default Plugin.define({
           const cover = await coveredBy(sid)
           if (cover) {
             lock.refresh(cover)
+            t("context.covered", { sid, root: cover })
             log("info", `subagent ${sid}: covered by ${cover}`)
             void unmarkWaiting(sid, "covered").finally(() => {
               void refreshPlaces()
@@ -1312,6 +1385,7 @@ export default Plugin.define({
             // A subagent: covered by the parent's slot (keep it fresh) or exempt
             // because the parent run is not gated at all.
             if (gate.kind === "covered") lock.refresh(gate.root)
+            t("context.subagent", { sid, kind: gate.kind, root: gate.root })
             log("info", `subagent ${sid}: ${gate.kind} by ${gate.root}`)
             return
           }
@@ -1325,6 +1399,7 @@ export default Plugin.define({
             const ahead = waitingAbove(rankOf(sid), sid)
             if (ahead.length) {
               const who = ahead.map((waiter) => waiter.sid).join(", ")
+              t("yield", { sid, ahead: ahead.map((waiter) => waiter.sid), level: levelOf(sid) })
               log("info", `yield ${sid}: ${who} ${ahead.length === 1 ? "outranks" : "outrank"} it`)
               held.delete(sid)
               lock.release(sid, "priority")
@@ -1334,7 +1409,16 @@ export default Plugin.define({
         }
 
         waiting.add(sid)
+        const acquireAt = Date.now()
+        t("acquire.start", { sid, level: levelOf(sid), waiting: waiting.size })
         const result = await lock.acquire(sid).finally(() => waiting.delete(sid))
+        t("acquire.result", {
+          sid,
+          granted: result.granted,
+          waitedMs: Date.now() - acquireAt,
+          overLimit: result.overLimit,
+          reason: result.reason ?? null,
+        })
         if (!result.granted) {
           log("debug", `skip ${sid}: ${result.reason ?? "not granted"}`)
           return
@@ -1345,6 +1429,7 @@ export default Plugin.define({
         // lease that outlived a plugin reload, or a turn lease reused by the
         // next step, must not restart the clock on every request.
         const leaseSince = lock.snapshot().leases.find((lease) => lease.sid === sid)?.since
+        t("lease.taken", { sid, since: leaseSince ?? null, level: levelOf(sid) })
         void syncState(sid, { holding: leaseSince ?? Date.now() })
       },
     )
@@ -1386,29 +1471,58 @@ export default Plugin.define({
     const armHandoff = (sid: string, kind: "tool" | "continue"): void => {
       const previous = handoffs.get(sid)
       if (previous?.timer) clearTimeout(previous.timer)
+      const ms = Math.max(config.handoffMs, config.pollMs * 2)
+      t("handoff.arm", { sid, kind, ms, replaced: previous?.kind ?? null })
       const timer = setTimeout(() => {
         handoffs.delete(sid)
+        t("handoff.fire", { sid, kind, ms })
         if (!held.delete(sid)) return
         lock.release(sid, kind === "tool" ? "no tool started" : "no continuation")
         void syncState(sid, { holding: null })
-      }, Math.max(config.handoffMs, config.pollMs * 2))
+      }, ms)
       if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref()
-      handoffs.set(sid, { kind, timer })
+      handoffs.set(sid, { kind, timer, at: Date.now() })
     }
 
     const controller = new AbortController()
+    // Stream liveness: a subscription that dies silently is the one failure the
+    // queue cannot survive (the holder keeps refreshing a lease nobody releases),
+    // so the trace records how long the stream lived and how many events it saw.
+    const stream = { openedAt: Date.now(), events: 0, lastAt: 0 }
     void (async () => {
       try {
+        t("stream.open", { types: EVENT_TYPES.length })
         for await (const event of ctx.event.subscribe({ types: EVENT_TYPES, signal: controller.signal })) {
+          stream.events += 1
+          stream.lastAt = Date.now()
           const type = String((event as AnyEvent).type ?? "")
+          const sid = eventSessionID(event as AnyEvent)
+          t("event.recv", {
+            type,
+            sid: sid ?? null,
+            finish: (event as AnyEvent).data?.finish ?? null,
+            status: (event as AnyEvent).data?.status?.type ?? null,
+            held: sid ? held.has(sid) : null,
+            handoff: sid ? handoffs.has(sid) : null,
+            waiting: sid ? waiting.has(sid) : null,
+            n: stream.events,
+          })
           if (type === "config.updated" || type === "provider.updated") {
             localCache.clear()
             continue
           }
-          if (type === "form.created" && !config.releaseOnForm) continue
-          if (type === "permission.asked" && !config.releaseOnPermission) continue
-          const sid = eventSessionID(event as AnyEvent)
-          if (!sid) continue
+          if (type === "form.created" && !config.releaseOnForm) {
+            t("event.ignore", { type, sid: sid ?? null, why: "releaseOnForm=false" })
+            continue
+          }
+          if (type === "permission.asked" && !config.releaseOnPermission) {
+            t("event.ignore", { type, sid: sid ?? null, why: "releaseOnPermission=false" })
+            continue
+          }
+          if (!sid) {
+            t("event.drop", { type, why: "no session id (status busy/retry, or no payload)" })
+            continue
+          }
           // The cloud flag is the UI's "not gated" signal: it draws the badge and
           // sorts the row. A session that has not made a request yet has no flag
           // from `context`, so a freshly created cloud session looked ordinary
@@ -1430,6 +1544,7 @@ export default Plugin.define({
             }
             if (!providerID) continue
             const local = await isLocalProvider(providerID)
+            t("event.model", { type, sid, providerID, local })
             // A fresh local session needs no flag: its `normal` level is the
             // default and the row already sorts as local.
             if (local && type === "session.created") continue
@@ -1444,7 +1559,10 @@ export default Plugin.define({
           // (`handoffMs`) and released on the matching event. In `turn` scope a
           // step is not a release at all.
           if (type === "session.step.ended" || type === "session.step.failed") {
-            if (config.lockScope !== "request") continue
+            if (config.lockScope !== "request") {
+              t("event.ignore", { type, sid, why: "turn scope" })
+              continue
+            }
             // The event stream is server-wide, so every instance of every
             // location sees this step — but only the instance that served the
             // request may decide what its boundary means. Releasing here
@@ -1452,12 +1570,17 @@ export default Plugin.define({
             // tool that is about to start (the handoff), so a sibling instance
             // would silently defeat it. A lease left by a dead instance is the
             // stale sweep's job, not a sibling's.
-            if (!held.has(sid)) continue
+            if (!held.has(sid)) {
+              t("event.ignore", { type, sid, why: "step of a lease this instance does not hold" })
+              continue
+            }
             const finish = type === "session.step.ended" ? String((event as AnyEvent).data?.finish ?? "") : ""
             if (config.handoffMs > 0 && (finish === "tool-calls" || finish === "length")) {
+              t("step.handoff", { type, sid, finish, handoffMs: Math.max(config.handoffMs, config.pollMs * 2) })
               armHandoff(sid, finish === "tool-calls" ? "tool" : "continue")
               continue
             }
+            t("step.release", { type, sid, finish })
             held.delete(sid)
             lock.release(sid, type)
             // The step is over, so nobody holds the slot any more — clear the
@@ -1470,9 +1593,13 @@ export default Plugin.define({
           // exactly this moment, the engine is now really free: release it.
           if (type === "session.tool.called") {
             const handoff = handoffs.get(sid)
-            if (!handoff) continue
+            if (!handoff) {
+              t("event.ignore", { type, sid, why: "no handoff armed" })
+              continue
+            }
             if (handoff.timer) clearTimeout(handoff.timer)
             handoffs.delete(sid)
+            t("tool.release", { sid, kind: handoff.kind, gapMs: Date.now() - handoff.at })
             if (!held.delete(sid)) continue
             lock.release(sid, "tool started")
             void syncState(sid, { holding: null })
@@ -1481,6 +1608,7 @@ export default Plugin.define({
           // A terminal event ends the request or turn for good; the lease is
           // released here and the badge must go with it. A queued session has no
           // `holding`, so this write is a no-op for it.
+          t("terminal", { type, sid, held: held.has(sid), handoff: handoffs.has(sid) })
           held.delete(sid)
           const pending = handoffs.get(sid)
           if (pending) {
@@ -1506,12 +1634,28 @@ export default Plugin.define({
             void refreshPlaces()
           })
         }
-      } catch {
-        // the stream closed: the plugin is being unloaded
+      } catch (error) {
+        // The stream closed: on unload that is expected, at any other time it
+        // means this instance will never see a step boundary again. The trace
+        // line is what makes that visible after the fact.
+        const closed = {
+          events: stream.events,
+          livedMs: Date.now() - stream.openedAt,
+          lastEventAgoMs: stream.lastAt ? Date.now() - stream.lastAt : null,
+          aborted: controller.signal.aborted,
+          error: String((error as { message?: string })?.message ?? error),
+        }
+        t("stream.closed", closed)
+        if (!controller.signal.aborted) {
+          log("warn", `event stream closed unexpectedly: ${closed.error} (after ${closed.events} events)`)
+        }
       }
     })()
 
-    const sweeper = setInterval(() => lock.sweep(), config.sweepMs)
+    const sweeper = setInterval(() => {
+      t("sweep", { leases: lock.snapshot().leases.length })
+      lock.sweep()
+    }, config.sweepMs)
     if (typeof (sweeper as { unref?: () => void }).unref === "function") (sweeper as { unref: () => void }).unref()
 
     // Keep leases of this process fresh: a live session doing a long single
@@ -1519,11 +1663,57 @@ export default Plugin.define({
     const heartbeat =
       config.refreshEveryMs > 0
         ? setInterval(() => {
-            for (const sid of held) lock.refresh(sid)
+            for (const sid of held) {
+              lock.refresh(sid)
+              t("refresh", { sid, source: "heartbeat" })
+            }
+            t("heartbeat", { held: [...held], handoffs: [...handoffs.keys()], waiting: [...waiting] })
           }, config.refreshEveryMs)
         : undefined
     if (heartbeat && typeof (heartbeat as { unref?: () => void }).unref === "function") {
       ;(heartbeat as { unref: () => void }).unref()
+    }
+
+    // The snapshot is the trace's backbone: even if every event line were lost,
+    // a minute-by-minute picture of who held the slot, who waited and what this
+    // instance thought it held is enough to reconstruct the night.
+    const snapshotter =
+      config.traceEveryMs > 0
+        ? setInterval(() => {
+            let leases: Array<Record<string, unknown>> = []
+            try {
+              leases = lock.snapshot().leases.map((lease) => ({
+                sid: lease.sid,
+                since: lease.since,
+                seen: lease.seen,
+                ageMs: leaseAge(lease.since),
+                staleMs: Date.now() - lease.seen,
+                over: lease.over === true,
+                pid: lease.pid ?? null,
+                owner: lease.owner ?? null,
+              }))
+            } catch {
+              // a snapshot is best-effort
+            }
+            const queue = rankedWaiters().map((entry, index) => ({
+              sid: entry.sid,
+              rank: entry.rank,
+              position: index + 1,
+              age: entry.age,
+            }))
+            t("snapshot", {
+              leases,
+              queue,
+              held: [...held],
+              handoffs: [...handoffs.keys()],
+              waiting: [...waiting],
+              events: stream.events,
+              lastEventAgoMs: stream.lastAt ? Date.now() - stream.lastAt : null,
+            })
+          }, config.traceEveryMs)
+        : undefined
+    if (snapshotter && typeof (snapshotter as { unref?: () => void }).unref === "function") {
+      ;(snapshotter as { unref: () => void }).unref()
     }
 
     const restored = await restoreStaleMarks()
@@ -1532,6 +1722,28 @@ export default Plugin.define({
     // Places left by another instance may be older than its last tick; the
     // queue is the source of truth, so publish it once on boot.
     await refreshPlaces()
+
+    t("boot", {
+      scope: config.lockScope,
+      limit: config.limit,
+      handoffMs: config.handoffMs,
+      pollMs: config.pollMs,
+      refreshEveryMs: config.refreshEveryMs,
+      sweepMs: config.sweepMs,
+      timeoutMs: config.acquireTimeoutMs,
+      onTimeout: config.onTimeout,
+      localProviders: config.localProviders,
+      dir: config.dir,
+      logFile: config.logFile,
+      traceFile: trace.file(),
+      pruned: pruned.length,
+      prunedSids: pruned,
+      tickets: prunedTickets,
+      restored,
+      orphans,
+      source: SOURCE,
+      node: process.version,
+    })
 
     log(
       "info",
@@ -1545,9 +1757,11 @@ export default Plugin.define({
     )
 
     return async () => {
+      t("shutdown", { held: [...held], waiting: [...waiting], handoffs: [...handoffs.keys()], events: stream.events })
       controller.abort()
       clearInterval(sweeper)
       if (heartbeat) clearInterval(heartbeat)
+      if (snapshotter) clearInterval(snapshotter)
       // This instance's queue loops must die with it: after a hot reload they
       // would keep polling the shared store, re-mark titles and take slots for
       // hooks nobody awaits any more.

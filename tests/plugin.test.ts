@@ -219,6 +219,10 @@ async function setup(
       // The original behaviour is the reference for these tests; the request
       // scope has its own tests below.
       lockScope: "turn",
+      // The decision trace goes next to the test's temp dir; no snapshot timer,
+      // so a test only reads the lines its own actions produced.
+      traceDir: join(dir, "trace"),
+      traceEveryMs: 0,
       ...overrides,
     },
     behavior,
@@ -253,6 +257,19 @@ async function setup(
     },
     logText() {
       return readFileSync(logFile, "utf8")
+    },
+    /** Every line of the decision trace, parsed. */
+    traceLines(): Array<Record<string, any>> {
+      const traceDir = join(dir, "trace")
+      if (!existsSync(traceDir)) return []
+      const lines: Array<Record<string, any>> = []
+      for (const name of readdirSync(traceDir)) {
+        if (!name.endsWith(".jsonl")) continue
+        for (const line of readFileSync(join(traceDir, name), "utf8").split("\n")) {
+          if (line.trim()) lines.push(JSON.parse(line))
+        }
+      }
+      return lines
     },
     async context(sessionID: string, providerID = "strata", messages: unknown[] = []) {
       const hook = hooks.find((candidate) => candidate.name === "context")
@@ -2164,6 +2181,94 @@ test("request scope: the creation time travels in the wait sidecar", async () =>
     void waiter
   } finally {
     await harness.teardown()
+  }
+})
+
+test("request scope: the trace records the gate, the step and the release", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+  try {
+    await harness.context("ses_a")
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "stop" },
+    })
+    await until(() => !existsSync(join(harness.dir, "ses_a.lease.json")), "the stop step frees the slot")
+
+    const lines = harness.traceLines()
+    const events = lines.map((line) => line.ev)
+    for (const expected of ["boot", "context.enter", "acquire.start", "acquire.result", "lease.taken", "event.recv", "step.release", "release"]) {
+      assert.ok(events.includes(expected), `trace has ${expected}`)
+    }
+    const step = lines.find((line) => line.ev === "step.release")
+    assert.equal(step?.sid, "ses_a")
+    assert.equal(step?.finish, "stop")
+    const release = lines.find((line) => line.ev === "release")
+    assert.equal(release?.reason, "session.step.ended")
+    assert.equal(typeof release?.ageMs, "number", "the release line says how long the lease was held")
+    // Every line carries the instance it came from.
+    for (const line of lines) {
+      assert.equal(typeof line.pid, "number")
+      assert.equal(typeof line.owner, "string")
+      assert.equal(typeof line.ms, "number")
+    }
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: the trace records a handoff and the tool that ends it", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+  try {
+    await harness.context("ses_a")
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "tool-calls" },
+    })
+    await wait(60)
+    harness.bus.emit({
+      type: "session.tool.called",
+      data: { sessionID: "ses_a", assistantMessageID: "msg_a", id: "tool_1", input: {}, executed: true },
+    })
+    await until(() => !existsSync(join(harness.dir, "ses_a.lease.json")), "the tool start frees the slot")
+
+    const lines = harness.traceLines()
+    const arm = lines.find((line) => line.ev === "handoff.arm")
+    assert.equal(arm?.sid, "ses_a")
+    assert.equal(arm?.kind, "tool")
+    const tool = lines.find((line) => line.ev === "tool.release")
+    assert.equal(tool?.sid, "ses_a")
+    assert.equal(typeof tool?.gapMs, "number", "the tool line says how long the gap lasted")
+    const release = lines.find((line) => line.ev === "release")
+    assert.equal(release?.reason, "tool started")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: a sibling instance traces why it left the lease alone", async () => {
+  const bus = makeEventBus()
+  const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
+  const holder = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 }, {}, undefined, { dir, bus })
+  const sibling = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 }, {}, undefined, { dir, bus })
+  try {
+    await holder.context("ses_1")
+    bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "tool-calls" },
+    })
+    await wait(80)
+    const ignored = sibling
+      .traceLines()
+      .filter((line) => line.ev === "event.ignore")
+      .map((line) => line.why)
+    assert.ok(
+      ignored.some((why) => String(why).includes("does not hold")),
+      "the sibling says it did not hold the lease",
+    )
+    assert.ok(holder.traceLines().some((line) => line.ev === "handoff.arm"), "the holder armed the handoff")
+  } finally {
+    await sibling.teardown()
+    await holder.teardown()
   }
 })
 

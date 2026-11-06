@@ -22,6 +22,8 @@
 import { createSignal } from "solid-js"
 import { ComposerPill, Plugin, type ComposerPillProps, type MountedSession } from "@opencode/plugin/gui"
 
+import { inboxLevel, startInboxSort } from "./inbox.ts"
+
 /** The queue levels, in the order one click moves through them. */
 type Level = "normal" | "high" | "low"
 const CYCLE: Record<Level, Level> = { normal: "high", high: "low", low: "normal" }
@@ -30,7 +32,7 @@ const CYCLE: Record<Level, Level> = { normal: "high", high: "low", low: "normal"
 const MARKS: Record<Exclude<Level, "normal">, string> = { high: "⚡", low: "▽" }
 
 /** Which level a title claims — the same reading the session list shows. */
-const levelOf = (title: string): Level => (title.startsWith(MARKS.high) ? "high" : title.startsWith(MARKS.low) ? "low" : "normal")
+const levelOf = inboxLevel
 
 export default Plugin.define({
   i18n: {
@@ -56,6 +58,9 @@ export default Plugin.define({
         ? ctx.options.priorityCommand
         : "prio"
     const enabled = ctx.options?.priorityEnabled !== false
+    // Client-only: the server part never sees this option. The sorter lives in
+    // the same window as the sidebar, so it can style the rows the host renders.
+    const sortInbox = ctx.options?.sortInbox !== false
 
     // session key -> level. A plain signal holding a new Map, so every pill
     // re-reads when any session's state changes.
@@ -156,6 +161,11 @@ export default Plugin.define({
       })
     }
 
+    // The host re-renders the list on its own schedule, so the sorter keeps
+    // re-applying the order while the plugin is loaded. The interval is cleared
+    // when the window closes or the plugin is reloaded.
+    const stopInboxSort = sortInbox ? startInboxSort() : undefined
+
     ctx.add(ComposerPill, () => ({
       id: "priority",
       show: (input: ComposerPillProps) => {
@@ -182,5 +192,7 @@ export default Plugin.define({
         }
       },
     }))
+
+    return () => stopInboxSort?.()
   },
 })

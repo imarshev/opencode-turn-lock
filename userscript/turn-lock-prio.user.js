@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.3.0
-// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) для turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
+// @version      0.4.0
+// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и сортировка working-сессий в инбоксе по приоритету для turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
 // @match        https://*/*
@@ -23,6 +23,11 @@
 // command. So it cannot disagree with the session list, and a change made on
 // the phone shows up here on the next refresh. One click moves one step down
 // the ladder: ordinary → `⚡` → `▽` → ordinary.
+//
+// It also sorts the "Working" section of the inbox by the same marks. The web
+// client orders that section by `time.busy` and knows nothing about /prio, so
+// the rows are re-ordered visually with CSS `order` (the DOM is not moved: the
+// list is a Solid keyed `For`). Set SORT_WORKING to false below to turn it off.
 //
 // Auth: the script never asks for the password. It wraps `fetch` at
 // document-start and reuses the `Authorization` header the app itself sends to
@@ -62,6 +67,35 @@
     const text = String(title || "")
     return text.startsWith(MARKS.high) ? "high" : text.startsWith(MARKS.low) ? "low" : "normal"
   }
+
+  // ---------------------------------------------------------------- inbox sort
+  //
+  // The web client renders the "Working" section as a flex column and sorts it
+  // by `time.busy` (oldest first); it has no concept of /prio. The marks are
+  // already in the title, so we only set CSS `order` on the existing rows:
+  //   ⚡ → 0, ordinary → 1, ▽ → 2, then the row's current index.
+  // Moving DOM nodes would fight Solid's keyed list, so we never move them.
+  // The same algorithm lives in src/inbox.ts (covered by tests/inbox.test.ts).
+  const SORT_WORKING = true
+  const WORKING = '[data-slot="sidebar-inbox-working"]'
+  const INBOX_ROW = '[data-slot="sidebar-inbox-item"]'
+  const RANK = { high: 0, normal: 1, low: 2 }
+  const inboxOrder = (title, index) => (RANK[levelOf(title)] ?? 1) * 1e6 + index
+
+  const sortInbox = () => {
+    if (!SORT_WORKING) return
+    const section = document.querySelector(WORKING)
+    if (!section) return
+    // The section header is a sibling of the scroll box, so find the rows by
+    // their own marker rather than as `firstElementChild`.
+    const rows = [...section.querySelectorAll(INBOX_ROW)]
+    rows.forEach((row, index) => {
+      const title = row.querySelector('span[dir="auto"]')?.textContent || ""
+      const order = String(inboxOrder(title, index))
+      if (row.style.order !== order) row.style.order = order
+    })
+  }
+
   const ROUTE = /^\/server\/[^/]+\/session\/([^/?#]+)/
   const COMMAND = "prio"
   const RU = (navigator.language || "").toLowerCase().startsWith("ru")
@@ -402,7 +436,11 @@
   const start = () => {
     // No pill off-route: refresh() mounts it only when the URL is a session.
     void refresh(true)
+    // The inbox is on the home route, not on a session route, so the sort is a
+    // separate tick rather than part of refresh().
+    sortInbox()
     setInterval(() => {
+      if (document.visibilityState === "visible") sortInbox()
       // SPA navigation changes the path without a load, so the route is checked
       // every tick; the title is re-read less often.
       const id = sessionID()
@@ -414,7 +452,10 @@
       if (document.visibilityState === "visible") void refresh(false)
     }, 1000)
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") void refresh(true)
+      if (document.visibilityState === "visible") {
+        sortInbox()
+        void refresh(true)
+      }
     })
     // The client re-renders the composer row and can drop or replace the node
     // the pill sits in, so its home is re-asserted here; the composer also

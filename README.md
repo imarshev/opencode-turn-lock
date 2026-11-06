@@ -2,9 +2,9 @@
 
 [![tests](https://github.com/imarshev/opencode-turn-lock/actions/workflows/test.yml/badge.svg)](https://github.com/imarshev/opencode-turn-lock/actions/workflows/test.yml)
 
-Плагин для **OpenCode V2**, который держит на локальном движке не больше N агентских сессий одновременно, а остальные ставит в очередь на уровне модели — и говорит сессии, что она ждёт, и на каком месте (`⏳ 2/3 · 3h10m · …`). Порядок очереди настраивается уровнем: `⚡` приоритет, обычная, `▽` низкий. В комплекте — userscript для Tampermonkey/Violentmonkey, который добавляет пилюлю `/prio` в веб-клиент.
+Плагин для **OpenCode V2**, который держит на локальном движке не больше N агентских сессий одновременно, а остальные ставит в очередь на уровне модели — и говорит сессии, что она ждёт, и на каком месте (`⏳ 2/3 · 3h10m · …`). Порядок очереди настраивается уровнем: `⚡` приоритет, обычная, `▽` низкий. В комплекте — userscript для Tampermonkey/Violentmonkey, который добавляет пилюлю `/prio` в веб-клиент. Обе половины ещё и сортируют working-сессии в инбоксе по приоритету: `⚡` сверху, обычные посередине, `▽` снизу.
 
-> **EN.** An OpenCode V2 plugin that serialises agent *turns* against a local model engine: at most N sessions may call the local model, everyone else waits before the request is sent. Cloud providers are never gated, subagents inherit their parent's verdict, and a queued session is marked in its own title with its place in the queue. Three levels reorder that queue — `⚡` high, ordinary, `▽` low: a session takes a free slot only while no session of a higher level waits, and a holder yields its slot at the next step boundary to a higher-level waiter. Leases survive across plugin instances (per-location) and processes, are refreshed by a heartbeat, and are released on every terminal event of a turn. A bundled Tampermonkey userscript puts the same `/prio` pill into the web client.
+> **EN.** An OpenCode V2 plugin that serialises agent *turns* against a local model engine: at most N sessions may call the local model, everyone else waits before the request is sent. Cloud providers are never gated, subagents inherit their parent's verdict, and a queued session is marked in its own title with its place in the queue. Three levels reorder that queue — `⚡` high, ordinary, `▽` low: a session takes a free slot only while no session of a higher level waits, and a holder yields its slot at the next step boundary to a higher-level waiter. Leases survive across plugin instances (per-location) and processes, are refreshed by a heartbeat, and are released on every terminal event of a turn. A bundled Tampermonkey userscript puts the same `/prio` pill into the web client. Both halves also sort the inbox's *Working* section by the same marks: `⚡` first, ordinary next, `▽` last.
 
 ---
 
@@ -36,6 +36,7 @@
 | **Субагенты** | не занимают слот: наследуют решение родителя (`covered` / `exempt`) |
 | **Видимость очереди** | заголовок ожидающей сессии: `⏳ 2/3 · 3h10m · <title>` — место в очереди и время ожидания; снимается при выдаче слота |
 | **Приоритет** | `/prio` в композере сессии — три уровня очереди: `⚡` приоритет (забирает следующий свободный слот), обычный и `▽` низкий (ждёт за всеми). Держатель слота уступает его ждущему **более высокого** уровня на границе своего следующего шага. Пометка в заголовке. В десктопе там же пилюля над композером |
+| **Сортировка инбокса** | В режиме Inbox секция **Working** идёт по приоритету: `⚡` → обычные → `▽`; внутри уровня сохраняется прежний порядок (кто раньше начал). Веб — userscript, десктоп — GUI-плагин |
 | **Тайм-аут** | 4 часа ожидания (настраивается), дальше — `proceed` сверх лимита или `hold` |
 | **Отказоустойчивость** | heartbeat, stale-лизаренс, boot-cleanup по мёртвому pid, fail-open на любых ошибках |
 | **Служебные вызовы** | `title`, `compaction`/`summary`, `generate` не гейтятся вообще |
@@ -300,7 +301,8 @@ Eсли строки `ready` нет — плагин не загрузился (
 серверную половину) и рестарта сервиса. Бандл `dist/gui-experimental.cjs` лежит в репозитории,
 пересобрать: `npm install && npm run build` (vite + пресет `@opencode/plugin/gui/vite`; `solid-js`,
 `effect`, `@opencode/*` остаются внешними — приложение подставляет свои). Опции те же:
-`priorityCommand` (имя команды, по умолчанию `prio`) и `priorityEnabled`.
+`priorityCommand` (имя команды, по умолчанию `prio`), `priorityEnabled` и `sortInbox`
+(сортировка working-сессий в инбоксе, по умолчанию `true`).
 
 ### Пилюля в веб-UI (userscript, хак)
 
@@ -320,6 +322,8 @@ Violentmonkey в десктопном браузере, либо Firefox на An
 - Прячется на не-сессионных маршрутах, в саб-сессиях (`parentID` в ответе `/api/session/{id}`:
   приоритет там родительский, свой флаг планировщик не читает) и когда `/prio` не зарегистрирован
   (`priorityEnabled: false`) — как десктопная.
+- Сортирует секцию **Working** инбокса по тем же меткам (см. ниже «Сортировка working-сессий в
+  инбоксе»); выключается константой `SORT_WORKING`.
 - Область действия: `localhost`, `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
   `::1` и имена `*.local` / `*.lan` / `*.home.arpa`. Задаётся не `@include`-масками (в
   манифесте стоит широкий `@match http://*/*`), а проверкой `location.hostname` в начале
@@ -334,6 +338,30 @@ Violentmonkey в десктопном браузере, либо Firefox на An
   подогнаны под чипы (32 px, радиус 8). Если слот исчезнет (смена разметки), включается
   прежний фолбэк — `position:fixed` над композером.
 - Ломается от смены разметки или маршрутов веб-клиента — это цена обхода.
+
+### Сортировка working-сессий в инбоксе
+
+Веб-клиент и десктоп показывают работающие сессии в секции **Working** инбокса и сортируют их
+сами — по `time.busy` (кто раньше начал, тот выше), без всякого понятия приоритета. Поэтому
+`⚡`/`▽` влияли только на очередь движка, но не на порядок в списке.
+
+Плагин переставляет строки визуально: каждой строке `[data-slot="sidebar-inbox-item"]` в
+контейнере `[data-slot="sidebar-inbox-working"]` ставится CSS `order` = уровень (`⚡` → 0,
+обычная → 1, `▽` → 2) и её текущий индекс. DOM не двигается, поэтому keyed-список Solid не
+ломается, а порядок внутри уровня остаётся прежним (по `time.busy`). Тик — раз в секунду;
+приоритет уже лежит в заголовке, отдельного состояния нет.
+
+- **Веб**: `userscript/turn-lock-prio.user.js` делает это автоматически; выключатель — константа
+  `SORT_WORKING` в начале скрипта.
+- **Десктоп**: GUI-половина, `plugins[].options.sortInbox: false` выключает (по умолчанию
+  включено). Как и пилюля, это работает только при установке пакетом.
+
+Это DOM-хак, а не API: `data-slot` и `span[dir="auto"]` — внутренняя разметка клиента. Если она
+изменится, сортировка тихо перестанет работать (пилюля сломается так же). Визуальный порядок и
+порядок клавиатурного фокуса расходятся: DOM остаётся в порядке `time.busy`. Поддержанный путь —
+upstream: [#61296](https://github.com/anomalyco/opencode/issues/61296) (плагин может заменить
+левую навигацию) и [#60976](https://github.com/anomalyco/opencode/issues/60976) (GUI-плагины в
+вебе).
 
 ---
 
@@ -367,6 +395,8 @@ Get-Content "$env:TEMP\opencode\turn-lock\*.lease.json"
 - **Хук `context` — только агентский цикл.** `title`, `compaction`/`summary`, `generate` намеренно не гейтятся: это короткие служебные вызовы, и задерживать их значило бы ломать облачные сессии.
 - **Один запрос — один шаг.** Слот держится на весь ход, поэтому ход с длинными инструментами (сборка, тесты) занимает слот всё это время. Это и есть цель, но помните об этом, ставя `limit: 1`.
 - **Пилюля — только десктоп, и она оптимистична.** Переключение ставит состояние сразу, а подтверждает его переименование заголовка; не дошла команда — всплывает ошибка и состояние откатывается. Если сервер перезапустился между переключением и событием `session.renamed`, пилюля держит последнее известное состояние, пока сессию не открыть заново (при новом визите заголовок читается с сервера).
+- **Сортировка инбокса — DOM-хак, а не API.** Она держится за `data-slot="sidebar-inbox-working"`, `data-slot="sidebar-inbox-item"` и `span[dir="auto"]`. Смена разметки — и порядок тихо вернётся к `time.busy`. Тик раз в секунду: приоритет меняется переименованием, поэтому задержка до 1 с. Визуальный порядок и порядок Tab/стрелок расходятся — DOM остаётся в порядке `time.busy`.
+- **Сортировка не меняет очередь.** Она только рисует список; слот по-прежнему выдаёт планировщик по `/prio` и `holdBack`. `⚡` сверху не значит «уже работает» — ждущая сессия тоже стоит в Working (`⏳`).
 - **Windows/pid.** Boot-cleanup проверяет живость процесса через `process.kill(pid, 0)`; на Windows это поддерживается, но если сервер запущен под другим пользователем, ответ будет `EPERM` — лизаренс остаётся (и убирается по `leaseTimeoutMs`).
 
 ---
@@ -377,6 +407,7 @@ Get-Content "$env:TEMP\opencode\turn-lock\*.lease.json"
 src/
   index.ts        плагин: конфиг, хук, события, метки заголовков, лог
   gui.tsx         десктоп-половина: пилюля очереди над композером, три уровня (Solid)
+  inbox.ts        сортировка working-сессий в инбоксе: уровень из заголовка, CSS order, тик
   core.ts         чистое ядро: лизаренсы, acquire/refresh/release/cancel, sweep (без fs и без OpenCode)
   store-file.ts   файловый стор: атомарная запись, терпимое чтение, boot-cleanup
 vite.config.ts    сборка GUI-бандла пресетом @opencode/plugin/gui/vite → dist/gui-experimental.cjs
@@ -384,11 +415,12 @@ tests/
   core.test.ts    планировщик: лимит, тайм-ауты, stale, cancel, две «процесса» на одном сторе
   store.test.ts   файловый стор: round-trip, битые файлы, pruneDead, общий лимит
   plugin.test.ts  плагин целиком через фейковый ctx (хук, события, метки, субагенты)
+  inbox.test.ts   сортировка инбокса: уровни, стабильность, CSS order, контракт userscript
   stubs/          заглушка @opencode/plugin для node --test
 ```
 
 ```powershell
-npm test          # 48 тестов, Node >= 22.18 (type stripping, сборки нет)
+npm test          # 59 тестов, Node >= 22.18 (type stripping, сборки нет)
 npm run check     # tsc --noEmit: серверная часть, тесты и gui.tsx
 npm run build     # dist/gui-experimental.cjs — бандл пилюли (его же коммитим)
 ```
@@ -401,7 +433,7 @@ npm run build     # dist/gui-experimental.cjs — бандл пилюли (ег�
 
 ## Проверено на
 
-OpenCode v2.2.5, Windows 11, локальный движок на 18500 (Qwen3.8-Flash-Next, лимит 2). Живые следы: `grant … after 387s wait (held 2/2)`, `title: ⏳ На основе документации…` у сессии, которая ждала слот, `subagent …: exempt` для субагента облачной сессии при двух занятых локальных слотах.
+OpenCode v2.2.5, Windows 11, локальный движок на 18500 (Qwen3.8-Flash-Next, лимит 2). Живые следы: `grant … after 387s wait (held 2/2)`, `title: ⏳ На основе документации…` у сессии, которая ждала слот, `subagent …: exempt` для субагента облачной сессии при двух занятых локальных слотах. Селекторы инбокса (`sidebar-inbox-working` / `sidebar-inbox-item`, сортировка по `time.busy`) сверены с ассетом веб-клиента 2.2.5 и с рендерером в `app.asar` десктопа.
 
 ## Лицензия
 

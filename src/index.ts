@@ -623,6 +623,10 @@ export default Plugin.define({
     const waiting = new Set<string>()
     const waitEpoch = new Map<string, number>()
     const epochOf = (sid: string) => waitEpoch.get(sid) ?? 0
+    // Bumped by every new mark. A teardown that started before the bump must
+    // not delete the sidecar or clear the place of the wait that replaced it.
+    const waitGeneration = new Map<string, number>()
+    const generationOf = (sid: string) => waitGeneration.get(sid) ?? 0
     const waitPath = (sid: string) => join(config.dir, `${sid.replace(/[^A-Za-z0-9_.-]/g, "_")}.wait.json`)
 
     const canEditTitle = (): boolean =>
@@ -972,6 +976,41 @@ export default Plugin.define({
       return { position: index + 1, total: order.length }
     }
 
+    /** A place belongs to the queue, not to one waiter: when the head is served
+     *  or someone joins, every badge behind it moves. A waiter rewrites its own
+     *  place only on its reminder tick (60s by default), which is far too slow
+     *  for that — right after a grant the new head would keep showing `2/8`.
+     *  So every queue change republishes the whole queue. Passes are serialized
+     *  and coalesced: a change that lands mid-pass schedules exactly one more,
+     *  so a burst of grants cannot interleave read-modify-write cycles. */
+    let placesDirty = false
+    let placesPass: Promise<void> | undefined
+    const refreshPlaces = (): Promise<void> => {
+      placesDirty = true
+      if (placesPass) return placesPass
+      // Start the pass in a microtask: an empty queue finishes synchronously,
+      // and the cleanup below would otherwise run before `placesPass` is set.
+      const pass = Promise.resolve().then(async () => {
+        try {
+          while (placesDirty) {
+            placesDirty = false
+            const order = orderedWaiters()
+            const total = order.length
+            for (const [index, id] of order.entries()) {
+              await syncState(id, { position: index + 1, total })
+            }
+          }
+        } catch (error) {
+          log("debug", `places: ${String(error)}`)
+        }
+      })
+      placesPass = pass
+      void pass.finally(() => {
+        if (placesPass === pass) placesPass = undefined
+      })
+      return pass
+    }
+
     // Priority. `<sessionID>.prio.json` is the shared record of where the user
     // wants this session to stand in the queue: `/prio` writes it from any client,
     // every process sharing the lock directory reads it. `level` is `high` (⚡, cuts
@@ -1180,6 +1219,7 @@ export default Plugin.define({
       const waitedMs = waiting && typeof waiting.since === "number" ? Date.now() - waiting.since : undefined
       if (waitedMs !== undefined) {
         await markWaiting(sid, waitedMs) // rebuilds `⚡ ⏳ 2/3 · 4m · …` in one go
+        await refreshPlaces() // the level moved this session, so every place moved
       } else if (canEditTitle()) {
         try {
           const info: any = await ctx.session.get({ sessionID: sid })
@@ -1202,6 +1242,7 @@ export default Plugin.define({
      *  after the first mark and would overwrite it, and because the countdown
      *  itself has to move. */
     async function markWaiting(sid: string, waitedMs: number): Promise<void> {
+      waitGeneration.set(sid, generationOf(sid) + 1)
       const since = Date.now() - waitedMs
       writeWaitMark(sid, since)
       const place = placeOf(sid, since)
@@ -1241,29 +1282,44 @@ export default Plugin.define({
     /** Restore the original title once the wait is over. */
     async function unmarkWaiting(sid: string, reason: string): Promise<void> {
       waitEpoch.set(sid, epochOf(sid) + 1)
-      void syncState(sid, { position: null, total: null, since: null })
+      const generation = generationOf(sid)
+      // A wait that started while this one was being torn down owns the queue
+      // now: its sidecar and its place must survive. Without the guard a late
+      // grant could delete the mark of the wait that replaced it and leave a
+      // `position` in metadata with no sidecar behind it.
+      const settled = () => generationOf(sid) === generation
+      const clear = () =>
+        settled() ? syncState(sid, { position: null, total: null, since: null }) : Promise.resolve()
       const wasMarked = marked.delete(sid)
-      if (!wasMarked && !readWaitMark(sid)) return
+      if (!wasMarked && !readWaitMark(sid)) {
+        void clear()
+        return
+      }
       // A session that no longer exists has no title to restore, so the usual
       // "keep the sidecar, retry on the next boot" would keep a phantom waiter
       // in the queue for good. Drop it now.
       if (reason === "session.deleted" || reason === "session.archived") {
-        dropWaitMark(sid)
+        if (settled()) dropWaitMark(sid)
+        void clear()
         return
       }
       if (!canEditTitle()) {
-        dropWaitMark(sid)
+        if (settled()) dropWaitMark(sid)
+        void clear()
         return
       }
       try {
         const info: any = await ctx.session.get({ sessionID: sid })
+        if (!settled()) return // a new wait already marked the title again
         const title = typeof info?.title === "string" ? info.title : ""
         const base = stripWaitPrefix(title)
         if (base !== title) {
           await ctx.session.update({ sessionID: sid, title: base })
           log("debug", `unmark ${sid}: ${reason}`)
         }
+        if (!settled()) return
         dropWaitMark(sid)
+        void clear()
       } catch (error) {
         // keep the sidecar: the next boot retries the restore
         log("debug", `unmark ${sid} failed: ${String(error)}`)
@@ -1309,6 +1365,41 @@ export default Plugin.define({
       return restored
     }
 
+    /** Metadata is a view of the queue, and a write can be lost when a process
+     *  is unloaded in the middle of a grant: the session then keeps a `position`
+     *  without a wait mark, and the badge draws a queue place for a session that
+     *  is not waiting. The sidecars are the only record of who waits, so on boot
+     *  every session is checked against them. */
+    async function clearOrphanPlaces(): Promise<number> {
+      if (!config.stateMetadata || !canEditTitle() || typeof ctx.session.list !== "function") return 0
+      const waiting = new Set(readWaiters().map((waiter) => waiter.sid))
+      let cleared = 0
+      let cursor: string | undefined
+      for (let page = 0; page < 50; page += 1) {
+        let listed: { data?: unknown[]; cursor?: { next?: string | null } }
+        try {
+          listed = (await ctx.session.list({ limit: 100, cursor })) as typeof listed
+        } catch (error) {
+          log("debug", `orphan sweep: ${String(error)}`)
+          break
+        }
+        const items = Array.isArray(listed?.data) ? listed.data : []
+        for (const item of items) {
+          const info = item as { id?: unknown; metadata?: unknown }
+          const sid = typeof info.id === "string" ? info.id : ""
+          if (!sid || waiting.has(sid)) continue
+          const state = readState(info.metadata)
+          if (!state || (state.position === undefined && state.total === undefined && state.since === undefined)) continue
+          await syncState(sid, { position: null, total: null, since: null })
+          cleared += 1
+        }
+        const next = listed?.cursor?.next
+        if (!next) break
+        cursor = next
+      }
+      return cleared
+    }
+
     const onChange = (event: ChangeEvent) => {
       switch (event.type) {
         case "grant":
@@ -1322,7 +1413,9 @@ export default Plugin.define({
           } else {
             log("debug", `grant ${event.sid} (held ${event.held}/${event.limit})`)
           }
-          void unmarkWaiting(event.sid, "grant")
+          void unmarkWaiting(event.sid, "grant").finally(() => {
+            void refreshPlaces()
+          })
           break
         case "wait":
           log(
@@ -1334,14 +1427,21 @@ export default Plugin.define({
             }${event.waitedMs ? ` (already ${Math.round(event.waitedMs / 1000)}s)` : ""}`,
           )
           void markWaiting(event.sid, event.waitedMs)
+          // The new waiter wrote its sidecar synchronously; everyone else's
+          // total changed with it.
+          void refreshPlaces()
           break
         case "release":
           log("info", `release ${event.sid}: ${event.reason} (held ${event.held}/${config.limit})`)
-          void unmarkWaiting(event.sid, "release")
+          void unmarkWaiting(event.sid, "release").finally(() => {
+            void refreshPlaces()
+          })
           break
         case "cancel":
           log("debug", `cancel wait ${event.sid}: ${event.reason}`)
-          void unmarkWaiting(event.sid, "cancel")
+          void unmarkWaiting(event.sid, "cancel").finally(() => {
+            void refreshPlaces()
+          })
           break
         case "stale":
           log("warn", `drop stale lease ${event.sid} (no refresh for ${Math.round(event.ageMs / 1000)}s)`)
@@ -1607,7 +1707,9 @@ export default Plugin.define({
           }
           // A queued session has no lease, so a terminal event for it (deleted,
           // inbox cancelled) releases nothing — still drop its title mark.
-          void unmarkWaiting(sid, type)
+          void unmarkWaiting(sid, type).finally(() => {
+            void refreshPlaces()
+          })
         }
       } catch {
         // the stream closed: the plugin is being unloaded
@@ -1631,6 +1733,10 @@ export default Plugin.define({
 
     const restored = await restoreStaleMarks()
     const prunedTickets = pruneTickets()
+    const orphans = await clearOrphanPlaces()
+    // Places left by another instance may be older than its last tick; the
+    // queue is the source of truth, so publish it once on boot.
+    await refreshPlaces()
 
     log(
       "info",
@@ -1640,7 +1746,7 @@ export default Plugin.define({
         config.acquireTimeoutMs / 60_000,
       )}min onTimeout=${config.onTimeout} mark=${config.markWaitingTitle} prio=${
         config.priorityEnabled ? `/${config.priorityCommand}` : "off"
-      } dir=${config.dir} pruned=${pruned.length} tickets=${prunedTickets} restored=${restored}`,
+      } dir=${config.dir} pruned=${pruned.length} tickets=${prunedTickets} restored=${restored} orphans=${orphans}`,
     )
 
     return async () => {

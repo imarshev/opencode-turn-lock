@@ -98,6 +98,8 @@ type Behavior = {
   titles?: Record<string, string>
   /** Sessions the server answers with "not found" (deleted, archived). */
   missing?: Set<string>
+  /** Metadata already stored on a session before the plugin starts. */
+  metadata?: Record<string, Record<string, unknown>>
 }
 
 function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
@@ -106,7 +108,7 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
   const updates: Array<{ sessionID: string; title: string }> = []
   const parents = behavior.parents ?? {}
   const titles = new Map<string, string>(Object.entries(behavior.titles ?? {}))
-  const metadata = new Map<string, Record<string, unknown>>()
+  const metadata = new Map<string, Record<string, unknown>>(Object.entries(behavior.metadata ?? {}))
   const titleOf = (sessionID: string) => titles.get(sessionID) ?? "test session"
   const commands: Array<{ name: string; description?: string; execute: (input: unknown) => Promise<void> }> = []
   const ctx = {
@@ -127,6 +129,18 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
       get: async ({ sessionID }: { sessionID: string }) => {
         if (behavior.missing?.has(sessionID)) throw new Error(`session ${sessionID} not found`)
         return { id: sessionID, parentID: parents[sessionID], title: titleOf(sessionID), metadata: metadata.get(sessionID) }
+      },
+      list: async ({ limit = 100, cursor }: { limit?: number; cursor?: string } = {}) => {
+        const ids = [...new Set([...titles.keys(), ...metadata.keys()])].sort()
+        const start = cursor ? ids.indexOf(cursor) + 1 : 0
+        const data = ids.slice(start, start + limit).map((id) => ({
+          id,
+          parentID: parents[id],
+          title: titleOf(id),
+          metadata: metadata.get(id),
+        }))
+        const next = start + limit < ids.length ? ids[start + limit] : undefined
+        return { data, cursor: { next } }
       },
       update: async ({ sessionID, title, metadata: next }: { sessionID: string; title?: string; metadata?: Record<string, unknown> }) => {
         if (behavior.failUpdate) throw new Error("session update failed")
@@ -778,6 +792,103 @@ test("deleting a queued session drops its sidecar instead of leaving a phantom",
       () => readdirSync(harness.dir).includes("ses_3.wait.json") === false,
       "the sidecar of a deleted session is dropped",
     )
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("serving the head republishes the place of everyone behind it", async () => {
+  const harness = await setup(
+    { limit: 1, remindEveryMs: 0 },
+    { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } },
+  )
+  try {
+    await harness.context("ses_1")
+    const second = harness.context("ses_2")
+    const third = harness.context("ses_3")
+    await until(() => readState(harness.metadata.get("ses_3"))?.position === 2, "the third waits in place 2")
+    assert.equal(readState(harness.metadata.get("ses_3"))?.total, 2)
+
+    // The head is served. The badge of the new head has to say `1/1` right
+    // away, not after its own reminder tick — this test has no ticks at all.
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await second
+    await until(() => readState(harness.metadata.get("ses_3"))?.position === 1, "the place shrinks at once")
+    assert.equal(readState(harness.metadata.get("ses_3"))?.total, 1)
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+    await third
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a new waiter updates the total of the ones ahead of it", async () => {
+  const harness = await setup(
+    { limit: 1, remindEveryMs: 0 },
+    { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } },
+  )
+  try {
+    await harness.context("ses_1")
+    const second = harness.context("ses_2")
+    await until(() => readState(harness.metadata.get("ses_2"))?.position === 1, "the first waiter")
+    assert.equal(readState(harness.metadata.get("ses_2"))?.total, 1)
+
+    const third = harness.context("ses_3")
+    await until(() => readState(harness.metadata.get("ses_3"))?.position === 2, "the second waiter")
+    await until(() => readState(harness.metadata.get("ses_2"))?.total === 2, "the first waiter sees the longer queue")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await second
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+    await third
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a priority switch republishes the places of the whole queue", async () => {
+  const harness = await setup(
+    { limit: 1, remindEveryMs: 0 },
+    { titles: { ses_1: "one", ses_2: "two", ses_3: "three" } },
+  )
+  try {
+    await harness.context("ses_1")
+    const second = harness.context("ses_2")
+    const third = harness.context("ses_3")
+    await until(() => readState(harness.metadata.get("ses_2"))?.position === 1, "the ordinary waiter is first")
+    assert.equal(readState(harness.metadata.get("ses_3"))?.position, 2)
+
+    await harness.command("ses_3", "prio", "high")
+    await until(() => readState(harness.metadata.get("ses_3"))?.position === 1, "the priority waiter cuts in")
+    await until(() => readState(harness.metadata.get("ses_2"))?.position === 2, "the ordinary waiter moves back")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await third
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_3" } })
+    await second
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("boot clears a place left in metadata by a waiter that is gone", async () => {
+  const harness = await setup(
+    {},
+    {
+      titles: { ses_ghost: "ghost" },
+      metadata: {
+        ses_ghost: { "turn-lock": { level: "normal", position: 3, total: 3, since: Date.now() - 60_000 } },
+      },
+    },
+  )
+  try {
+    await until(
+      () => readState(harness.metadata.get("ses_ghost"))?.position === undefined,
+      "the orphan place is cleared on boot",
+    )
+    assert.equal(readState(harness.metadata.get("ses_ghost"))?.since, undefined, "the wait start goes with it")
+    assert.equal(readState(harness.metadata.get("ses_ghost"))?.level, "normal", "the level is kept")
   } finally {
     await harness.teardown()
   }

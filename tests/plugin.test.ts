@@ -855,7 +855,7 @@ test("an active session yields its slot at the next step, without breaking the r
     await until(() => thirdDone, "the priority session starts after one step")
     await wait(150)
     assert.equal(firstDone, false, "the preempted session waits for a slot again")
-    assert.match(harness.logText(), /yield ses_1: ses_3 has priority/)
+    assert.match(harness.logText(), /yield ses_1: ses_3 outranks it/)
 
     // It resumes on its own: the other holder ends its turn, nothing priority waits.
     harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
@@ -894,15 +894,20 @@ test("priority off leaves nobody holding a slot back", async () => {
 test("the command argument survives both shapes a client may send", () => {
   assert.equal(mod.parsePriorityArgument("", "prio"), "toggle")
   assert.equal(mod.parsePriorityArgument("  ", "prio"), "toggle")
-  assert.equal(mod.parsePriorityArgument("on", "prio"), "on")
-  assert.equal(mod.parsePriorityArgument("OFF", "prio"), "off")
-  assert.equal(mod.parsePriorityArgument("remove", "prio"), "off")
+  assert.equal(mod.parsePriorityArgument("on", "prio"), "high")
+  assert.equal(mod.parsePriorityArgument("OFF", "prio"), "normal")
+  assert.equal(mod.parsePriorityArgument("remove", "prio"), "normal")
+  assert.equal(mod.parsePriorityArgument("normal", "prio"), "normal")
+  assert.equal(mod.parsePriorityArgument("low", "prio"), "low")
+  assert.equal(mod.parsePriorityArgument("DOWN", "prio"), "low")
+  assert.equal(mod.parsePriorityArgument("high", "prio"), "high")
   assert.equal(mod.parsePriorityArgument("anything else", "prio"), "toggle")
   // a client that hands over the whole line instead of only the arguments
   assert.equal(mod.parsePriorityArgument("/prio", "prio"), "toggle")
   assert.equal(mod.parsePriorityArgument("prio", "prio"), "toggle")
-  assert.equal(mod.parsePriorityArgument("/prio off", "prio"), "off")
-  assert.equal(mod.parsePriorityArgument("  /PRIO on ", "prio"), "on")
+  assert.equal(mod.parsePriorityArgument("/prio off", "prio"), "normal")
+  assert.equal(mod.parsePriorityArgument("  /PRIO low ", "prio"), "low")
+  assert.equal(mod.parsePriorityArgument("/prio HIGH", "prio"), "high")
 })
 
 test("/prio with the command name still in the text turns priority off", async () => {
@@ -914,6 +919,161 @@ test("/prio with the command name still in the text turns priority off", async (
     await harness.command("ses_1", "prio", "/prio off")
     assert.equal(harness.titles.get("ses_1"), "one", "the whole line is parsed, not treated as a toggle")
     assert.deepEqual(harness.prioFiles(), [])
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("the low mark composes with the waiting prefix", () => {
+  assert.equal(mod.withLowMark("do it"), "▽ do it")
+  assert.equal(mod.withLowMark("▽ do it"), "▽ do it")
+  assert.equal(mod.withLowMark("⚡ do it"), "▽ do it", "a session is at one level at a time")
+  assert.equal(mod.withPriorityMark("▽ do it"), "⚡ do it")
+  assert.equal(mod.withoutLowMark("▽ ⏳ 3m · do it"), "⏳ 3m · do it")
+  assert.equal(mod.hasLowMark("▽ ⏳ do it"), true)
+  assert.equal(mod.hasLowMark("⚡ do it"), false)
+  assert.deepEqual(["⚡ do it", "▽ do it", "do it"].map(mod.levelOfTitle), ["high", "low", "normal"])
+  assert.equal(mod.withLevelMark("▽ do it", "normal"), "do it")
+
+  assert.equal(mod.withWaitPrefix("▽ do it", 3 * 60_000, { position: 3, total: 3 }), "▽ ⏳ 3/3 · 3m · do it")
+  assert.equal(mod.withWaitPrefix("⚡ ⏳ 4m · do it", 5 * 60_000, undefined, "low"), "▽ ⏳ 5m · do it")
+  assert.equal(mod.withWaitPrefix("▽ ⏳ 4m · do it", 5 * 60_000, undefined, "normal"), "⏳ 5m · do it")
+  assert.equal(mod.stripWaitPrefix("▽ ⏳ 2/3 · 1h5m · do it"), "▽ do it")
+  assert.deepEqual(mod.PRIORITY_RANK, { low: 0, normal: 1, high: 2 })
+})
+
+test("/prio low marks the session with ▽ and records the level", async () => {
+  const harness = await setup({}, { titles: { ses_1: "one" } })
+  try {
+    await harness.context("ses_1")
+
+    await harness.command("ses_1", "prio", "low")
+    assert.equal(harness.titles.get("ses_1"), "▽ one")
+    const flag = JSON.parse(readFileSync(join(harness.dir, "ses_1.prio.json"), "utf8"))
+    assert.equal(flag.level, "low")
+
+    // one level at a time: ⚡ replaces ▽, ordinary drops the flag again
+    await harness.command("ses_1", "prio", "high")
+    assert.equal(harness.titles.get("ses_1"), "⚡ one")
+    await harness.command("ses_1", "prio", "normal")
+    assert.equal(harness.titles.get("ses_1"), "one")
+    assert.deepEqual(harness.prioFiles(), [])
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("the queue is served by level: ⚡ first, then ordinary, then ▽", async () => {
+  const harness = await setup({ limit: 1 }, { titles: { ses_2: "two", ses_3: "three", ses_4: "four" } })
+  try {
+    await harness.context("ses_1") // the only slot is held
+
+    let twoDone = false
+    let threeDone = false
+    let fourDone = false
+    const two = harness.context("ses_2").then(() => {
+      twoDone = true
+    })
+    await until(() => harness.titles.get("ses_2") === "⏳ two", "the ordinary waiter is marked")
+    await harness.command("ses_3", "prio", "on")
+    const three = harness.context("ses_3").then(() => {
+      threeDone = true
+    })
+    await until(() => harness.titles.get("ses_3") === "⚡ ⏳ 1/2 · three", "the priority waiter is first")
+    await harness.command("ses_4", "prio", "low")
+    const four = harness.context("ses_4").then(() => {
+      fourDone = true
+    })
+    await until(() => harness.titles.get("ses_4") === "▽ ⏳ 3/3 · four", "the low waiter is last in the queue")
+
+    // The freed slot is not a race here: the ordinary waiter is held back by the
+    // priority one and the low one by both, so ⚡ takes it.
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await until(() => threeDone, "the priority session got the freed slot")
+    await wait(150)
+    assert.equal(twoDone, false, "an ordinary waiter holds back while a priority one queues")
+    assert.equal(fourDone, false, "the low waiter holds back behind both")
+
+    // Next level: ordinary. The low one is still not served.
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_3" } })
+    await until(() => twoDone, "the ordinary session got the next slot")
+    await wait(150)
+    assert.equal(fourDone, false, "the low waiter holds back while an ordinary one queues")
+
+    // Last level.
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+    await Promise.all([two, three, four])
+    assert.equal(harness.titles.get("ses_4"), "▽ four", "the ▽ mark stays while the flag is on")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a low session gives its slot up to an ordinary waiter", async () => {
+  const harness = await setup({}, { titles: { ses_1: "one", ses_3: "three" } })
+  try {
+    await harness.command("ses_1", "prio", "low")
+    assert.equal(harness.titles.get("ses_1"), "▽ one", "the flag marks the session before it runs")
+    await harness.context("ses_1") // one step done, the slot is held
+    await harness.context("ses_2")
+
+    let thirdDone = false
+    const third = harness.context("ses_3").then(() => {
+      thirdDone = true
+    })
+    await until(() => harness.titles.get("ses_3") === "⏳ three", "the ordinary waiter is marked")
+
+    // ses_1's next step boundary: an ordinary waiter outranks ▽, so it gives up.
+    let firstDone = false
+    const first = harness.context("ses_1").then(() => {
+      firstDone = true
+    })
+    await until(() => thirdDone, "the ordinary session took the yielded slot")
+    await wait(150)
+    assert.equal(firstDone, false, "the preempted session waits for a slot again")
+    assert.match(harness.logText(), /yield ses_1: ses_3 outranks it/)
+    // Whether the place label is already there depends on when ses_3's grant
+    // dropped its wait sidecar, so only the mark and the countdown are asserted.
+    assert.match(
+      harness.titles.get("ses_1") ?? "",
+      /^▽ ⏳ (?:\d+\/\d+ · )?one$/,
+      "it re-queues at the back, still ▽",
+    )
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_2" } })
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_3" } })
+    await first
+    assert.equal(harness.titles.get("ses_1"), "▽ one", "the queue mark comes off when the slot is back")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a flag file written before levels existed still means ⚡", async () => {
+  const harness = await setup({ limit: 1 }, { titles: { ses_2: "two", ses_3: "three" } })
+  try {
+    await harness.context("ses_1")
+    // the shape 0.1 wrote: no `level` field at all
+    writeFileSync(join(harness.dir, "ses_3.prio.json"), JSON.stringify({ sid: "ses_3", pid: process.pid, since: Date.now() }))
+
+    let twoDone = false
+    let threeDone = false
+    const two = harness.context("ses_2").then(() => {
+      twoDone = true
+    })
+    await until(() => harness.titles.get("ses_2") === "⏳ two", "the ordinary waiter is marked")
+    const three = harness.context("ses_3").then(() => {
+      threeDone = true
+    })
+    await until(() => harness.titles.get("ses_3") === "⚡ ⏳ 1/2 · three", "the legacy flag is read as priority")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await until(() => threeDone, "the legacy priority session got the freed slot")
+    await wait(150)
+    assert.equal(twoDone, false, "the ordinary waiter still holds back for it")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_3" } })
+    await Promise.all([two, three])
   } finally {
     await harness.teardown()
   }

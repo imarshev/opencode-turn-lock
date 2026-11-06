@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.2.4
-// @description  Пилюля приоритета для opencode-turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
+// @version      0.3.0
+// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) для turn-lock в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
 // @match        https://*/*
@@ -19,9 +19,10 @@
 // script draws the same pill the desktop app gets from ./gui-experimental.
 //
 // It is deliberately dumb, exactly like the desktop pill: the state is the "⚡"
-// prefix of the session title, and the switch is the server-side `/prio`
-// command. So it cannot disagree with the session list, and a toggle made on
-// the phone shows up here on the next refresh.
+// or "▽" prefix of the session title, and the switch is the server-side `/prio`
+// command. So it cannot disagree with the session list, and a change made on
+// the phone shows up here on the next refresh. One click moves one step down
+// the ladder: ordinary → `⚡` → `▽` → ordinary.
 //
 // Auth: the script never asks for the password. It wraps `fetch` at
 // document-start and reuses the `Authorization` header the app itself sends to
@@ -53,7 +54,14 @@
     /\.(local|lan|home\.arpa)$/.test(hostname)
   if (!local) return
 
-  const MARK = "⚡"
+  // The marks the server part writes into a title; ordinary carries none. One
+  // click moves one step down this ladder.
+  const MARKS = { high: "⚡", low: "▽" }
+  const CYCLE = { normal: "high", high: "low", low: "normal" }
+  const levelOf = (title) => {
+    const text = String(title || "")
+    return text.startsWith(MARKS.high) ? "high" : text.startsWith(MARKS.low) ? "low" : "normal"
+  }
   const ROUTE = /^\/server\/[^/]+\/session\/([^/?#]+)/
   const COMMAND = "prio"
   const RU = (navigator.language || "").toLowerCase().startsWith("ru")
@@ -62,14 +70,16 @@
     ? {
         ordinary: "Очередь: обычная",
         priority: "Очередь: приоритет",
-        hint: "Приоритет забирает следующий свободный слот; активная сессия уступит свой на границе своего следующего шага. Работающий вызов не прерывается.",
+        low: "Очередь: низкий",
+        hint: "Приоритет забирает следующий свободный слот; низкий ждёт за всеми и уступает им. Работающий вызов не прерывается. Один клик: обычная → приоритет → низкий → обычная.",
         failed: "не удалось изменить приоритет",
         missing: "команда /prio не зарегистрирована на сервере",
       }
     : {
         ordinary: "Queue: ordinary",
         priority: "Queue: priority",
-        hint: "Priority takes the next free slot; an active session yields its slot at its next step. Nothing running is interrupted.",
+        low: "Queue: low",
+        hint: "Priority takes the next free slot; low waits behind everyone and yields to them. Nothing running is interrupted. One click: ordinary → priority → low → ordinary.",
         failed: "the priority change failed",
         missing: "the /prio command is not registered on the server",
       }
@@ -135,7 +145,7 @@
     const body = await response.json()
     const info = body && body.data ? body.data : body
     return {
-      on: String(info && info.title ? info.title : "").startsWith(MARK),
+      level: levelOf(info && info.title),
       directory: info && info.location ? info.location.directory : undefined,
       // A subagent session is judged by its parent's verdict, not its own: a
       // `/prio` there would write a flag the scheduler never reads.
@@ -159,10 +169,12 @@
     return found
   }
 
-  const toggle = async (id, on) => {
+  // The command takes the level by name (`on`/`off` still work server-side, but
+  // three states are clearer asked for explicitly).
+  const setLevel = async (id, level) => {
     const response = await api(`/api/session/${encodeURIComponent(id)}/command`, {
       method: "POST",
-      body: JSON.stringify({ name: COMMAND, text: on ? "off" : "on" }),
+      body: JSON.stringify({ name: COMMAND, text: level }),
     })
     if (!response.ok) throw new Error(`command ${response.status}`)
   }
@@ -225,15 +237,21 @@
         }
         button:hover { opacity:1; border-color: color-mix(in oklab, CanvasText 30%, transparent) }
         button:disabled { cursor:progress; opacity:.6 }
-        button[data-on="true"] {
+        button[data-level="high"] {
           border-color: color-mix(in oklab, #f5a524 65%, transparent);
           background: color-mix(in oklab, #f5a524 20%, Canvas);
+        }
+        // Low is deliberately the least loud of the three: same shape, grey.
+        button[data-level="low"] {
+          border-color: color-mix(in oklab, #8b8b93 55%, transparent);
+          background: color-mix(in oklab, #8b8b93 16%, Canvas);
+          opacity: 0.8;
         }
         button[data-state="error"] { border-color:#e5484d; color:#e5484d }
         .mark { font-size:14px; line-height:1; flex:0 0 auto }
         .text { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
       </style>
-      <button type="button" data-on="false" title="">
+      <button type="button" data-level="normal" title="">
         <span class="mark" aria-hidden="true">↑</span><span class="text"></span>
       </button>`
     button = root.querySelector("button")
@@ -280,13 +298,19 @@
 
   const render = (state) => {
     if (!button) return
-    const on = state.on
-    button.dataset.on = on ? "true" : "false"
+    button.dataset.level = state.level
     button.dataset.state = state.error ? "error" : state.missing ? "missing" : "ok"
     button.disabled = Boolean(state.busy)
     button.title = state.error ? T.failed : T.hint
-    root.querySelector(".mark").textContent = on ? "⚡" : "↑"
-    label.textContent = state.error ? T.failed : on ? T.priority : T.ordinary
+    root.querySelector(".mark").textContent =
+      state.level === "high" ? MARKS.high : state.level === "low" ? MARKS.low : "↑"
+    label.textContent = state.error
+      ? T.failed
+      : state.level === "high"
+        ? T.priority
+        : state.level === "low"
+          ? T.low
+          : T.ordinary
   }
 
   const hide = () => {
@@ -300,7 +324,7 @@
 
   // --------------------------------------------------------------------- loop
 
-  const state = { id: null, on: false, busy: false, error: false, missing: false, parent: false }
+  const state = { id: null, level: "normal", busy: false, error: false, missing: false, parent: false }
   let lastRead = 0
   let reading = false
 
@@ -316,7 +340,7 @@
     try {
       const info = await readSession(id)
       state.id = id
-      state.on = info.on
+      state.level = info.level
       state.parent = info.parent
       state.error = false
       state.missing = false
@@ -340,7 +364,7 @@
       // keep the last known state: the server may be restarting
       if (state.id !== id) {
         state.id = id
-        state.on = false
+        state.level = "normal"
         state.parent = false
         render(state)
       }
@@ -352,16 +376,17 @@
   async function onClick() {
     const id = sessionID()
     if (!id || state.busy) return
-    const was = state.on
+    const was = state.level
+    const next = CYCLE[was]
     state.busy = true
-    state.on = !was // optimistic: the rename confirms or corrects it
+    state.level = next // optimistic: the rename confirms or corrects it
     state.error = false
     render(state)
     try {
-      await toggle(id, was)
+      await setLevel(id, next)
       await refresh(true)
     } catch {
-      state.on = was
+      state.level = was
       state.error = true
       render(state)
       setTimeout(() => {

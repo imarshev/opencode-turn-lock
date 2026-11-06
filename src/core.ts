@@ -70,8 +70,8 @@ export type TurnLockOptions = {
   /** How long a cancelled wait stays flagged, so the polling loop can see it. */
   cancelTtlMs?: number
   /** Reserve a free slot for someone else: return true to keep `sid` waiting
-   *  even though `live < limit`. Used for priority — an ordinary session holds
-   *  back while a priority session queues. A holder is never affected: the
+   *  even though `live < limit`. Used for priority — a session holds back while
+   *  a session of a higher priority queues. A holder is never affected: the
    *  check runs only where a slot would newly be taken. */
   holdBack?: (sid: string) => boolean
 }
@@ -145,7 +145,8 @@ export function createTurnLock(options: TurnLockOptions): TurnLock {
   const tryTake = (sid: string, at: number): "taken" | "full" | "priority" => {
     const mine = store.read(sid)
     if (mine) return "taken"
-    // A free slot is not necessarily an available one: priority waiters get it.
+    // A free slot is not necessarily an available one: a waiter of a higher
+    // priority is holding it back.
     if (holdBack?.(sid)) return "priority"
     const live = freshLeases(at)
     if (live.length >= limit) return "full"

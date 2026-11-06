@@ -32,12 +32,14 @@
 // session exactly like a working one (`running`), so this prefix is the only
 // signal the session list can show.
 //
-// Priority (`/prio`, marked "⚡ " in the title) answers "the priorities changed:
-// I need a newer session's result first" without stopping anything. Two rules:
-// an ordinary session never takes a free slot while a priority session queues,
-// and a session that already holds a slot gives it up at its *next step
-// boundary* — never in the middle of a model or tool call. The preempted session
-// re-queues itself and resumes on its own, so work continues unattended.
+// Priority (`/prio`, marked "⚡ " or "▽ " in the title) answers "the priorities
+// changed: I need a newer session's result first" without stopping anything.
+// Three levels — high (`⚡`), ordinary (no mark) and low (`▽`) — and two rules:
+// a session takes a free slot only while no session of a *higher* level queues
+// behind it, and a session that already holds a slot gives it up at its *next
+// step boundary* — never in the middle of a model or tool call — to a waiter of
+// a higher level. The preempted session re-queues itself and resumes on its own,
+// so work continues unattended.
 //
 // Configuration (optional), highest precedence last:
 //   built-in defaults
@@ -59,9 +61,9 @@
 //     "releaseOnPermission": true,      // a permission prompt frees the slot
 //     "remindEveryMs": 60000,           // title countdown tick + log line for a long wait
 //     "markWaitingTitle": true,         // prefix the session title with "⏳ " while it waits
-//     "priorityEnabled": true,          // /prio: a session the user needs now cuts the queue
-//     "priorityCommand": "prio",        // the slash command that toggles it
-//     "priorityTtlMs": 86400000,        // a forgotten ⚡ stops working after this long
+//     "priorityEnabled": true,          // /prio: ⚡ cuts the queue, ▽ stands at the back of it
+//     "priorityCommand": "prio",        // the slash command that sets the level
+//     "priorityTtlMs": 86400000,        // a forgotten ⚡ or ▽ stops working after this long
 //     "dir": "%TEMP%/opencode/turn-lock",
 //     "logFile": "%TEMP%/opencode/turn-lock.log",
 //     "logLevel": "info"                // "off" | "info" | "debug"
@@ -132,8 +134,8 @@ export const DEFAULTS: TurnLockConfig = {
   markWaitingTitle: true,
   priorityEnabled: true,
   priorityCommand: "prio",
-  // A forgotten ⚡ must not starve everyone forever: after a day the flag stops
-  // having any effect and its file is dropped on the next read.
+  // A forgotten mark must not skew the queue forever: after a day it stops having
+  // any effect and its file is dropped on the next read.
   priorityTtlMs: 24 * 60 * 60_000,
   dir: join(tmpdir(), "opencode", "turn-lock"),
   logFile: join(tmpdir(), "opencode", "turn-lock.log"),
@@ -316,12 +318,54 @@ export const WAITING_MARK = "⏳ "
  *  itself queued reads as `⚡ ⏳ 2/3 · 26m · <title>`. */
 export const PRIORITY_MARK = "⚡"
 
-/** The priority mark plus the space the two marks are joined by, if any. */
-const PRIORITY_PREFIX = /^⚡ ?/
+/** Prefix of a session that should wait last: it stands behind every ordinary
+ *  waiter and gives its slot up to them, so `▽ ⏳ 3/3 · 26m · <title>`. */
+export const LOW_MARK = "▽"
 
-/** Title with the priority mark added (idempotent). */
+/** The queue levels, best first. `normal` is the absence of a flag: no sidecar
+ *  file, no mark in the title. */
+export type PriorityLevel = "low" | "normal" | "high"
+
+/** What one level is worth against another: `high` beats `normal` beats `low`. */
+export const PRIORITY_RANK: Record<PriorityLevel, number> = { low: 0, normal: 1, high: 2 }
+
+/** The mark of a level in a session title; ordinary carries none. */
+export function markFor(level: PriorityLevel): string {
+  return level === "high" ? PRIORITY_MARK : level === "low" ? LOW_MARK : ""
+}
+
+/** The level mark plus the space the two marks are joined by, if any. */
+const PRIORITY_PREFIX = /^⚡ ?/
+const LOW_PREFIX = /^▽ ?/
+
+/** The level a title carries: its leading mark, or ordinary when it has none. */
+export function levelOfTitle(title: string): PriorityLevel {
+  if (PRIORITY_PREFIX.test(title)) return "high"
+  if (LOW_PREFIX.test(title)) return "low"
+  return "normal"
+}
+
+/** Title with every level mark removed (idempotent, touches nothing else). */
+export function withoutLevelMark(title: string): string {
+  let result = title
+  for (;;) {
+    const next = result.replace(PRIORITY_PREFIX, "").replace(LOW_PREFIX, "")
+    if (next === result) return result
+    result = next
+  }
+}
+
+/** Title carrying exactly this level's mark (idempotent; `normal` removes both). */
+export function withLevelMark(title: string, level: PriorityLevel): string {
+  const mark = markFor(level)
+  const base = withoutLevelMark(title)
+  return mark ? `${mark} ${base}` : base
+}
+
+/** Title with the priority mark added (idempotent). A `▽` is replaced: a session
+ *  is at one level at a time. */
 export function withPriorityMark(title: string): string {
-  return PRIORITY_PREFIX.test(title) ? title : `${PRIORITY_MARK} ${title}`
+  return withLevelMark(title, "high")
 }
 
 /** Title with the priority mark removed (idempotent, touches nothing else). */
@@ -332,6 +376,21 @@ export function withoutPriorityMark(title: string): string {
 /** Does this title carry the priority mark? */
 export function hasPriorityMark(title: string): boolean {
   return PRIORITY_PREFIX.test(title)
+}
+
+/** Title with the low-priority mark added (idempotent; replaces a `⚡`). */
+export function withLowMark(title: string): string {
+  return withLevelMark(title, "low")
+}
+
+/** Title with the low-priority mark removed (idempotent, touches nothing else). */
+export function withoutLowMark(title: string): string {
+  return title.replace(LOW_PREFIX, "")
+}
+
+/** Does this title carry the low-priority mark? */
+export function hasLowMark(title: string): boolean {
+  return LOW_PREFIX.test(title)
 }
 
 /**
@@ -357,35 +416,40 @@ export function formatWait(waitedMs: number, place?: QueuePlace): string {
   return parts.join(" · ")
 }
 
-/** Original title with every waiting prefix removed. A leading priority mark
- *  is not a waiting prefix: it stays where it is. */
+/** Original title with every waiting prefix removed. A leading level mark is not
+ *  a waiting prefix: it stays where it is. */
 export function stripWaitPrefix(title: string): string {
-  const priority = hasPriorityMark(title)
-  let result = title.replace(PRIORITY_PREFIX, "")
+  const mark = markFor(levelOfTitle(title))
+  let result = withoutLevelMark(title)
   while (WAIT_PREFIX.test(result)) result = result.replace(WAIT_PREFIX, "")
-  return priority ? `${PRIORITY_MARK} ${result}` : result
+  return mark ? `${mark} ${result}` : result
 }
 
-/** Title of a waiting session: `⏳ 2/3 · 3h10m · <title>`, or `⚡ ⏳ …` when it
- *  is waiting *and* priority. Priority defaults to whatever the title already
- *  carries; pass it explicitly to add or remove the mark in the same write. */
+/** Title of a waiting session: `⏳ 2/3 · 3h10m · <title>`, or `⚡ ⏳ …` / `▽ ⏳ …`
+ *  when it is waiting *and* flagged. The level defaults to whatever the title
+ *  already carries; pass it explicitly to move the session in the same write.
+ *  `true`/`false` are accepted for the two-level callers (`true` = `high`). */
 export function withWaitPrefix(
   title: string,
   waitedMs: number,
   place?: QueuePlace,
-  priority: boolean = hasPriorityMark(title),
+  level: PriorityLevel | boolean = levelOfTitle(title),
 ): string {
-  const base = withoutPriorityMark(stripWaitPrefix(title))
+  const base = withoutLevelMark(stripWaitPrefix(title))
   const label = formatWait(waitedMs, place)
-  return `${priority ? `${PRIORITY_MARK} ` : ""}${WAITING_MARK}${label ? `${label} · ` : ""}${base}`
+  const mark = markFor(level === true ? "high" : level === false ? "normal" : level)
+  return `${mark ? `${mark} ` : ""}${WAITING_MARK}${label ? `${label} · ` : ""}${base}`
 }
 
 /**
- * Reads the intent out of a command's text: `/prio`, `/prio on`, `/prio off`.
+ * Reads the intent out of a command's text: `/prio`, `/prio on`, `/prio low`.
  * Tolerates both shapes a client may hand over — just the arguments, or the
  * whole line including the command name — because that is not specified.
+ * `toggle` is the bare `/prio` of the two-level days: it still means "on unless
+ * this session is already `⚡`", so an old habit keeps working and `low` is only
+ * ever asked for by name.
  */
-export function parsePriorityArgument(text: string, command: string): "on" | "off" | "toggle" {
+export function parsePriorityArgument(text: string, command: string): PriorityLevel | "toggle" {
   let argument = String(text ?? "").trim().toLowerCase()
   const name = String(command ?? "").toLowerCase()
   for (const prefix of [`/${name}`, name]) {
@@ -395,8 +459,9 @@ export function parsePriorityArgument(text: string, command: string): "on" | "of
       break
     }
   }
-  if (argument === "off" || argument === "remove" || argument === "false" || argument === "0") return "off"
-  if (argument === "on" || argument === "add" || argument === "true" || argument === "1") return "on"
+  if (/^(off|remove|false|0|no|normal|ordinary|mid|middle|medium|default|base)$/.test(argument)) return "normal"
+  if (/^(low|lo|down|bottom|least|min|background)$/.test(argument)) return "low"
+  if (/^(on|add|true|1|yes|high|hi|up|max|first|priority|urgent)$/.test(argument)) return "high"
   return "toggle"
 }
 
@@ -528,12 +593,16 @@ export default Plugin.define({
       return { position: index + 1, total: order.length }
     }
 
-    // Priority. `<sessionID>.prio.json` is the shared record that the user needs
-    // this session now: `/prio` writes it from any client, every process sharing
-    // the lock directory reads it. A flag is inert while its session neither
-    // waits nor holds a slot, so a forgotten ⚡ costs nothing — and it expires
-    // anyway after priorityTtlMs.
+    // Priority. `<sessionID>.prio.json` is the shared record of where the user
+    // wants this session to stand in the queue: `/prio` writes it from any client,
+    // every process sharing the lock directory reads it. `level` is `high` (⚡, cuts
+    // the queue) or `low` (▽, stands at the back of it); no file means ordinary.
+    // A flag is inert while its session neither waits nor holds a slot, so a
+    // forgotten mark costs nothing — and it expires anyway after priorityTtlMs.
     const prioPath = (sid: string) => join(config.dir, `${sid.replace(/[^A-Za-z0-9_.-]/g, "_")}.prio.json`)
+
+    /** A recorded flag: which end of the queue the session asked for, and since when. */
+    type PriorityFlag = { level: Exclude<PriorityLevel, "normal">; since: number }
 
     const dropPriority = (sid: string) => {
       try {
@@ -543,7 +612,7 @@ export default Plugin.define({
       }
     }
 
-    const readPriority = (sid: string): { since: number } | undefined => {
+    const readPriority = (sid: string): PriorityFlag | undefined => {
       if (!config.priorityEnabled) return undefined
       try {
         const value = JSON.parse(readFileSync(prioPath(sid), "utf8"))
@@ -553,75 +622,102 @@ export default Plugin.define({
           dropPriority(sid)
           return undefined
         }
-        return { since }
+        // Ordinary is the absence of a flag: a file saying so is stale, and a file
+        // without `level` was written before levels existed — it meant `⚡` then.
+        if (value?.level === "normal") {
+          dropPriority(sid)
+          return undefined
+        }
+        return { level: value?.level === "low" ? "low" : "high", since }
       } catch {
         return undefined
       }
     }
 
-    const writePriority = (sid: string) => {
+    /** Asks for `level` in the queue; ordinary is the absence of a flag. */
+    const writePriority = (sid: string, level: PriorityLevel) => {
+      if (level === "normal") {
+        dropPriority(sid)
+        return
+      }
       try {
         mkdirSync(config.dir, { recursive: true })
-        writeFileSync(prioPath(sid), JSON.stringify({ sid, pid: process.pid, owner, since: Date.now() }), "utf8")
+        writeFileSync(
+          prioPath(sid),
+          JSON.stringify({ sid, pid: process.pid, owner, since: Date.now(), level }),
+          "utf8",
+        )
       } catch {
         // priority is best-effort: without the file the session simply stays ordinary
       }
     }
 
-    /** Priority sessions queued right now, oldest flag first. One that already
-     *  holds a slot is being served, so it is not in this list. */
-    const priorityWaiters = (): Array<{ sid: string; since: number }> => {
-      const flagged: Array<{ sid: string; since: number }> = []
+    /** The level this session asked for, read from the shared flag. */
+    const levelOf = (sid: string): PriorityLevel => {
+      const flag = readPriority(sid)
+      return flag ? flag.level : "normal"
+    }
+
+    const rankOf = (sid: string): number => PRIORITY_RANK[levelOf(sid)]
+
+    /** Everyone queued right now, with the level they will be served at. `age` is
+     *  what orders two waiters of one level: the moment the flag was set for a
+     *  flagged one, the moment they started waiting for an ordinary one. A waiter
+     *  that already holds a slot is being served, so it is not in this list. */
+    const rankedWaiters = (): Array<{ sid: string; rank: number; age: number }> => {
+      const ranked: Array<{ sid: string; rank: number; age: number }> = []
       for (const waiter of readWaiters()) {
         if (store.read(waiter.sid)) continue
-        const mine = readPriority(waiter.sid)
-        if (mine) flagged.push({ sid: waiter.sid, since: mine.since })
+        const flag = readPriority(waiter.sid)
+        ranked.push(
+          flag
+            ? { sid: waiter.sid, rank: PRIORITY_RANK[flag.level], age: flag.since }
+            : { sid: waiter.sid, rank: PRIORITY_RANK.normal, age: waiter.since },
+        )
       }
-      return flagged.sort((a, b) => a.since - b.since || a.sid.localeCompare(b.sid))
+      return ranked
     }
 
-    /** The queue in the order it will actually be served: priority first (by the
-     *  age of the flag), the rest by the moment they started waiting. `sid` is
-     *  included even before its sidecar exists, so a place is always defined. */
-    const orderedWaiters = (sid?: string, since = 0): string[] => {
-      const waiting = new Map<string, number>()
-      for (const waiter of readWaiters()) waiting.set(waiter.sid, waiter.since)
-      const flagged = new Map<string, number>()
-      for (const priority of priorityWaiters()) flagged.set(priority.sid, priority.since)
-      if (sid) {
-        waiting.set(sid, since)
-        const mine = readPriority(sid)
-        if (mine) flagged.set(sid, mine.since)
-      }
-      const first = [...flagged.entries()]
-        .filter(([id]) => waiting.has(id))
-        .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
-        .map(([id]) => id)
-      const then = [...waiting.entries()]
-        .filter(([id]) => !flagged.has(id))
-        .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
-        .map(([id]) => id)
-      return [...first, ...then]
-    }
+    /** Waiters of a strictly better level than `rank`: they take the next free slot
+     *  first, and a holder of `rank` gives its own slot up to them. */
+    const waitingAbove = (rank: number, except?: string) =>
+      rankedWaiters().filter((waiter) => waiter.sid !== except && waiter.rank > rank)
 
-    /** May `sid` take a free slot? No, while a priority session queues ahead of
-     *  it: any ordinary session behind every priority waiter, and between two
-     *  priority sessions the one flagged later. */
+    /** May `sid` take a free slot? No, while anyone goes before it: a better level,
+     *  or the older flag inside the level it is flagged at. Two ordinary waiters
+     *  have never been ordered against each other — the slot is the first one awake. */
     const holdsBack = (sid: string): boolean => {
-      const ahead = priorityWaiters()
-      if (!ahead.length) return false
-      const mine = readPriority(sid)
-      if (!mine) return true
-      return ahead.some((w) => w.sid !== sid && (w.since < mine.since || (w.since === mine.since && w.sid < sid)))
+      const flag = readPriority(sid)
+      const mine = flag ? PRIORITY_RANK[flag.level] : PRIORITY_RANK.normal
+      for (const waiter of rankedWaiters()) {
+        if (waiter.sid === sid) continue
+        if (waiter.rank > mine) return true
+        if (!flag || waiter.rank !== mine) continue
+        if (waiter.age < flag.since || (waiter.age === flag.since && waiter.sid < sid)) return true
+      }
+      return false
+    }
+
+    /** The queue in the order it will actually be served: the best level first
+     *  (`⚡`, then ordinary, then `▽`), inside a level by the age that orders it.
+     *  `sid` is included even before its sidecar exists, so a place is always defined. */
+    const orderedWaiters = (sid?: string, since = 0): string[] => {
+      const entries = new Map<string, { rank: number; age: number }>()
+      const put = (id: string, flag: PriorityFlag | undefined, waited: number) =>
+        entries.set(id, flag ? { rank: PRIORITY_RANK[flag.level], age: flag.since } : { rank: PRIORITY_RANK.normal, age: waited })
+      for (const waiter of readWaiters()) put(waiter.sid, readPriority(waiter.sid), waiter.since)
+      if (sid) put(sid, readPriority(sid), since)
+      return [...entries.entries()]
+        .sort((a, b) => b[1].rank - a[1].rank || a[1].age - b[1].age || a[0].localeCompare(b[0]))
+        .map(([id]) => id)
     }
 
     /** `/prio` in the session's composer. A command callback runs immediately
      *  and is not a model request, so it also reaches a session that is sitting
      *  in the queue — which is exactly when it matters. */
-    async function applyPriority(sid: string, on: boolean): Promise<void> {
+    async function applyLevel(sid: string, level: PriorityLevel): Promise<void> {
       waitEpoch.set(sid, epochOf(sid) + 1) // an in-flight title update must not win
-      if (on) writePriority(sid)
-      else dropPriority(sid)
+      writePriority(sid, level)
       const waiting = readWaitMark(sid)
       const waitedMs = waiting && typeof waiting.since === "number" ? Date.now() - waiting.since : undefined
       if (waitedMs !== undefined) {
@@ -630,13 +726,13 @@ export default Plugin.define({
         try {
           const info: any = await ctx.session.get({ sessionID: sid })
           const title = typeof info?.title === "string" ? info.title : ""
-          const next = on ? withPriorityMark(title) : withoutPriorityMark(title)
+          const next = withLevelMark(title, level)
           if (title && next !== title) await ctx.session.update({ sessionID: sid, title: next })
         } catch (error) {
           log("debug", `priority ${sid}: title update failed: ${String(error)}`)
         }
       }
-      log("info", `priority ${sid}: ${on ? "on" : "off"}`)
+      log("info", `priority ${sid}: ${level}`)
     }
 
     /** Records that `sid` is waiting (the sidecar is the only shared record of
@@ -659,7 +755,7 @@ export default Plugin.define({
         const place = placeOf(sid, since)
         // The flag, not the title, decides the mark: /prio can be typed while
         // this session is already queued, and the next tick has to notice.
-        const next = withWaitPrefix(title, waitedMs, place, Boolean(readPriority(sid)))
+        const next = withWaitPrefix(title, waitedMs, place, levelOf(sid))
         if (next === title) {
           marked.add(sid)
           return
@@ -759,7 +855,7 @@ export default Plugin.define({
             "info",
             `wait ${event.sid}: ${
               event.blocked === "priority"
-                ? `a priority session takes the next free slot (${event.held}/${event.limit} busy)`
+                ? `a session of a higher priority takes the next free slot (${event.held}/${event.limit} busy)`
                 : `${event.held}/${event.limit} local sessions are busy`
             }${event.waitedMs ? ` (already ${Math.round(event.waitedMs / 1000)}s)` : ""}`,
           )
@@ -898,14 +994,14 @@ export default Plugin.define({
 
         // Soft preemption. Never interrupt a model or tool call: this hook runs
         // at a step boundary, which is the only place a slot can be given up
-        // without breaking anything. An ordinary holder that sees a priority
-        // session queued releases its own slot and re-queues below; it resumes on
-        // its own as soon as the priority session is served.
-        if (held.has(sid) && !readPriority(sid)) {
-          const ahead = priorityWaiters()
+        // without breaking anything. A holder that sees a waiter of a better level
+        // queued gives its own slot up and re-queues below; it resumes on its own
+        // as soon as that waiter is served. So `▽` yields to everyone, `⚡` to nobody.
+        if (held.has(sid)) {
+          const ahead = waitingAbove(rankOf(sid), sid)
           if (ahead.length) {
             const who = ahead.map((waiter) => waiter.sid).join(", ")
-            log("info", `yield ${sid}: ${who} ${ahead.length === 1 ? "has priority" : "have priority"}`)
+            log("info", `yield ${sid}: ${who} ${ahead.length === 1 ? "outranks" : "outrank"} it`)
             held.delete(sid)
             lock.release(sid, "priority")
           }
@@ -925,18 +1021,22 @@ export default Plugin.define({
     // client has (the composer), and a command callback is executed immediately
     // instead of being queued into the session inbox, so it reaches a session
     // that is blocked in the gate above. Nothing is sent to the model: the state
-    // is the ⚡ in the title.
+    // is the `⚡` or `▽` in the title.
     if (config.priorityEnabled && typeof ctx?.command?.transform === "function") {
       try {
         await ctx.command.transform((editor: { add: (command: unknown) => void }) => {
           editor.add({
             name: config.priorityCommand,
-            description: "turn-lock: this session cuts the queue (⚡). No argument toggles, or pass on/off",
+            description:
+              "turn-lock: where this session stands in the queue — on/⚡ cuts it, low/▽ stands at the back of it, off is ordinary",
             execute: async (input: { sessionID?: string; prompt?: { text?: string } }) => {
               const sid = input?.sessionID
               if (!sid) return
               const verdict = parsePriorityArgument(input?.prompt?.text ?? "", config.priorityCommand)
-              await applyPriority(sid, verdict === "off" ? false : verdict === "on" ? true : !readPriority(sid))
+              // A bare `/prio` keeps the meaning it had at two levels: on, unless
+              // this session is already `⚡`. `low` is only ever asked for by name.
+              const level = verdict === "toggle" ? (levelOf(sid) === "high" ? "normal" : "high") : verdict
+              await applyLevel(sid, level)
             },
           })
         })

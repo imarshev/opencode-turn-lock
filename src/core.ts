@@ -92,10 +92,10 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
 
 export function createTurnLock(options: TurnLockOptions): TurnLock {
   const store = options.store
-  const limit = Math.max(1, options.limit ?? 2)
+  const limit = Math.max(1, options.limit ?? 1)
   const acquireTimeoutMs = Math.max(0, options.acquireTimeoutMs ?? 10 * 60_000)
   const leaseTimeoutMs = Math.max(1_000, options.leaseTimeoutMs ?? 60 * 60_000)
-  const pollMs = Math.max(5, options.pollMs ?? 1_000)
+  const pollMs = Math.max(5, options.pollMs ?? 200)
   const onTimeout = options.onTimeout ?? "proceed"
   const remindEveryMs = Math.max(0, options.remindEveryMs ?? 5 * 60_000)
   const now = options.now ?? (() => Date.now())

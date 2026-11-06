@@ -3,21 +3,23 @@
 //
 // Why: the local engine (strata on 18500) serves one request at a time and
 // switches context per request, so N interleaved agent sessions thrash the
-// conversation cache. This plugin serialises *turns* per session: a session
-// takes a lease on its first gated request and keeps it until its run ends
-// (idle / success / failure / interrupt / delete / question), so a goal in one
-// session runs to completion before the next session is admitted.
+// conversation cache. By default the slot covers one *request*: it is taken in
+// the `context` hook and freed at `session.step.ended`, so the engine is
+// available while a session runs a tool. The session keeps a turn ticket
+// (`<sid>.turn.json`) so its next step is served ahead of everyone who queued
+// while it worked — but only for a fory (`requeueGraceMs`, 10 s): a step that
+// is not ready inside that window lets the next session in, and that session
+// gets a fory of its own. `lockScope: "turn"` restores the whole-turn lease.
 //
 // Cloud providers are never gated: the `context` hook checks the provider of
 // the outgoing request and returns immediately unless it is local. Auxiliary
 // request kinds (`title`, `summary`/`compaction`, `generate`) are not hooked at
 // all, so cloud sessions and local bookkeeping calls are never delayed.
 //
-// Subagents are never gated on their own: a subagent session inherits the
-// verdict of its parent. If the parent holds a slot the child is covered (and
-// refreshes the parent's lease); if the parent run is not gated (cloud) the
-// child is exempt too. Without this, a local parent waiting for its own
-// subagent would queue behind itself.
+// Subagents are gated on their own in `request` scope: each request takes a
+// slot and inherits the level of its parent chain (a parent waiting for its
+// subagent does not hold a slot, so there is nothing to share). In `turn` scope
+// a subagent is covered by its parent's lease instead, exactly as before.
 //
 // A queued session used to get a synthetic "turn-lock: в очереди" message in
 // its inbox. That message is invisible while the session waits (a queued
@@ -48,13 +50,14 @@
 //
 //   {
 //     "enabled": true,
-//     "limit": 2,                       // concurrent local sessions
+//     "limit": 1,                       // concurrent local sessions
 //     "localProviders": ["strata"],     // provider ids treated as local
 //     "localHosts": ["127.0.0.1", "localhost", "::1", "0.0.0.0"],
 //     "acquireTimeoutMs": 14400000,     // 4 h: max wait before onTimeout applies
 //     "onTimeout": "proceed",           // "proceed" (fail-open) | "hold"
 //     "leaseTimeoutMs": 7200000,        // lease without refresh = abandoned
-//     "pollMs": 1000,
+//     "pollMs": 200,
+//     "requeueGraceMs": 10000,          // fory: the session that just released keeps the head of the queue
 //     "fifoGraceMs": 2000,              // how long place 1 may take a freed slot before place 2 gets it
 //     "refreshEveryMs": 20000,
 //     "sweepMs": 60000,
@@ -102,6 +105,14 @@ export type TurnLockConfig = {
   acquireTimeoutMs: number
   onTimeout: "proceed" | "hold"
   leaseTimeoutMs: number
+  /** What one lease covers: a single model request (`request`, the default) or
+   *  the whole turn (`turn`). In `request` scope the slot is freed at the end
+   *  of every step, while the session keeps its turn ticket for the next one. */
+  lockScope: "request" | "turn"
+  /** How long a session that just released a slot keeps the head of its level
+   *  in `request` scope ("fory"): its next step may ask for the model at once
+   *  and still be served first. 0 disables the fory. */
+  requeueGraceMs: number
   pollMs: number
   /** How long the head of a level may take a freed slot before the next waiter
    *  of the same level is let through. 0 disables the FIFO order (first awake wins). */
@@ -128,7 +139,10 @@ export type TurnLockConfig = {
 
 export const DEFAULTS: TurnLockConfig = {
   enabled: true,
-  limit: 2,
+  // The local engine serves one request at a time (one slot, `prefill_pipe: 0`),
+  // so a second lease only hides the queue inside the engine and costs the exact
+  // priority this plugin exists to give.
+  limit: 1,
   localProviders: ["strata"],
   localHosts: ["127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::", "[::]"],
   // A long queued turn is normal here: the point is to let one goal finish
@@ -138,7 +152,16 @@ export const DEFAULTS: TurnLockConfig = {
   acquireTimeoutMs: 4 * 60 * 60_000,
   onTimeout: "proceed",
   leaseTimeoutMs: 2 * 60 * 60_000,
-  pollMs: 1_000,
+  // One lease per model request: the slot is free while a tool runs, and the
+  // session keeps a turn ticket so it is first in line for its next step.
+  // `"turn"` restores the old whole-turn lease.
+  lockScope: "request",
+  pollMs: 200,
+  // The fory of `request` scope: a session that has just finished a request may
+  // send the next step at once and still be served first. Ten seconds covers a
+  // tool call that returns immediately (a `read`, a `grep`) without letting a
+  // session that went quiet keep the head of the queue for long.
+  requeueGraceMs: 10_000,
   // The head of a level gets two poll ticks to take a freed slot; if it does not
   // (dead process, wedged event loop), the next place is served instead.
   fifoGraceMs: 2_000,
@@ -165,8 +188,12 @@ export const DEFAULTS: TurnLockConfig = {
 }
 
 /** Leases are released on any of these: the run ended, the session is gone, or
- *  the agent is blocked on the human (question form / permission prompt). */
+ *  the agent is blocked on the human (question form / permission prompt). In
+ *  `request` scope `step.ended`/`step.failed` also release, at the end of one
+ *  model request; in `turn` scope they are ignored. */
 export const RELEASE_EVENTS = [
+  "session.step.ended",
+  "session.step.failed",
   "session.idle",
   "session.status",
   "session.execution.succeeded",
@@ -197,6 +224,12 @@ const END_OF_RUN_EVENTS = new Set<string>([
   "session.deleted",
   "session.archived",
 ])
+
+/** Events after which a *turn* is over, so its queue ticket must be dropped.
+ *  A superset of END_OF_RUN_EVENTS: `session.idle` ends the turn but is left out
+ *  of the wait cancellation above on purpose (a cancelled wait lets the request
+ *  through ungated, and idle also fires between steps in some clients). */
+const TURN_END_EVENTS = new Set<string>([...END_OF_RUN_EVENTS, "session.idle"])
 
 /** Fields of an OpenCode V2 event the lock cares about. */
 type AnyEvent = {
@@ -259,8 +292,10 @@ function mergeConfig(base: TurnLockConfig, raw: unknown): TurnLockConfig {
     localHosts: asStringArray(value.localHosts, base.localHosts).map((host) => host.toLowerCase()),
     acquireTimeoutMs: asNumber(value.acquireTimeoutMs, base.acquireTimeoutMs, 0),
     onTimeout: value.onTimeout === "hold" ? "hold" : value.onTimeout === "proceed" ? "proceed" : base.onTimeout,
+    lockScope: value.lockScope === "turn" ? "turn" : value.lockScope === "request" ? "request" : base.lockScope,
     leaseTimeoutMs: asNumber(value.leaseTimeoutMs, base.leaseTimeoutMs, 1_000),
     pollMs: Math.max(5, asNumber(value.pollMs, base.pollMs, 5)),
+    requeueGraceMs: Math.max(0, asNumber(value.requeueGraceMs, base.requeueGraceMs, 0)),
     fifoGraceMs: Math.max(0, asNumber(value.fifoGraceMs, base.fifoGraceMs, 0)),
     refreshEveryMs: Math.max(0, asNumber(value.refreshEveryMs, base.refreshEveryMs, 0)),
     sweepMs: Math.max(1_000, asNumber(value.sweepMs, base.sweepMs, 1_000)),
@@ -709,6 +744,189 @@ export default Plugin.define({
       }
     }
 
+    // A turn ticket: the ordering key a session keeps across the steps of one
+    // turn. In `request` scope the lease (the slot) is freed at
+    // `session.step.ended`, so another session can use the engine while this one
+    // runs a tool; the ticket stays, so when this session asks for the model
+    // again it is ahead of everyone who queued while it worked. It is dropped
+    // when the turn ends. The ticket is not a lease: it does not reserve a slot
+    // and does not hold anyone back until the session asks again.
+    const ticketPath = (sid: string) => join(config.dir, `${sid.replace(/[^A-Za-z0-9_.-]/g, "_")}.turn.json`)
+    // A ticket is refreshed on every step of its turn; one that has not been
+    // refreshed for longer than the maximum wait cannot belong to a live turn.
+    const ticketTtlMs = Math.max(config.acquireTimeoutMs, config.leaseTimeoutMs)
+
+    /** A turn ticket. `graceUntil` is the fory: the moment until which the
+     *  session's *turn* keeps the head of the queue. `root` is the top of the
+     *  parent chain the fory belongs to: a subagent runs the work of its parent,
+     *  so a window opened by either of them is one reservation for the whole
+     *  subtree (see `holdsBack`). Both fields are absent outside a fory and die
+     *  with the ticket. */
+    type TurnTicket = { since: number; seen: number; graceUntil?: number; root?: string }
+
+    const dropTicket = (sid: string) => {
+      try {
+        if (existsSync(ticketPath(sid))) unlinkSync(ticketPath(sid))
+      } catch {
+        // best-effort
+      }
+    }
+
+    const readTicket = (sid: string): TurnTicket | undefined => {
+      if (config.lockScope !== "request") return undefined
+      let value: any
+      try {
+        value = JSON.parse(readFileSync(ticketPath(sid), "utf8"))
+      } catch {
+        return undefined
+      }
+      const since = typeof value?.since === "number" ? value.since : 0
+      const seen = typeof value?.seen === "number" ? value.seen : since
+      const graceUntil = typeof value?.graceUntil === "number" ? value.graceUntil : 0
+      const root = typeof value?.root === "string" && value.root ? value.root : undefined
+      const pid = typeof value?.pid === "number" ? value.pid : undefined
+      if (!since || Date.now() - seen > ticketTtlMs || (pid !== undefined && pid !== process.pid && !processAlive(pid))) {
+        dropTicket(sid)
+        return undefined
+      }
+      return { since, seen, graceUntil, root }
+    }
+
+    /** Create the ticket on the first request of a turn, refresh it on every
+     *  later step of the same turn. An unfinished fory is carried over: asking
+     *  for the next step is exactly what the fory is for. */
+    const writeTicket = (sid: string): void => {
+      if (config.lockScope !== "request") return
+      const existing = readTicket(sid)
+      try {
+        mkdirSync(config.dir, { recursive: true })
+        writeFileSync(
+          ticketPath(sid),
+          JSON.stringify({
+            sid,
+            pid: process.pid,
+            owner,
+            since: existing?.since ?? Date.now(),
+            seen: Date.now(),
+            ...(existing?.graceUntil ? { graceUntil: existing.graceUntil, root: existing.root ?? sid } : {}),
+          }),
+          "utf8",
+        )
+      } catch {
+        // best-effort: without a ticket the session is ordered by its wait age
+      }
+    }
+
+    /** Start the fory: the session has just released its slot and may ask for
+     *  the next step at once. For `requeueGraceMs` nobody of its level (or a
+     *  lower one) takes the slot before its turn; a better level still goes
+     *  first. The window is keyed by the root of the parent chain, so a
+     *  subagent takes the place its parent left and vice versa. */
+    const setGrace = async (sid: string): Promise<void> => {
+      if (config.lockScope !== "request" || config.requeueGraceMs <= 0) return
+      const existing = readTicket(sid)
+      // No ticket means the request was never gated (cloud, a title call), so
+      // there is no turn to keep a place for.
+      if (!existing) return
+      // `rootOf` is cached after the first gated request; after a hot reload it
+      // costs one lookup, which is fine on a step boundary.
+      const root = await rootOf(sid)
+      try {
+        mkdirSync(config.dir, { recursive: true })
+        writeFileSync(
+          ticketPath(sid),
+          JSON.stringify({
+            sid,
+            pid: process.pid,
+            owner,
+            since: existing.since,
+            seen: Date.now(),
+            graceUntil: Date.now() + config.requeueGraceMs,
+            root,
+          }),
+          "utf8",
+        )
+      } catch {
+        // best-effort: without the file the session returns by its ticket age
+      }
+    }
+
+    /** The fory is spent once the slot is taken: the whole subtree is being
+     *  served, so the window of the root and of this session go away. */
+    const clearGrace = (sid: string): void => {
+      if (config.lockScope !== "request") return
+      const root = roots.get(sid) ?? sid
+      for (const id of new Set([sid, root])) {
+        const existing = readTicket(id)
+        if (!existing?.graceUntil) continue
+        try {
+          writeFileSync(
+            ticketPath(id),
+            JSON.stringify({ sid: id, pid: process.pid, owner, since: existing.since, seen: Date.now() }),
+            "utf8",
+          )
+        } catch {
+          // best-effort
+        }
+      }
+    }
+
+    /** Fory windows recorded in the turn tickets, freshest first. A window may
+     *  already be over: the queue still needs its end to know when the slot
+     *  really became available (see `holdsBack`). A window left by a dead
+     *  process is ignored. */
+    const readGraces = (): Array<{ sid: string; root: string; until: number }> => {
+      if (config.lockScope !== "request" || config.requeueGraceMs <= 0) return []
+      let names: string[]
+      try {
+        names = readdirSync(config.dir)
+      } catch {
+        return []
+      }
+      const graces: Array<{ sid: string; root: string; until: number }> = []
+      for (const name of names) {
+        if (!name.endsWith(".turn.json")) continue
+        const fallback = name.slice(0, -".turn.json".length)
+        let value: any
+        try {
+          value = JSON.parse(readFileSync(ticketPath(fallback), "utf8"))
+        } catch {
+          continue
+        }
+        const until = typeof value?.graceUntil === "number" ? value.graceUntil : 0
+        if (until <= 0) continue
+        const pid = typeof value?.pid === "number" ? value.pid : undefined
+        if (pid !== undefined && pid !== process.pid && !processAlive(pid)) continue
+        const sid = typeof value?.sid === "string" && value.sid ? value.sid : fallback
+        const root = typeof value?.root === "string" && value.root ? value.root : sid
+        graces.push({ sid, root, until })
+      }
+      return graces.sort((a, b) => b.until - a.until)
+    }
+
+    const ticketSince = (sid: string): number | undefined => readTicket(sid)?.since
+
+    /** Drop tickets left by a dead process, an expired turn, or a previous run
+     *  with another `lockScope`. */
+    const pruneTickets = (): number => {
+      let names: string[]
+      try {
+        names = readdirSync(config.dir)
+      } catch {
+        return 0
+      }
+      let removed = 0
+      for (const name of names) {
+        if (!name.endsWith(".turn.json")) continue
+        const sid = name.slice(0, -".turn.json".length)
+        const before = existsSync(ticketPath(sid))
+        if (config.lockScope !== "request") dropTicket(sid)
+        else readTicket(sid)
+        if (before && !existsSync(ticketPath(sid))) removed += 1
+      }
+      return removed
+    }
+
     /** Everyone waiting right now, oldest first. The sidecars are the only
      *  shared record of waiters (the store holds granted leases only), so the
      *  queue position is derived from them; a waiter whose process is gone is
@@ -813,9 +1031,25 @@ export default Plugin.define({
       }
     }
 
+    // A subagent runs the work of its parent, so it queues at the parent's
+    // level: the root is cached when the session is first gated. A session that
+    // has not been seen yet falls back to its own flag (a root session's own
+    // flag is the root flag anyway).
+    const roots = new Map<string, string>()
+
+    /** The flag that decides this session's queue level: a subagent has no say of
+     *  its own, it queues at its root's level. The root is cached on the first
+     *  gated request, so a session seen for the first time falls back to its own
+     *  flag (for a root that is the same flag anyway). */
+    const flagOf = (sid: string): PriorityFlag | undefined => {
+      const root = roots.get(sid)
+      if (root && root !== sid) return readPriority(root)
+      return readPriority(sid)
+    }
+
     /** The level this session asked for, read from the shared flag. */
     const levelOf = (sid: string): PriorityLevel => {
-      const flag = readPriority(sid)
+      const flag = flagOf(sid)
       return flag ? flag.level : "normal"
     }
 
@@ -829,11 +1063,12 @@ export default Plugin.define({
       const ranked: Array<{ sid: string; rank: number; age: number }> = []
       for (const waiter of readWaiters()) {
         if (store.read(waiter.sid)) continue
-        const flag = readPriority(waiter.sid)
+        const flag = flagOf(waiter.sid)
+        const ticket = flag ? undefined : ticketSince(waiter.sid)
         ranked.push(
           flag
             ? { sid: waiter.sid, rank: PRIORITY_RANK[flag.level], age: flag.since }
-            : { sid: waiter.sid, rank: PRIORITY_RANK.normal, age: waiter.since },
+            : { sid: waiter.sid, rank: PRIORITY_RANK.normal, age: ticket ?? waiter.since },
         )
       }
       return ranked
@@ -868,15 +1103,35 @@ export default Plugin.define({
     }
 
     /** May `sid` take a free slot? No, while anyone goes before it: a better level
-     *  always, and an older waiter of its own level until the head has had its
-     *  `fifoGraceMs`. `since` is when this wait began; a flagged session is
-     *  ordered by when it asked for the level, exactly like `orderedWaiters`. */
+     *  always, a turn inside its fory (`request` scope), and an older waiter of
+     *  its own level until the head has had its `fifoGraceMs`. `since` is when this
+     *  wait began; a flagged session is ordered by when it asked for the level,
+     *  exactly like `orderedWaiters`. */
     const holdsBack = (sid: string, since: number): boolean => {
-      const flag = readPriority(sid)
+      const flag = flagOf(sid)
       const mine = flag ? PRIORITY_RANK[flag.level] : PRIORITY_RANK.normal
-      const age = flag ? flag.since : since
+      const age = flag ? flag.since : (ticketSince(sid) ?? since)
       const waiters = rankedWaiters()
       if (waiters.some((waiter) => waiter.sid !== sid && waiter.rank > mine)) return true
+      // The fory: a session that has just released the slot keeps the head of its
+      // level for `requeueGraceMs`. It may ask for the next step at any moment in
+      // that window; if it does not, the window lapses and the next place is
+      // served. A better level still goes first.
+      const now = Date.now()
+      const graces = readGraces()
+      // The window belongs to a turn, not to a session id: a subagent runs the
+      // work of its parent, so the fory of the parent covers the child and the
+      // fory of the child covers the parent and its siblings. `roots` is warm
+      // for the session asking (the hook caches it before every acquire).
+      const myRoot = roots.get(sid) ?? sid
+      const isMine = (grace: { root: string }) => grace.root === myRoot
+      // Windows of this level and above, plus the session's own: a lower level's
+      // fory cannot delay a better one.
+      const relevant = graces.filter((grace) => isMine(grace) || rankOf(grace.root) >= mine)
+      if (relevant.some((grace) => !isMine(grace) && grace.until > now)) return true
+      // Inside its own window the session is the reservation: neither the levels
+      // nor the FIFO windows of the places behind it can hold it back.
+      if (relevant.some((grace) => isMine(grace) && grace.until > now)) return false
       if (config.fifoGraceMs <= 0) return false
       const ahead = waiters.filter(
         (waiter) =>
@@ -887,9 +1142,12 @@ export default Plugin.define({
       if (!ahead.length) return false
       // Each place ahead gets one grace window: the head takes the slot at once,
       // place 2 after one window, place 3 after two, and so on. The window is at
-      // least two polls, so a head always gets a real chance to wake up.
+      // least two polls, so a head always gets a real chance to wake up. A fory
+      // keeps the slot past the moment the lease vanished, so the windows of the
+      // places behind it start when the fory lapses, not at the release.
+      const availableAt = Math.max(readFreeAt(), ...relevant.map((grace) => grace.until))
       const grace = Math.max(config.fifoGraceMs, config.pollMs * 2)
-      return Date.now() - readFreeAt() < ahead.length * grace
+      return now - availableAt < ahead.length * grace
     }
 
     /** The queue in the order it will actually be served: the best level first
@@ -898,9 +1156,14 @@ export default Plugin.define({
     const orderedWaiters = (sid?: string, since = 0): string[] => {
       const entries = new Map<string, { rank: number; age: number }>()
       const put = (id: string, flag: PriorityFlag | undefined, waited: number) =>
-        entries.set(id, flag ? { rank: PRIORITY_RANK[flag.level], age: flag.since } : { rank: PRIORITY_RANK.normal, age: waited })
-      for (const waiter of readWaiters()) put(waiter.sid, readPriority(waiter.sid), waiter.since)
-      if (sid) put(sid, readPriority(sid), since)
+        entries.set(
+          id,
+          flag
+            ? { rank: PRIORITY_RANK[flag.level], age: flag.since }
+            : { rank: PRIORITY_RANK.normal, age: ticketSince(id) ?? waited },
+        )
+      for (const waiter of readWaiters()) put(waiter.sid, flagOf(waiter.sid), waiter.since)
+      if (sid) put(sid, flagOf(sid), since)
       return [...entries.entries()]
         .sort((a, b) => b[1].rank - a[1].rank || a[1].age - b[1].age || a[0].localeCompare(b[0]))
         .map(([id]) => id)
@@ -1116,6 +1379,22 @@ export default Plugin.define({
       return parent
     }
 
+    /** The top of the parent chain, cached. A subagent inherits its level. */
+    const rootOf = async (sid: string): Promise<string> => {
+      const cached = roots.get(sid)
+      if (cached) return cached
+      let current = sid
+      let depth = 0
+      while (depth < 8) {
+        const parent = await parentOf(current)
+        if (!parent) break
+        current = parent
+        depth += 1
+      }
+      roots.set(sid, current)
+      return current
+    }
+
     const resolveGate = async (
       sid: string,
     ): Promise<{ kind: "root" } | { kind: "covered" | "exempt"; root: string }> => {
@@ -1151,7 +1430,10 @@ export default Plugin.define({
       pid: process.pid,
       owner,
       onChange,
-      holdBack: config.priorityEnabled ? holdsBack : undefined,
+      // In `request` scope the hold-back is also what orders waiters by their
+      // turn ticket, so it must stay on even without `/prio`: the levels simply
+      // become inert (readPriority returns nothing when priority is off).
+      holdBack: config.priorityEnabled || config.lockScope === "request" ? holdsBack : undefined,
       onFree: writeFreeAt,
     })
 
@@ -1200,27 +1482,42 @@ export default Plugin.define({
         void applyCloudTitle(sid, !local)
         if (!local) return
 
-        const gate = await resolveGate(sid)
-        if (gate.kind !== "root") {
-          // A subagent: covered by the parent's slot (keep it fresh) or exempt
-          // because the parent run is not gated at all.
-          if (gate.kind === "covered") lock.refresh(gate.root)
-          log("info", `subagent ${sid}: ${gate.kind} by ${gate.root}`)
-          return
-        }
-
-        // Soft preemption. Never interrupt a model or tool call: this hook runs
-        // at a step boundary, which is the only place a slot can be given up
-        // without breaking anything. A holder that sees a waiter of a better level
-        // queued gives its own slot up and re-queues below; it resumes on its own
-        // as soon as that waiter is served. So `▽` yields to everyone, `⚡` to nobody.
-        if (held.has(sid)) {
-          const ahead = waitingAbove(rankOf(sid), sid)
-          if (ahead.length) {
-            const who = ahead.map((waiter) => waiter.sid).join(", ")
-            log("info", `yield ${sid}: ${who} ${ahead.length === 1 ? "outranks" : "outrank"} it`)
+        if (config.lockScope === "request") {
+          // One lease per model request. The turn keeps a ticket across steps,
+          // so the session is ahead of everyone who queued while it worked; the
+          // slot itself is free while a tool runs. The root is cached here so a
+          // subagent inherits its parent's level.
+          await rootOf(sid)
+          if (held.has(sid)) {
+            // A step event was lost: this is a new context, so the previous
+            // request is over and the lease must not turn back into a turn lease.
             held.delete(sid)
-            lock.release(sid, "priority")
+            lock.release(sid, "step-boundary")
+          }
+          writeTicket(sid)
+        } else {
+          const gate = await resolveGate(sid)
+          if (gate.kind !== "root") {
+            // A subagent: covered by the parent's slot (keep it fresh) or exempt
+            // because the parent run is not gated at all.
+            if (gate.kind === "covered") lock.refresh(gate.root)
+            log("info", `subagent ${sid}: ${gate.kind} by ${gate.root}`)
+            return
+          }
+
+          // Soft preemption. Never interrupt a model or tool call: this hook runs
+          // at a step boundary, which is the only place a slot can be given up
+          // without breaking anything. A holder that sees a waiter of a better level
+          // queued gives its own slot up and re-queues below; it resumes on its own
+          // as soon as that waiter is served. So `▽` yields to everyone, `⚡` to nobody.
+          if (held.has(sid)) {
+            const ahead = waitingAbove(rankOf(sid), sid)
+            if (ahead.length) {
+              const who = ahead.map((waiter) => waiter.sid).join(", ")
+              log("info", `yield ${sid}: ${who} ${ahead.length === 1 ? "outranks" : "outrank"} it`)
+              held.delete(sid)
+              lock.release(sid, "priority")
+            }
           }
         }
 
@@ -1231,6 +1528,8 @@ export default Plugin.define({
           return
         }
         held.add(sid)
+        // The fory has done its job: the session is being served again.
+        clearGrace(sid)
       },
     )
 
@@ -1275,15 +1574,37 @@ export default Plugin.define({
           if (type === "permission.asked" && !config.releaseOnPermission) continue
           const sid = eventSessionID(event as AnyEvent)
           if (!sid) continue
+          // A step ends one model request, not the turn: in `request` scope it
+          // frees the slot and leaves the ticket alone, so the next step of this
+          // session is first in line. In `turn` scope it is not a release at all.
+          if (type === "session.step.ended" || type === "session.step.failed") {
+            if (config.lockScope !== "request") continue
+            // Only a request this instance actually served starts a fory: a
+            // cloud session's step must not reserve a local slot.
+            const released = held.delete(sid)
+            lock.release(sid, type)
+            // The fory: this session may ask for the next step at once, so its
+            // turn keeps the head of the queue for `requeueGraceMs` (the ticket
+            // it already has carries the window).
+            if (released) await setGrace(sid)
+            continue
+          }
           held.delete(sid)
           lock.release(sid, type)
           // `release` only frees a slot this session held; a queued one has no
           // lease. Its wait is a separate polling loop, and the reminder tick
           // would keep re-marking the title and take the next free slot for a
           // run that will never happen.
-          if (END_OF_RUN_EVENTS.has(type)) lock.cancelWait(sid, type)
+          if (END_OF_RUN_EVENTS.has(type)) {
+            lock.cancelWait(sid, type)
+          }
+          // The turn is over: its next one starts at the back of the queue.
+          if (TURN_END_EVENTS.has(type)) dropTicket(sid)
           // A session that no longer runs cannot be the one the user needs now.
-          if (type === "session.deleted" || type === "session.archived") dropPriority(sid)
+          if (type === "session.deleted" || type === "session.archived") {
+            dropPriority(sid)
+            dropTicket(sid)
+          }
           // A queued session has no lease, so a terminal event for it (deleted,
           // inbox cancelled) releases nothing — still drop its title mark.
           void unmarkWaiting(sid, type)
@@ -1309,14 +1630,17 @@ export default Plugin.define({
     }
 
     const restored = await restoreStaleMarks()
+    const prunedTickets = pruneTickets()
 
     log(
       "info",
-      `ready: src=${SOURCE} limit=${config.limit} local=${config.localProviders.join(",")} timeout=${Math.round(
+      `ready: src=${SOURCE} scope=${config.lockScope} limit=${config.limit} fory=${Math.round(
+        config.requeueGraceMs / 1000,
+      )}s local=${config.localProviders.join(",")} timeout=${Math.round(
         config.acquireTimeoutMs / 60_000,
       )}min onTimeout=${config.onTimeout} mark=${config.markWaitingTitle} prio=${
         config.priorityEnabled ? `/${config.priorityCommand}` : "off"
-      } dir=${config.dir} pruned=${pruned.length} restored=${restored}`,
+      } dir=${config.dir} pruned=${pruned.length} tickets=${prunedTickets} restored=${restored}`,
     )
 
     return async () => {

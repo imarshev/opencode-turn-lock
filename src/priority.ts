@@ -85,9 +85,11 @@ export function parsePriorityArgument(text: string, command: string): PriorityLe
 
 /**
  * One waiter as the queue sees it: the session, the rank of the level it is
- * served at, and the age that orders it against its own level. For a flagged
- * session the age is the moment the flag was set; for an ordinary one it is the
- * moment its wait (or turn ticket) began.
+ * served at, and the age that orders it against its own level. The age is the
+ * absolute creation time of the session (`session.time.created`): a session that
+ * comes back after a tool is still older than everyone who queued while it
+ * worked. A flag only supplies the level; inside a level the oldest session is
+ * served first.
  */
 export type QueueEntry = { sid: string; rank: number; age: number }
 

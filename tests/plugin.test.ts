@@ -100,6 +100,10 @@ type Behavior = {
   missing?: Set<string>
   /** Metadata already stored on a session before the plugin starts. */
   metadata?: Record<string, Record<string, unknown>>
+  /** Explicit session creation times (`session.time.created`). A session not
+   *  listed here reports `1`, so two unlisted sessions tie and the queue falls
+   *  back to the session id — the same order the tests use in their names. */
+  created?: Record<string, number>
 }
 
 function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
@@ -109,6 +113,8 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
   const parents = behavior.parents ?? {}
   const titles = new Map<string, string>(Object.entries(behavior.titles ?? {}))
   const metadata = new Map<string, Record<string, unknown>>(Object.entries(behavior.metadata ?? {}))
+  const created = new Map<string, number>(Object.entries(behavior.created ?? {}))
+  const createdOf = (sessionID: string) => created.get(sessionID) ?? 1
   const titleOf = (sessionID: string) => titles.get(sessionID) ?? "test session"
   const commands: Array<{ name: string; description?: string; execute: (input: unknown) => Promise<void> }> = []
   const ctx = {
@@ -128,7 +134,13 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
       },
       get: async ({ sessionID }: { sessionID: string }) => {
         if (behavior.missing?.has(sessionID)) throw new Error(`session ${sessionID} not found`)
-        return { id: sessionID, parentID: parents[sessionID], title: titleOf(sessionID), metadata: metadata.get(sessionID) }
+        return {
+          id: sessionID,
+          parentID: parents[sessionID],
+          title: titleOf(sessionID),
+          metadata: metadata.get(sessionID),
+          time: { created: createdOf(sessionID) },
+        }
       },
       list: async ({ limit = 100, cursor }: { limit?: number; cursor?: string } = {}) => {
         const ids = [...new Set([...titles.keys(), ...metadata.keys()])].sort()
@@ -138,6 +150,7 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
           parentID: parents[id],
           title: titleOf(id),
           metadata: metadata.get(id),
+          time: { created: createdOf(id) },
         }))
         const next = start + limit < ids.length ? ids[start + limit] : undefined
         return { data, cursor: { next } }
@@ -178,8 +191,9 @@ function makeCtx(options: Record<string, unknown>, behavior: Behavior = {}) {
 
 type Harness = Awaited<ReturnType<typeof setup>>
 
-async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior = {}) {
+async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior = {}, before?: (dir: string) => void) {
   const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
+  before?.(dir)
   const logFile = join(dir, "turn-lock.log")
   const { ctx, hooks, bus, titles, metadata, updates, commands } = makeCtx(
     {
@@ -191,10 +205,10 @@ async function setup(overrides: Record<string, unknown> = {}, behavior: Behavior
       remindEveryMs: 0,
       sweepMs: 60_000,
       // The tests below spell out the limit they exercise; the shipped default
-      // (1) is asserted separately. The fory is off unless a test asks for it,
-      // so the older ordering tests stay about the ticket and the levels.
+      // (1) is asserted separately. The handoff is off unless a test asks for
+      // it, so a step boundary frees the slot at once in the older tests.
       limit: 2,
-      requeueGraceMs: 0,
+      handoffMs: 0,
       // The original behaviour is the reference for these tests; the request
       // scope has its own tests below.
       lockScope: "turn",
@@ -1570,10 +1584,11 @@ test("a stale lease left in the store stops blocking after leaseTimeoutMs", asyn
 
 // --- lockScope: "request" -------------------------------------------------
 //
-// In request scope a lease covers one model request, so the slot is freed at
-// `session.step.ended` and taken again at the next `context`. A turn ticket
-// (`<sid>.turn.json`) keeps the session's place in the queue across those
-// steps, so releasing a slot is a yield, not a fall to the back.
+// In request scope a lease covers one model request, so the slot is freed when
+// the step's tools start (or at `session.step.ended` when nothing follows) and
+// taken again at the next `context`. The queue is ordered by the session's
+// absolute creation time, so a session that comes back after a tool is still
+// the oldest one in its level.
 
 test("request scope: one step, not the whole turn, frees the slot", async () => {
   const harness = await setup({ lockScope: "request" })
@@ -1621,7 +1636,10 @@ test("request scope: one step, not the whole turn, frees the slot", async () => 
 })
 
 test("request scope: a session gets its place back on the step after it released the slot", async () => {
-  const harness = await setup({ lockScope: "request" })
+  const harness = await setup(
+    { lockScope: "request" },
+    { created: { ses_a: 100, ses_b: 200, ses_c: 300, ses_d: 400 } },
+  )
   try {
     await harness.context("ses_a")
     await harness.context("ses_b")
@@ -1645,8 +1663,8 @@ test("request scope: a session gets its place back on the step after it released
     await until(() => cDone, "the oldest waiter took the freed slot")
     assert.equal(dDone, false, "the younger waiter still waits")
 
-    // a asks for the model again. Its ticket is older than d's, so it is not
-    // sent to the back of the queue.
+    // a asks for the model again. It was created before d, so it is not sent to
+    // the back of the queue.
     let aDone = false
     const a = harness.context("ses_a").then(() => {
       aDone = true
@@ -1670,27 +1688,18 @@ test("request scope: a session gets its place back on the step after it released
   }
 })
 
-test("request scope: the turn ticket outlives a step and dies with the turn", async () => {
+test("request scope: no turn ticket is written any more", async () => {
   const harness = await setup({ lockScope: "request" })
-  const ticket = () => join(harness.dir, "ses_1.turn.json")
   try {
     await harness.context("ses_1")
-    assert.ok(existsSync(ticket()), "the first request of a turn opens a ticket")
-    const first = JSON.parse(readFileSync(ticket(), "utf8"))
+    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), false, "the queue no longer keeps a ticket")
 
     harness.bus.emit({
       type: "session.step.ended",
       data: { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "tool-calls" },
     })
     await until(() => !existsSync(join(harness.dir, "ses_1.lease.json")), "the step released the slot")
-    assert.ok(existsSync(ticket()), "the ticket stays across the step")
-
-    await harness.context("ses_1") // the next step of the same turn
-    const next = JSON.parse(readFileSync(ticket(), "utf8"))
-    assert.equal(next.since, first.since, "the next step keeps the original place in the queue")
-
-    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
-    await until(() => !existsSync(ticket()), "the end of the turn drops the ticket")
+    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), false, "nothing is left behind")
   } finally {
     await harness.teardown()
   }
@@ -1775,7 +1784,7 @@ test("request scope: a returning session does not jump over a priority waiter", 
     })
     await until(() => dDone, "the priority waiter took the freed slot")
     await wait(150)
-    assert.equal(aDone, false, "an older ticket does not outrank ⚡")
+    assert.equal(aDone, false, "an older creation time does not outrank ⚡")
     void a
     void c
     void d
@@ -1784,8 +1793,11 @@ test("request scope: a returning session does not jump over a priority waiter", 
   }
 })
 
-test("request scope: the ticket orders the queue even with /prio off", async () => {
-  const harness = await setup({ lockScope: "request", priorityEnabled: false })
+test("request scope: creation time orders the queue even with /prio off", async () => {
+  const harness = await setup(
+    { lockScope: "request", priorityEnabled: false },
+    { created: { ses_a: 100, ses_b: 200, ses_c: 300, ses_d: 400 } },
+  )
   try {
     await harness.context("ses_a")
     await harness.context("ses_b")
@@ -1818,7 +1830,7 @@ test("request scope: the ticket orders the queue even with /prio off", async () 
       type: "session.step.ended",
       data: { sessionID: "ses_b", assistantMessageID: "msg_b", finish: "tool-calls" },
     })
-    await until(() => aDone, "the older ticket wins without any priority flag")
+    await until(() => aDone, "the older session wins without any priority flag")
     await wait(150)
     assert.equal(dDone, false, "the later waiter still waits")
     void a
@@ -1915,16 +1927,16 @@ test("request scope: a subagent queues at its parent's level", async () => {
   }
 })
 
-test("request scope: a ticket left by a dead process is not honoured", async () => {
-  const harness = await setup({ lockScope: "request" })
-  try {
+test("boot drops turn tickets left by a previous version", async () => {
+  const harness = await setup({}, {}, (dir) => {
     writeFileSync(
-      join(harness.dir, "ses_1.turn.json"),
+      join(dir, "ses_1.turn.json"),
       JSON.stringify({ sid: "ses_1", pid: 0, since: Date.now() - 60_000, seen: Date.now() - 60_000 }),
     )
-    await harness.context("ses_1")
-    const ticket = JSON.parse(readFileSync(join(harness.dir, "ses_1.turn.json"), "utf8"))
-    assert.ok(Date.now() - ticket.since < 5_000, "the dead ticket was replaced with a fresh one")
+  })
+  try {
+    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), false, "the obsolete ticket is gone")
+    assert.match(harness.logText(), /tickets=1/, "boot reports what it cleaned up")
   } finally {
     await harness.teardown()
   }
@@ -1957,22 +1969,24 @@ test("turn scope: step events do not free the slot", async () => {
   }
 })
 
-// --- fory: request scope only ---------------------------------------------
+// --- request scope: handoff and creation-time order ------------------------
 //
-// A session that has just released its slot keeps the head of the queue for
-// `requeueGraceMs`: if it asks for the next step inside that window it is
-// served first, and only when the window lapses does the next waiter get the
-// slot. The window lives in the turn ticket, so it dies with the turn.
+// A step boundary is not a pause: `finish: "tool-calls"` is followed by a tool
+// within milliseconds, and `finish: "length"` may be continued at once. The
+// lease is kept across that gap (`handoffMs`) and released on the first
+// `session.tool.called` (or the continuation request). The queue itself is
+// ordered by the absolute session creation time, not by when a wait began.
 
-test("shipped defaults: one slot, 200 ms polling, a 10 s fory", () => {
+test("shipped defaults: one slot, 200 ms polling, a 1 s handoff", () => {
   assert.equal(mod.DEFAULTS.limit, 1, "the engine serves one request at a time")
   assert.equal(mod.DEFAULTS.pollMs, 200)
-  assert.equal(mod.DEFAULTS.requeueGraceMs, 10_000)
+  assert.equal(mod.DEFAULTS.handoffMs, 1_000)
   assert.equal(mod.DEFAULTS.lockScope, "request")
+  assert.equal("requeueGraceMs" in mod.DEFAULTS, false, "the fory is gone")
 })
 
-test("request scope: a fory keeps the slot for a session that asks again at once", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, requeueGraceMs: 400 })
+test("request scope: a tool-calls step keeps the slot until the tool starts", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
   try {
     await harness.context("ses_a")
     let bDone = false
@@ -1985,26 +1999,74 @@ test("request scope: a fory keeps the slot for a session that asks again at once
       type: "session.step.ended",
       data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "tool-calls" },
     })
-    await until(() => !existsSync(join(harness.dir, "ses_a.lease.json")), "the step released the slot")
     await wait(120)
-    assert.equal(bDone, false, "the waiter does not take a slot the fory reserves")
+    assert.equal(bDone, false, "the slot is not freed in the gap before the tool")
+    assert.ok(existsSync(join(harness.dir, "ses_a.lease.json")), "the lease survives the step boundary")
 
-    let aDone = false
-    const a = harness.context("ses_a").then(() => {
-      aDone = true
+    harness.bus.emit({
+      type: "session.tool.called",
+      data: { sessionID: "ses_a", assistantMessageID: "msg_a", id: "tool_1", input: {}, executed: true },
     })
-    await until(() => aDone, "the returning session is served inside its fory")
-    await wait(80)
-    assert.equal(bDone, false, "the waiter is still behind the fory")
-    void a
+    await until(() => bDone, "the tool start frees the slot")
+    assert.equal(existsSync(join(harness.dir, "ses_a.lease.json")), false, "the lease is gone once the tool runs")
     void b
   } finally {
     await harness.teardown()
   }
 })
 
-test("request scope: the fory lapses and the next session is served", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, requeueGraceMs: 200 })
+test("request scope: a stop step frees the slot at once", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+  try {
+    await harness.context("ses_a")
+    let bDone = false
+    const b = harness.context("ses_b").then(() => {
+      bDone = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_b.wait.json")), "the waiter is queued")
+
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "stop" },
+    })
+    await until(() => bDone, "a finished turn does not hold the slot")
+    void b
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: a length step holds the slot for the continuation", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+  try {
+    await harness.context("ses_a")
+    let bDone = false
+    const b = harness.context("ses_b").then(() => {
+      bDone = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_b.wait.json")), "the waiter is queued")
+
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "length" },
+    })
+    await wait(80)
+    assert.equal(bDone, false, "a truncated step keeps the slot for its continuation")
+
+    // The continuation is the same session asking again: the lease is reused,
+    // not released and retaken.
+    await harness.context("ses_a")
+    assert.equal(existsSync(join(harness.dir, "ses_a.wait.json")), false, "the continuation does not queue")
+    await wait(80)
+    assert.equal(bDone, false, "the waiter is still behind the held lease")
+    void b
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: the handoff lapses when no tool ever starts", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 60 })
   try {
     await harness.context("ses_a")
     let bDone = false
@@ -2017,159 +2079,58 @@ test("request scope: the fory lapses and the next session is served", async () =
       type: "session.step.ended",
       data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "tool-calls" },
     })
-    await wait(80)
-    assert.equal(bDone, false, "the fory holds the waiter for its window")
-    await until(() => bDone, "the waiter is served once the fory lapses")
-
-    // a comes back: it is first in line again, but only after b has had its own
-    // fory — an older ticket does not cut in front of the session just served.
-    let aDone = false
-    const a = harness.context("ses_a").then(() => {
-      aDone = true
-    })
-    await until(() => existsSync(join(harness.dir, "ses_a.wait.json")), "the returning session queues behind the holder")
-    harness.bus.emit({
-      type: "session.step.ended",
-      data: { sessionID: "ses_b", assistantMessageID: "msg_b", finish: "tool-calls" },
-    })
-    await wait(80)
-    assert.equal(aDone, false, "b's own fory outranks the older ticket")
-    await until(() => aDone, "the older ticket is served after b's fory")
-    void a
+    await until(() => bDone, "the slot is freed once the handoff window lapses")
     void b
   } finally {
     await harness.teardown()
   }
 })
 
-test("request scope: when the fory lapses the next place is served first, not a later one", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, requeueGraceMs: 200 })
-  try {
-    await harness.context("ses_a")
-    let bDone = false
-    let cDone = false
-    const b = harness.context("ses_b").then(() => {
-      bDone = true
-    })
-    await until(() => existsSync(join(harness.dir, "ses_b.wait.json")), "place 1 is queued")
-    const c = harness.context("ses_c").then(() => {
-      cDone = true
-    })
-    await until(() => existsSync(join(harness.dir, "ses_c.wait.json")), "place 2 is queued")
-
-    harness.bus.emit({
-      type: "session.step.ended",
-      data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "tool-calls" },
-    })
-    await until(() => bDone, "place 1 takes the slot when the fory lapses")
-    await wait(120)
-    assert.equal(cDone, false, "place 2 does not race past place 1 at the same moment")
-    void b
-    void c
-  } finally {
-    await harness.teardown()
-  }
-})
-
-test("request scope: the fory belongs to the turn, so a subagent and its parent share it", async () => {
+test("request scope: the queue is ordered by creation time, not by when the wait began", async () => {
   const harness = await setup(
-    { lockScope: "request", limit: 1, requeueGraceMs: 400 },
-    { parents: { ses_child: "ses_parent" } },
+    { lockScope: "request", limit: 1 },
+    { created: { ses_old: 100, ses_mid: 200, ses_new: 300 } },
   )
   try {
-    await harness.context("ses_parent")
-    let outsiderDone = false
-    const outsider = harness.context("ses_w").then(() => {
-      outsiderDone = true
+    await harness.context("ses_holder")
+    let midDone = false
+    let oldDone = false
+    // The older session queues *after* the younger one.
+    const mid = harness.context("ses_mid").then(() => {
+      midDone = true
     })
-    await until(() => existsSync(join(harness.dir, "ses_w.wait.json")), "the outsider is queued")
+    await until(() => existsSync(join(harness.dir, "ses_mid.wait.json")), "the younger waiter is queued")
+    const old = harness.context("ses_old").then(() => {
+      oldDone = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_old.wait.json")), "the older waiter is queued")
 
-    // The parent goes into a tool (a `task` call): the slot frees, and the
-    // subagent asks for the model. It enters on the parent's fory instead of
-    // queueing behind the outsider.
-    harness.bus.emit({
-      type: "session.step.ended",
-      data: { sessionID: "ses_parent", assistantMessageID: "msg_p", finish: "tool-calls" },
-    })
-    await until(() => !existsSync(join(harness.dir, "ses_parent.lease.json")), "the parent released the slot")
-    let childDone = false
-    const child = harness.context("ses_child").then(() => {
-      childDone = true
-    })
-    await until(() => childDone, "the subagent enters inside the parent's fory")
-    await wait(80)
-    assert.equal(outsiderDone, false, "the outsider is still behind the turn")
-
-    // The subagent finishes; its own fory now covers the parent (the tool
-    // returned and the parent continues the same turn).
-    harness.bus.emit({
-      type: "session.step.ended",
-      data: { sessionID: "ses_child", assistantMessageID: "msg_c", finish: "tool-calls" },
-    })
-    await until(() => !existsSync(join(harness.dir, "ses_child.lease.json")), "the subagent released the slot")
-    let parentDone = false
-    const parent = harness.context("ses_parent").then(() => {
-      parentDone = true
-    })
-    await until(() => parentDone, "the parent resumes inside the subagent's fory")
-    await wait(80)
-    assert.equal(outsiderDone, false, "the outsider still waits")
-    void parent
-    void child
-    void outsider
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_holder" } })
+    await until(() => oldDone, "the oldest session takes the slot")
+    assert.equal(midDone, false, "the session created later waits behind it")
+    void old
+    void mid
   } finally {
     await harness.teardown()
   }
 })
 
-test("request scope: siblings under one root share the fory too", async () => {
-  const harness = await setup(
-    { lockScope: "request", limit: 1, requeueGraceMs: 400 },
-    { parents: { ses_s1: "ses_p", ses_s2: "ses_p" } },
-  )
+test("request scope: the creation time travels in the wait sidecar", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1 }, { created: { ses_1: 4_242 } })
   try {
-    await harness.context("ses_p")
-    let outsiderDone = false
-    const outsider = harness.context("ses_w").then(() => {
-      outsiderDone = true
-    })
-    await until(() => existsSync(join(harness.dir, "ses_w.wait.json")), "the outsider is queued")
-
-    // The parent releases into a tool, the first subagent takes the fory.
-    harness.bus.emit({
-      type: "session.step.ended",
-      data: { sessionID: "ses_p", assistantMessageID: "msg_p", finish: "tool-calls" },
-    })
-    let s1Done = false
-    const s1 = harness.context("ses_s1").then(() => {
-      s1Done = true
-    })
-    await until(() => s1Done, "the first subagent enters on the parent's fory")
-
-    // The first subagent releases; its sibling (same root) enters on the same
-    // window instead of the outsider taking it.
-    harness.bus.emit({
-      type: "session.step.ended",
-      data: { sessionID: "ses_s1", assistantMessageID: "msg_s1", finish: "tool-calls" },
-    })
-    await until(() => !existsSync(join(harness.dir, "ses_s1.lease.json")), "the first subagent released the slot")
-    let s2Done = false
-    const s2 = harness.context("ses_s2").then(() => {
-      s2Done = true
-    })
-    await until(() => s2Done, "the sibling enters on the same fory")
-    await wait(80)
-    assert.equal(outsiderDone, false, "the outsider is still behind the root's turn")
-    void outsider
-    void s1
-    void s2
+    await harness.context("ses_holder")
+    const waiter = harness.context("ses_1")
+    await until(() => existsSync(join(harness.dir, "ses_1.wait.json")), "the waiter is queued")
+    const mark = JSON.parse(readFileSync(join(harness.dir, "ses_1.wait.json"), "utf8"))
+    assert.equal(mark.createdAt, 4_242, "another instance can order the queue by the same key")
+    void waiter
   } finally {
     await harness.teardown()
   }
 })
 
-test("request scope: the fory dies with the turn", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, requeueGraceMs: 5_000 })
+test("request scope: a step with no finish frees the slot at once", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
   try {
     await harness.context("ses_a")
     let bDone = false
@@ -2178,17 +2139,22 @@ test("request scope: the fory dies with the turn", async () => {
     })
     await until(() => existsSync(join(harness.dir, "ses_b.wait.json")), "the waiter is queued")
 
-    harness.bus.emit({
-      type: "session.step.ended",
-      data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "tool-calls" },
-    })
-    await wait(80)
-    assert.equal(bDone, false, "the fory reserves the slot")
-
-    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_a" } })
-    await until(() => bDone, "the end of the turn drops the fory with the ticket")
+    harness.bus.emit({ type: "session.step.ended", data: { sessionID: "ses_a" } })
+    await until(() => bDone, "an unknown finish releases the slot")
     void b
   } finally {
     await harness.teardown()
   }
 })
+
+
+
+
+
+
+
+
+
+
+
+

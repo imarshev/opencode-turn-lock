@@ -16,13 +16,16 @@
 // with the same title would share the first match. The alternative — no click
 // at all — loses the useful part, so the caller decides by passing `cycle`.
 
-import { rowOrder, stateFromTitle, waitLabel, waitSentence, type Lang, type TurnLockState } from "./state.ts"
+import { holdSentence, rowOrder, stateFromTitle, waitLabel, waitSentence, type Lang, type TurnLockState } from "./state.ts"
+import { levelOfTitle } from "./title.ts"
+import type { PriorityLevel } from "./priority.ts"
 
-export type InboxLevel = "high" | "normal" | "low"
+/** The three queue levels, as the client draws them. */
+export type InboxLevel = PriorityLevel
 
 /** The level a title claims; kept for the composer pill's fallback path. */
 export function inboxLevel(title: string | null | undefined): InboxLevel {
-  return stateFromTitle(title)?.level ?? "normal"
+  return levelOfTitle(String(title ?? ""))
 }
 
 /** One row as the loader sees it: the title is the key the DOM exposes. */
@@ -79,6 +82,8 @@ export const BADGE_CSS = `
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-level="high"] { color: #f59e0b; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-level="low"] { color: #94a3b8; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-cloud="true"] { color: #38bdf8; }
+[data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-holding="true"] { border-color: #22c55e; }
+[data-slot="sidebar-inbox-item"] .${BADGE_CLASS} .tl-hold { color: #22c55e; display: inline-flex; align-items: center; gap: 3px; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}:hover { filter: brightness(1.25); }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS} svg { width: 9px; height: 9px; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS} .tl-wait { font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -91,6 +96,7 @@ const ICON = {
     '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4.6 12a2.9 2.9 0 0 1 .3-5.8 3.9 3.9 0 0 1 7.4 1.2A2.3 2.3 0 0 1 11.7 12z"/></svg>',
   clock:
     '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.9V8l2.2 1.4"/></svg>',
+  hold: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="3.6"/></svg>',
 } as const
 
 const WORDS = {
@@ -111,13 +117,20 @@ export function describeState(state: TurnLockState, now = Date.now(), lang: Lang
   if (state.level === "low") parts.push(words.low)
   if (state.position !== undefined && state.total !== undefined) parts.push(words.place(`${state.position}/${state.total}`))
   if (state.since !== undefined) parts.push(waitSentence(now - state.since, lang))
+  if (state.holding !== undefined) parts.push(holdSentence(now - state.holding, lang))
   return parts.join(" · ")
 }
 
 /** A row needs a badge only when it has something to say. */
 function hasBadge(state: TurnLockState | undefined): state is TurnLockState {
   if (!state) return false
-  return state.cloud === true || state.level !== "normal" || state.position !== undefined || state.since !== undefined
+  return (
+    state.cloud === true ||
+    state.level !== "normal" ||
+    state.position !== undefined ||
+    state.since !== undefined ||
+    state.holding !== undefined
+  )
 }
 
 function badgeHtml(state: TurnLockState, now: number, lang: Lang): string {
@@ -129,7 +142,13 @@ function badgeHtml(state: TurnLockState, now: number, lang: Lang): string {
     state.since !== undefined
       ? `${ICON.clock}<span class="tl-wait">${waitLabel(now - state.since, lang)}</span>`
       : ""
-  return `${icons}${place ? `<span>${place}</span>` : ""}${wait}`
+  // The holder is drawn apart: a filled dot and its own timer, so the row that
+  // is actually being served is distinguishable from the ones waiting for it.
+  const hold =
+    state.holding !== undefined
+      ? `<span class="tl-hold">${ICON.hold}<span class="tl-wait">${waitLabel(now - state.holding, lang)}</span></span>`
+      : ""
+  return `${icons}${place ? `<span>${place}</span>` : ""}${wait}${hold}`
 }
 
 /** The row's title, as the client renders it. */
@@ -232,6 +251,8 @@ export function applyInboxView(
     const cloud = state.cloud ? "true" : "false"
     if (badge.dataset.level !== state.level) badge.dataset.level = state.level
     if (badge.dataset.cloud !== cloud) badge.dataset.cloud = cloud
+    const holding = state.holding !== undefined ? "true" : "false"
+    if (badge.dataset.holding !== holding) badge.dataset.holding = holding
     badge.title = describeState(state, now, lang)
     badge.onclick = (event: Event) => {
       event.preventDefault()

@@ -12,7 +12,11 @@
 // data, and every reader tolerates a missing or malformed value: an old session
 // has no metadata at all, and a hand-edited one must not break the list.
 
-import type { PriorityLevel } from "./index.ts"
+import { isLevel, LEVEL_RANK, type PriorityLevel } from "./priority.ts"
+import { hasCloudMark, levelOfTitle, WAIT_PREFIX, withoutCloudMark, withoutLevelMark } from "./title.ts"
+
+export { LEVEL_RANK }
+export { CLOUD_MARK } from "./title.ts"
 
 /** The key this plugin owns inside `session.metadata`. */
 export const STATE_KEY = "turn-lock"
@@ -28,12 +32,9 @@ export type TurnLockState = {
   total?: number
   /** When the wait started (epoch ms), used for the countdown. */
   since?: number
+  /** When this session took the slot (epoch ms), present only while it holds it. */
+  holding?: number
 }
-
-const LEVELS: readonly PriorityLevel[] = ["low", "normal", "high"]
-
-/** Visual order of the levels: high first, ordinary next, low last. */
-export const LEVEL_RANK: Record<PriorityLevel, number> = { high: 0, normal: 1, low: 2 }
 
 const positive = (value: unknown): number | undefined => {
   const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN
@@ -52,7 +53,7 @@ export function readState(metadata: unknown): TurnLockState | undefined {
   const value = raw as Record<string, unknown>
 
   const state: TurnLockState = {
-    level: LEVELS.includes(value.level as PriorityLevel) ? (value.level as PriorityLevel) : "normal",
+    level: isLevel(value.level) ? value.level : "normal",
   }
   if (value.cloud === true) state.cloud = true
   const position = positive(value.position)
@@ -62,6 +63,7 @@ export function readState(metadata: unknown): TurnLockState | undefined {
     state.total = total
   }
   if (typeof value.since === "number" && Number.isFinite(value.since)) state.since = value.since
+  if (typeof value.holding === "number" && Number.isFinite(value.holding)) state.holding = value.holding
   return state
 }
 
@@ -72,6 +74,7 @@ function compact(state: TurnLockState): Record<string, unknown> {
   if (state.position !== undefined) value.position = state.position
   if (state.total !== undefined) value.total = state.total
   if (state.since !== undefined) value.since = state.since
+  if (state.holding !== undefined) value.holding = state.holding
   return value
 }
 
@@ -89,15 +92,6 @@ export function withState(metadata: unknown, state: TurnLockState | undefined): 
   return base
 }
 
-/** The cloud prefix the server may write into a title (`titleMarks: "all"`). */
-export const CLOUD_MARK = "☁️ "
-
-const CLOUD_PREFIX = /^☁️ ?/
-const PRIORITY_PREFIX = /^⚡ ?/
-const LOW_PREFIX = /^▽ ?/
-/** `⏳ 2/5 · 9m · ` and the older shapes the server has written. */
-const WAIT_PREFIX = /^⏳ (?:(\d+)\/(\d+) · )?(?:(?:\d+h(?:\d+m)?|\d+m|\d+ мин|\d+ ч(?: \d+ мин)?|ждёт) · )?/
-
 /**
  * The state a title claims, for sessions whose metadata is missing (everything
  * written before metadata existed, and anything another client renamed). Reads
@@ -108,18 +102,15 @@ export function stateFromTitle(title: string | null | undefined): TurnLockState 
   const state: TurnLockState = { level: "normal" }
   let found = false
 
-  if (CLOUD_PREFIX.test(text)) {
+  if (hasCloudMark(text)) {
     state.cloud = true
-    text = text.replace(CLOUD_PREFIX, "")
+    text = withoutCloudMark(text)
     found = true
   }
-  if (PRIORITY_PREFIX.test(text)) {
-    state.level = "high"
-    text = text.replace(PRIORITY_PREFIX, "")
-    found = true
-  } else if (LOW_PREFIX.test(text)) {
-    state.level = "low"
-    text = text.replace(LOW_PREFIX, "")
+  const level = levelOfTitle(text)
+  if (level !== "normal") {
+    state.level = level
+    text = withoutLevelMark(text)
     found = true
   }
   const wait = WAIT_PREFIX.exec(text)
@@ -178,6 +169,23 @@ export function waitSentence(waitedMs: number, lang: Lang = "ru"): string {
   if (seconds < 60) return `ждёт ${seconds} ${ruPlural(seconds, "секунду", "секунды", "секунд")}`
   if (minutes < 60) return `ждёт ${minutes} ${ruPlural(minutes, "минуту", "минуты", "минут")}`
   const head = `ждёт ${hours} ${ruPlural(hours, "час", "часа", "часов")}`
+  return rest === 0 ? head : `${head} ${rest} ${ruPlural(rest, "минуту", "минуты", "минут")}`
+}
+
+/**
+ * The time a session has been holding the slot, as a tooltip sentence:
+ * `держит слот 9 минут`. The badge shows the same duration in the short form.
+ */
+export function holdSentence(heldMs: number, lang: Lang = "ru"): string {
+  const { seconds, minutes, hours, rest } = waitParts(heldMs)
+  if (lang === "en") {
+    if (seconds < 60) return `holding the slot ${seconds} s`
+    if (minutes < 60) return `holding the slot ${minutes} min`
+    return rest === 0 ? `holding the slot ${hours} h` : `holding the slot ${hours} h ${rest} min`
+  }
+  if (seconds < 60) return `держит слот ${seconds} ${ruPlural(seconds, "секунду", "секунды", "секунд")}`
+  if (minutes < 60) return `держит слот ${minutes} ${ruPlural(minutes, "минуту", "минуты", "минут")}`
+  const head = `держит слот ${hours} ${ruPlural(hours, "час", "часа", "часов")}`
   return rest === 0 ? head : `${head} ${rest} ${ruPlural(rest, "минуту", "минуты", "минут")}`
 }
 

@@ -23,14 +23,8 @@ import { createSignal } from "solid-js"
 import { ComposerPill, Plugin, type ComposerPillProps, type MountedSession } from "@opencode/plugin/gui"
 
 import { inboxLevel, startInboxView } from "./inbox.ts"
+import { LEVEL_CYCLE, type PriorityLevel } from "./priority.ts"
 import { readState } from "./state.ts"
-
-/** The queue levels, in the order one click moves through them. */
-type Level = "normal" | "high" | "low"
-const CYCLE: Record<Level, Level> = { normal: "high", high: "low", low: "normal" }
-
-/** The marks the server part writes into a title. Ordinary carries none. */
-const MARKS: Record<Exclude<Level, "normal">, string> = { high: "⚡", low: "▽" }
 
 /** Which level a title claims — the same reading the session list shows. */
 const levelOf = inboxLevel
@@ -65,8 +59,8 @@ export default Plugin.define({
 
     // session key -> level. A plain signal holding a new Map, so every pill
     // re-reads when any session's state changes.
-    const [state, setState] = createSignal(new Map<string, Level>())
-    const remember = (key: string, level: Level) =>
+    const [state, setState] = createSignal(new Map<string, PriorityLevel>())
+    const remember = (key: string, level: PriorityLevel) =>
       setState((current) => {
         if (current.get(key) === level) return current
         const next = new Map(current)
@@ -162,8 +156,8 @@ export default Plugin.define({
       }
     })()
 
-    const move = (session: MountedSession, from: Level) => {
-      const next = CYCLE[from]
+    const move = (session: MountedSession, from: PriorityLevel) => {
+      const next = LEVEL_CYCLE[from]
       remember(session.key, next) // optimistic: the rename confirms or corrects it
       void ctx.client.session.command({ sessionID: session.id, name: command, text: next }).catch(() => {
         remember(session.key, from)
@@ -193,7 +187,7 @@ export default Plugin.define({
             // only route back; without it the badge stays read-only.
             if (!row.id) return
             const from = row.state?.level ?? inboxLevel(row.title)
-            void ctx.client.session.command({ sessionID: row.id, name: command, text: CYCLE[from] }).catch(() => {
+            void ctx.client.session.command({ sessionID: row.id, name: command, text: LEVEL_CYCLE[from] }).catch(() => {
               ctx.toast.show({ title: ctx.t("failed"), variant: "error" })
             })
           },

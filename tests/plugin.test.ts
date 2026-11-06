@@ -1242,6 +1242,48 @@ test("by default the level and the wait live in metadata, not in the title", asy
   }
 })
 
+test("the holder of the slot is marked as active, with its own timer", async () => {
+  const harness = await setup({ limit: 1, lockScope: "turn" }, { titles: { ses_1: "one", ses_2: "two" } })
+  try {
+    await harness.context("ses_1")
+    await until(() => readState(harness.metadata.get("ses_1"))?.holding !== undefined, "the grant is stored")
+    const held = readState(harness.metadata.get("ses_1"))
+    assert.equal(held?.holding !== undefined, true, "the holder carries a start time")
+    assert.equal(held?.position, undefined, "a holder has no place in the queue")
+
+    // A turn keeps its lease across steps, so the timer must not restart on the
+    // next request of the same turn.
+    const started = held?.holding
+    await harness.context("ses_1")
+    assert.equal(readState(harness.metadata.get("ses_1"))?.holding, started, "the turn keeps one timer")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await until(() => readState(harness.metadata.get("ses_1"))?.holding === undefined, "the release clears the timer")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a waiter carries no hold timer, a released holder loses it", async () => {
+  const harness = await setup({ limit: 1 }, { titles: { ses_1: "one", ses_2: "two" } })
+  try {
+    await harness.context("ses_1")
+    await until(() => readState(harness.metadata.get("ses_1"))?.holding !== undefined, "ses_1 holds")
+
+    const waiting = harness.context("ses_2")
+    await until(() => readState(harness.metadata.get("ses_2"))?.since !== undefined, "ses_2 waits")
+    assert.equal(readState(harness.metadata.get("ses_2"))?.holding, undefined, "a waiter is not a holder")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await waiting
+    await until(() => readState(harness.metadata.get("ses_1"))?.holding === undefined, "the old holder is cleared")
+    await until(() => readState(harness.metadata.get("ses_2"))?.holding !== undefined, "the new holder is marked")
+    assert.equal(readState(harness.metadata.get("ses_2"))?.since, undefined, "the place is gone once it holds")
+  } finally {
+    await harness.teardown()
+  }
+})
+
 test("a cloud request is recorded in metadata and leaves the title alone", async () => {
   const harness = await setup({}, { titles: { ses_cloud: "cloud" } })
   try {
@@ -1252,6 +1294,74 @@ test("a cloud request is recorded in metadata and leaves the title alone", async
     await harness.context("ses_cloud", "strata")
     await until(() => readState(harness.metadata.get("ses_cloud"))?.cloud === undefined, "switching back clears it")
     assert.equal(harness.titles.get("ses_cloud"), "cloud")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a created cloud session is flagged before its first request", async () => {
+  const harness = await setup({}, { titles: { ses_new: "new" } })
+  try {
+    harness.bus.emit({
+      type: "session.created",
+      data: { sessionID: "ses_new", model: { providerID: "polzaai", id: "deepseek" } },
+    })
+    await until(
+      () => readState(harness.metadata.get("ses_new"))?.cloud === true,
+      "the cloud flag is written at creation, not at the first request",
+    )
+    assert.equal(existsSync(join(harness.dir, "ses_new.lease.json")), false, "creation takes no slot")
+    assert.equal(harness.titles.get("ses_new"), "new", "no ☁️ in the title by default")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a created cloud session carries the ☁️ mark at once when titles are marked", async () => {
+  const harness = await setup({ titleMarks: "all" }, { titles: { ses_new: "new" } })
+  try {
+    harness.bus.emit({
+      type: "session.created",
+      data: { sessionID: "ses_new", model: { providerID: "polzaai", id: "deepseek" } },
+    })
+    await until(() => harness.titles.get("ses_new") === "☁️ new", "the cloud mark is added at creation")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("a created local session is not written to at all", async () => {
+  const harness = await setup({}, { titles: { ses_local: "local" } })
+  try {
+    harness.bus.emit({
+      type: "session.created",
+      data: { sessionID: "ses_local", model: { providerID: "strata", id: "qwen" } },
+    })
+    await wait(80)
+    assert.equal(harness.metadata.get("ses_local"), undefined, "an ordinary local row needs no metadata")
+    assert.equal(harness.updates.length, 0, "and no title write either")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("switching the model updates the cloud flag at once", async () => {
+  const harness = await setup({}, { titles: { ses_switch: "switch" } })
+  try {
+    harness.bus.emit({
+      type: "session.model.selected",
+      data: { sessionID: "ses_switch", model: { providerID: "polzaai", id: "deepseek" } },
+    })
+    await until(() => readState(harness.metadata.get("ses_switch"))?.cloud === true, "a switch to cloud marks the session")
+
+    harness.bus.emit({
+      type: "session.model.selected",
+      data: { sessionID: "ses_switch", model: { providerID: "strata", id: "qwen" } },
+    })
+    await until(
+      () => readState(harness.metadata.get("ses_switch"))?.cloud === undefined,
+      "a switch back to local clears the flag",
+    )
   } finally {
     await harness.teardown()
   }

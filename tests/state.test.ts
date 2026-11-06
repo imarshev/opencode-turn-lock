@@ -22,12 +22,16 @@ test("metadata: a stored state round-trips, junk degrades to ordinary", () => {
   const state: TurnLockState = { level: "high", cloud: true, position: 2, total: 5, since: 1_700_000_000_000 }
   assert.deepEqual(readState(withState({}, state)), state)
 
+  const holding: TurnLockState = { level: "normal", holding: 1_700_000_000_000 }
+  assert.deepEqual(readState(withState({}, holding)), holding)
+
   assert.equal(readState(undefined), undefined)
   assert.equal(readState({}), undefined)
   assert.equal(readState({ [STATE_KEY]: "high" }), undefined)
   assert.deepEqual(readState({ [STATE_KEY]: { level: "nonsense" } }), { level: "normal" })
   assert.deepEqual(readState({ [STATE_KEY]: { level: "low", position: 9, total: 2 } }), { level: "low" })
   assert.deepEqual(readState({ [STATE_KEY]: { level: "normal", cloud: "yes" } }), { level: "normal" })
+  assert.deepEqual(readState({ [STATE_KEY]: { level: "normal", holding: "soon" } }), { level: "normal" })
 })
 
 test("metadata: our key is written without touching the session's own keys", () => {

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.5.1
-// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и бейджи приоритета/облака/места и времени ожидания для working-сессий в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
+// @version      0.6.0
+// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и бейджи приоритета/облака/места, времени ожидания и удержания слота для working-сессий в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
 // @match        https://*/*
@@ -96,6 +96,7 @@
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4.6 12a2.9 2.9 0 0 1 .3-5.8 3.9 3.9 0 0 1 7.4 1.2A2.3 2.3 0 0 1 11.7 12z"/></svg>',
     clock:
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.9V8l2.2 1.4"/></svg>',
+    hold: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="3.6"/></svg>',
   }
   const BADGE_CSS = `
 [data-slot="sidebar-inbox-item"] .${BADGE} {
@@ -119,6 +120,8 @@
 [data-slot="sidebar-inbox-item"] .${BADGE}[data-level="high"] { color: #f59e0b; }
 [data-slot="sidebar-inbox-item"] .${BADGE}[data-level="low"] { color: #94a3b8; }
 [data-slot="sidebar-inbox-item"] .${BADGE}[data-cloud="true"] { color: #38bdf8; }
+[data-slot="sidebar-inbox-item"] .${BADGE}[data-holding="true"] { border-color: #22c55e; }
+[data-slot="sidebar-inbox-item"] .${BADGE} .tl-hold { color: #22c55e; display: inline-flex; align-items: center; gap: 3px; }
 [data-slot="sidebar-inbox-item"] .${BADGE}:hover { filter: brightness(1.25); }
 [data-slot="sidebar-inbox-item"] .${BADGE} svg { width: 9px; height: 9px; }
 [data-slot="sidebar-inbox-item"] .${BADGE} .tl-wait { font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -139,6 +142,7 @@
       state.total = total
     }
     if (Number.isFinite(Number(raw.since)) && Number(raw.since) > 0) state.since = Number(raw.since)
+    if (Number.isFinite(Number(raw.holding)) && Number(raw.holding) > 0) state.holding = Number(raw.holding)
     return state
   }
 
@@ -227,6 +231,18 @@
     const head = `ждёт ${hours} ${plural(hours, "час", "часа", "часов")}`
     return rest === 0 ? head : `${head} ${rest} ${plural(rest, "минуту", "минуты", "минут")}`
   }
+  const holdSentence = (heldMs) => {
+    const { seconds, minutes, hours, rest } = waitParts(heldMs)
+    if (!RU) {
+      if (seconds < 60) return `holding the slot ${seconds} s`
+      if (minutes < 60) return `holding the slot ${minutes} min`
+      return rest === 0 ? `holding the slot ${hours} h` : `holding the slot ${hours} h ${rest} min`
+    }
+    if (seconds < 60) return `держит слот ${seconds} ${plural(seconds, "секунду", "секунды", "секунд")}`
+    if (minutes < 60) return `держит слот ${minutes} ${plural(minutes, "минуту", "минуты", "минут")}`
+    const head = `держит слот ${hours} ${plural(hours, "час", "часа", "часов")}`
+    return rest === 0 ? head : `${head} ${rest} ${plural(rest, "минуту", "минуты", "минут")}`
+  }
 
   const describe = (state, now) => {
     const parts = []
@@ -237,11 +253,19 @@
       parts.push(RU ? `${state.position}/${state.total} в очереди` : `${state.position}/${state.total} in queue`)
     }
     if (state.since !== undefined) parts.push(waitSentence(now - state.since))
+    if (state.holding !== undefined) parts.push(holdSentence(now - state.holding))
     return parts.join(" · ")
   }
 
   const hasBadge = (state) =>
-    Boolean(state && (state.cloud || state.level !== "normal" || state.position !== undefined || state.since !== undefined))
+    Boolean(
+      state &&
+        (state.cloud ||
+          state.level !== "normal" ||
+          state.position !== undefined ||
+          state.since !== undefined ||
+          state.holding !== undefined),
+    )
 
   const badgeHtml = (state, now) => {
     const icons = `${state.cloud ? ICONS.cloud : ""}${
@@ -251,7 +275,12 @@
     // The wait ticks on its own: it is computed from `since`, so the server does
     // not have to rewrite anything once a minute.
     const wait = state.since !== undefined ? `${ICONS.clock}<span class="tl-wait">${waitLabel(now - state.since)}</span>` : ""
-    return `${icons}${place}${wait}`
+    // The holder is drawn apart: a filled dot and its own timer.
+    const hold =
+      state.holding !== undefined
+        ? `<span class="tl-hold">${ICONS.hold}<span class="tl-wait">${waitLabel(now - state.holding)}</span></span>`
+        : ""
+    return `${icons}${place}${wait}${hold}`
   }
 
   const ensureStyle = () => {
@@ -327,6 +356,7 @@
       if (badge.innerHTML !== html) badge.innerHTML = html
       badge.dataset.level = entry.state.level
       badge.dataset.cloud = entry.state.cloud ? "true" : "false"
+      badge.dataset.holding = entry.state.holding !== undefined ? "true" : "false"
       badge.title = describe(entry.state, now)
       badge.onclick = (event) => {
         event.preventDefault()

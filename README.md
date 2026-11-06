@@ -481,7 +481,10 @@ Get-Content "$env:TEMP\opencode\turn-lock\*.lease.json"
 
 ```
 src/
-  index.ts        плагин: конфиг, хук, события, метки заголовков, лог
+  index.ts        плагин: конфиг, хук, события, лог; ре-экспорт priority/title
+  priority.ts     уровни очереди: ранг, метки, цикл, парсер /prio, компаратор
+  priority-store.ts  сайдкар <sid>.prio.json: TTL, старые формы, уровень корня
+  title.ts        грамматика заголовка: облако, уровень, префикс ожидания
   gui.tsx         десктоп-половина: пилюля очереди над композером, три уровня (Solid)
   state.ts        состояние сессии в metadata: уровень, облако, место, время; разбор старых заголовков
   inbox.ts        инбокс: порядок строк по состоянию, бейдж уровня/облака/очереди/времени, тик
@@ -492,13 +495,15 @@ tests/
   core.test.ts    планировщик: лимит, тайм-ауты, stale, cancel, две «процесса» на одном сторе
   store.test.ts   файловый стор: round-trip, битые файлы, pruneDead, общий лимит
   plugin.test.ts  плагин целиком через фейковый ctx (хук, события, метки, субагенты)
+  priority.test.ts       уровни, ранг, цикл, парсер, порядок очереди
+  priority-store.test.ts сайдкар: round-trip, TTL, старые формы, наследование корня
   state.test.ts   метаданные: форма, мусор, фолбэк из заголовка, ключ сортировки, подписи ожидания
   inbox.test.ts   инбокс: порядок, бейджи, клик, контракт userscript
   stubs/          заглушка @opencode/plugin для node --test
 ```
 
 ```powershell
-npm test          # 87 тестов, Node >= 22.18 (type stripping, сборки нет)
+npm test          # 117 тестов, Node >= 22.18 (type stripping, сборки нет)
 npm run check     # tsc --noEmit: серверная часть, тесты и gui.tsx
 npm run build     # dist/gui-experimental.cjs — бандл пилюли (его же коммитим)
 ```

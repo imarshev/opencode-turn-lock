@@ -83,8 +83,34 @@ import { fileURLToPath } from "node:url"
 import { Plugin } from "@opencode/plugin"
 
 import { createTurnLock, type ChangeEvent } from "./core.ts"
-import { CLOUD_MARK, readState, withState, type TurnLockState } from "./state.ts"
+import {
+  aheadInLevel,
+  compareQueue,
+  levelEntry,
+  outranking,
+  parsePriorityArgument,
+  toggleLevel,
+  type PriorityLevel,
+  type QueueEntry,
+} from "./priority.ts"
+import { createPriorityFlags } from "./priority-store.ts"
+import { readState, withState, type TurnLockState } from "./state.ts"
 import { fileStore, processAlive } from "./store-file.ts"
+import {
+  formatWait,
+  stripWaitPrefix,
+  withCloudMark,
+  withLevelMark,
+  withWaitPrefix,
+  withoutLevelMark,
+  type QueuePlace,
+} from "./title.ts"
+
+// The priority vocabulary and the title grammar live in their own modules; the
+// plugin entry re-exports them, so `/prio`, the GUI and the tests keep importing
+// everything from this file.
+export * from "./priority.ts"
+export * from "./title.ts"
 
 // Which copy of the plugin is running. A loose file in ~/.config/opencode/plugins
 // and a package install of this project both load code that looks identical, so
@@ -211,7 +237,12 @@ export const RELEASE_EVENTS = [
   "provider.updated",
 ] as const
 
-const EVENT_TYPES = [...RELEASE_EVENTS] as string[]
+/** Events that carry a model but not a release. A session's provider is known
+ *  from the moment it is created or its model is switched, and the UI needs the
+ *  cloud flag then — not at the first request. */
+const MODEL_EVENTS = ["session.created", "session.model.selected"] as const
+
+const EVENT_TYPES = [...RELEASE_EVENTS, ...MODEL_EVENTS] as string[]
 
 /** Events after which this session's run is over, so a wait it queued must not
  *  outlive it. `form.*` and `permission.*` are deliberately absent: there the
@@ -238,6 +269,7 @@ type AnyEvent = {
     sessionID?: string
     status?: { type?: string }
     form?: { sessionID?: string }
+    model?: { providerID?: string }
   }
 }
 
@@ -373,197 +405,6 @@ function readBaseUrl(info: unknown): string | undefined {
   return undefined
 }
 
-/** Prefix a queued session's title with this, so any session list shows it is waiting. */
-export const WAITING_MARK = "⏳ "
-
-/** Prefix of a session the user needs now: it cuts the queue and takes the next
- *  free slot. It sits outside the waiting prefix, so a priority session that is
- *  itself queued reads as `⚡ ⏳ 2/3 · 26m · <title>`. */
-export const PRIORITY_MARK = "⚡"
-
-/** Prefix of a session that should wait last: it stands behind every ordinary
- *  waiter and gives its slot up to them, so `▽ ⏳ 3/3 · 26m · <title>`. */
-export const LOW_MARK = "▽"
-
-/** The queue levels, best first. `normal` is the absence of a flag: no sidecar
- *  file, no mark in the title. */
-export type PriorityLevel = "low" | "normal" | "high"
-
-/** What one level is worth against another: `high` beats `normal` beats `low`. */
-export const PRIORITY_RANK: Record<PriorityLevel, number> = { low: 0, normal: 1, high: 2 }
-
-/** The mark of a level in a session title; ordinary carries none. */
-export function markFor(level: PriorityLevel): string {
-  return level === "high" ? PRIORITY_MARK : level === "low" ? LOW_MARK : ""
-}
-
-/** The level mark plus the space the two marks are joined by, if any. */
-const PRIORITY_PREFIX = /^⚡ ?/
-const LOW_PREFIX = /^▽ ?/
-/** The cloud mark the server writes ahead of everything (`titleMarks: "all"`). */
-const CLOUD_PREFIX = /^☁️ ?/
-
-/** Does this title carry the cloud mark? */
-export function hasCloudMark(title: string): boolean {
-  return CLOUD_PREFIX.test(title)
-}
-
-/** Title with every cloud mark removed (idempotent, touches nothing else). */
-export function withoutCloudMark(title: string): string {
-  let result = title
-  for (;;) {
-    const next = result.replace(CLOUD_PREFIX, "")
-    if (next === result) return result
-    result = next
-  }
-}
-
-/** Title carrying (or not) the cloud mark, with every other mark left in place. */
-export function withCloudMark(title: string, cloud: boolean): string {
-  const base = withoutCloudMark(title)
-  return cloud ? `${CLOUD_MARK}${base}` : base
-}
-
-/** Run `transform` on the title after the cloud mark, then put the mark back. */
-function afterCloud(title: string, transform: (text: string) => string): string {
-  const cloud = hasCloudMark(title)
-  const next = transform(withoutCloudMark(title))
-  return cloud ? `${CLOUD_MARK}${next}` : next
-}
-
-/** The level a title carries: its leading mark, or ordinary when it has none. */
-export function levelOfTitle(title: string): PriorityLevel {
-  const text = withoutCloudMark(title)
-  if (PRIORITY_PREFIX.test(text)) return "high"
-  if (LOW_PREFIX.test(text)) return "low"
-  return "normal"
-}
-
-/** Title with every level mark removed (idempotent, touches nothing else). */
-export function withoutLevelMark(title: string): string {
-  return afterCloud(title, (text) => {
-    let result = text
-    for (;;) {
-      const next = result.replace(PRIORITY_PREFIX, "").replace(LOW_PREFIX, "")
-      if (next === result) return result
-      result = next
-    }
-  })
-}
-
-/** Title carrying exactly this level's mark (idempotent; `normal` removes both). */
-export function withLevelMark(title: string, level: PriorityLevel): string {
-  const cloud = hasCloudMark(title) ? CLOUD_MARK : ""
-  const mark = markFor(level)
-  const base = withoutLevelMark(withoutCloudMark(title))
-  return `${cloud}${mark ? `${mark} ` : ""}${base}`
-}
-
-/** Title with the priority mark added (idempotent). A `▽` is replaced: a session
- *  is at one level at a time. */
-export function withPriorityMark(title: string): string {
-  return withLevelMark(title, "high")
-}
-
-/** Title with the priority mark removed (idempotent, touches nothing else). */
-export function withoutPriorityMark(title: string): string {
-  return afterCloud(title, (text) => text.replace(PRIORITY_PREFIX, ""))
-}
-
-/** Does this title carry the priority mark? */
-export function hasPriorityMark(title: string): boolean {
-  return PRIORITY_PREFIX.test(withoutCloudMark(title))
-}
-
-/** Title with the low-priority mark added (idempotent; replaces a `⚡`). */
-export function withLowMark(title: string): string {
-  return withLevelMark(title, "low")
-}
-
-/** Title with the low-priority mark removed (idempotent, touches nothing else). */
-export function withoutLowMark(title: string): string {
-  return afterCloud(title, (text) => text.replace(LOW_PREFIX, ""))
-}
-
-/** Does this title carry the low-priority mark? */
-export function hasLowMark(title: string): boolean {
-  return LOW_PREFIX.test(withoutCloudMark(title))
-}
-
-/**
- * Matches the whole waiting prefix, not just the emoji: `⏳ 2/3 · 3h10m · `,
- * `⏳ 3m · `, the Russian wording older versions wrote (`⏳ ждёт · `,
- * `⏳ 4 мин · `), and the bare `⏳ `. Applied in a loop, so a title that was
- * marked twice is still cleaned up.
- */
-const WAIT_PREFIX =
-  /^⏳ (?:(?:\d+\/\d+) · )?(?:(?:\d+h(?:\d+m)?|\d+m|\d+ мин|\d+ ч(?: \d+ мин)?|ждёт) · )?/
-
-/** Where a waiting session stands: `position` of `total` waiters, 1-based. */
-export type QueuePlace = { position: number; total: number }
-
-/** Compact wait label for the title: "" under a minute, "26m", "3h10m",
- *  prefixed by "2/3 · " when the session is not alone in the queue. */
-export function formatWait(waitedMs: number, place?: QueuePlace): string {
-  const minutes = Math.floor(Math.max(0, waitedMs) / 60_000)
-  const parts: string[] = []
-  if (place && place.total > 1) parts.push(`${place.position}/${place.total}`)
-  if (minutes >= 60) parts.push(`${Math.floor(minutes / 60)}h${minutes % 60 ? `${minutes % 60}m` : ""}`)
-  else if (minutes >= 1) parts.push(`${minutes}m`)
-  return parts.join(" · ")
-}
-
-/** Original title with every waiting prefix removed. A leading level mark is not
- *  a waiting prefix: it stays where it is. */
-export function stripWaitPrefix(title: string): string {
-  const cloud = hasCloudMark(title)
-  const mark = markFor(levelOfTitle(title))
-  let result = withoutLevelMark(withoutCloudMark(title))
-  while (WAIT_PREFIX.test(result)) result = result.replace(WAIT_PREFIX, "")
-  return `${cloud ? CLOUD_MARK : ""}${mark ? `${mark} ${result}` : result}`
-}
-
-/** Title of a waiting session: `⏳ 2/3 · 3h10m · <title>`, or `⚡ ⏳ …` / `▽ ⏳ …`
- *  when it is waiting *and* flagged. The level defaults to whatever the title
- *  already carries; pass it explicitly to move the session in the same write.
- *  `true`/`false` are accepted for the two-level callers (`true` = `high`). */
-export function withWaitPrefix(
-  title: string,
-  waitedMs: number,
-  place?: QueuePlace,
-  level: PriorityLevel | boolean = levelOfTitle(title),
-): string {
-  const cloud = hasCloudMark(title)
-  const base = withoutCloudMark(withoutLevelMark(stripWaitPrefix(title)))
-  const label = formatWait(waitedMs, place)
-  const mark = markFor(level === true ? "high" : level === false ? "normal" : level)
-  return `${cloud ? CLOUD_MARK : ""}${mark ? `${mark} ` : ""}${WAITING_MARK}${label ? `${label} · ` : ""}${base}`
-}
-
-/**
- * Reads the intent out of a command's text: `/prio`, `/prio on`, `/prio low`.
- * Tolerates both shapes a client may hand over — just the arguments, or the
- * whole line including the command name — because that is not specified.
- * `toggle` is the bare `/prio` of the two-level days: it still means "on unless
- * this session is already `⚡`", so an old habit keeps working and `low` is only
- * ever asked for by name.
- */
-export function parsePriorityArgument(text: string, command: string): PriorityLevel | "toggle" {
-  let argument = String(text ?? "").trim().toLowerCase()
-  const name = String(command ?? "").toLowerCase()
-  for (const prefix of [`/${name}`, name]) {
-    if (argument === prefix) return "toggle"
-    if (argument.startsWith(`${prefix} `)) {
-      argument = argument.slice(prefix.length + 1).trim()
-      break
-    }
-  }
-  if (/^(off|remove|false|0|no|normal|ordinary|mid|middle|medium|default|base)$/.test(argument)) return "normal"
-  if (/^(low|lo|down|bottom|least|min|background)$/.test(argument)) return "low"
-  if (/^(on|add|true|1|yes|high|hi|up|max|first|priority|urgent)$/.test(argument)) return "high"
-  return "toggle"
-}
-
 /**
  * True for a synthetic transcript entry this plugin posted. Older versions
  * queued "turn-lock" notices into the session inbox; those become real messages
@@ -645,11 +486,12 @@ export default Plugin.define({
       position?: number | null
       total?: number | null
       since?: number | null
+      holding?: number | null
     }
     const applyPatch = (state: TurnLockState, patch: StatePatch): TurnLockState => {
       const next: TurnLockState = { ...state }
       if (patch.level) next.level = patch.level
-      for (const key of ["cloud", "position", "total", "since"] as const) {
+      for (const key of ["cloud", "position", "total", "since", "holding"] as const) {
         const value = patch[key]
         if (value === undefined) continue
         if (value === null) delete next[key]
@@ -989,8 +831,14 @@ export default Plugin.define({
             placesDirty = false
             const order = orderedWaiters()
             const total = order.length
+            // `since` comes from the wait sidecar, not from a previous write: a
+            // waiter restored after a plugin reload (or marked by another
+            // instance) has a sidecar but may have no `since` in its metadata,
+            // and a place without a start time draws no timer in the UI.
+            const starts = new Map(readWaiters().map((waiter) => [waiter.sid, waiter.since]))
             for (const [index, id] of order.entries()) {
-              await syncState(id, { position: index + 1, total })
+              const since = starts.get(id)
+              await syncState(id, { position: index + 1, total, ...(since ? { since } : {}) })
             }
           }
         } catch (error) {
@@ -1004,112 +852,52 @@ export default Plugin.define({
       return pass
     }
 
-    // Priority. `<sessionID>.prio.json` is the shared record of where the user
-    // wants this session to stand in the queue: `/prio` writes it from any client,
-    // every process sharing the lock directory reads it. `level` is `high` (⚡, cuts
-    // the queue) or `low` (▽, stands at the back of it); no file means ordinary.
-    // A flag is inert while its session neither waits nor holds a slot, so a
-    // forgotten mark costs nothing — and it expires anyway after priorityTtlMs.
-    const prioPath = (sid: string) => join(config.dir, `${sid.replace(/[^A-Za-z0-9_.-]/g, "_")}.prio.json`)
-
-    /** A recorded flag: which end of the queue the session asked for, and since when. */
-    type PriorityFlag = { level: Exclude<PriorityLevel, "normal">; since: number }
-
-    const dropPriority = (sid: string) => {
-      try {
-        if (existsSync(prioPath(sid))) unlinkSync(prioPath(sid))
-      } catch {
-        // best-effort
-      }
-    }
-
-    const readPriority = (sid: string): PriorityFlag | undefined => {
-      if (!config.priorityEnabled) return undefined
-      try {
-        const value = JSON.parse(readFileSync(prioPath(sid), "utf8"))
-        const since = typeof value?.since === "number" ? value.since : 0
-        if (!since) return undefined
-        if (Date.now() - since > config.priorityTtlMs) {
-          dropPriority(sid)
-          return undefined
-        }
-        // Ordinary is the absence of a flag: a file saying so is stale, and a file
-        // without `level` was written before levels existed — it meant `⚡` then.
-        if (value?.level === "normal") {
-          dropPriority(sid)
-          return undefined
-        }
-        return { level: value?.level === "low" ? "low" : "high", since }
-      } catch {
-        return undefined
-      }
-    }
-
-    /** Asks for `level` in the queue; ordinary is the absence of a flag. */
-    const writePriority = (sid: string, level: PriorityLevel) => {
-      if (level === "normal") {
-        dropPriority(sid)
-        return
-      }
-      try {
-        mkdirSync(config.dir, { recursive: true })
-        writeFileSync(
-          prioPath(sid),
-          JSON.stringify({ sid, pid: process.pid, owner, since: Date.now(), level }),
-          "utf8",
-        )
-      } catch {
-        // priority is best-effort: without the file the session simply stays ordinary
-      }
-    }
-
+    // Priority. The flag sidecar and its rules (TTL, legacy shapes, root
+    // inheritance) live in priority-store.ts; the plugin only supplies the lock
+    // directory and the ancestry cache. A flag is inert while its session neither
+    // waits nor holds a slot, so a forgotten mark costs nothing — and it expires
+    // anyway after priorityTtlMs.
+    //
     // A subagent runs the work of its parent, so it queues at the parent's
     // level: the root is cached when the session is first gated. A session that
     // has not been seen yet falls back to its own flag (a root session's own
     // flag is the root flag anyway).
     const roots = new Map<string, string>()
 
-    /** The flag that decides this session's queue level: a subagent has no say of
-     *  its own, it queues at its root's level. The root is cached on the first
-     *  gated request, so a session seen for the first time falls back to its own
-     *  flag (for a root that is the same flag anyway). */
-    const flagOf = (sid: string): PriorityFlag | undefined => {
-      const root = roots.get(sid)
-      if (root && root !== sid) return readPriority(root)
-      return readPriority(sid)
-    }
+    const flags = createPriorityFlags({
+      dir: config.dir,
+      ttlMs: config.priorityTtlMs,
+      enabled: config.priorityEnabled,
+      owner,
+      rootOf: (sid) => roots.get(sid),
+    })
 
-    /** The level this session asked for, read from the shared flag. */
-    const levelOf = (sid: string): PriorityLevel => {
+    const flagOf = flags.flagOf
+    const levelOf = flags.levelOf
+    const rankOf = flags.rankOf
+
+    /**
+     * One waiter as the queue sees it. The age is the moment the flag was set for
+     * a flagged session, and the turn ticket (or the start of this wait) for an
+     * ordinary one — the single rule every order below uses.
+     */
+    const entryOf = (sid: string, waited: number): QueueEntry => {
       const flag = flagOf(sid)
-      return flag ? flag.level : "normal"
+      return flag
+        ? levelEntry(sid, flag.level, flag.since)
+        : levelEntry(sid, "normal", ticketSince(sid) ?? waited)
     }
 
-    const rankOf = (sid: string): number => PRIORITY_RANK[levelOf(sid)]
-
-    /** Everyone queued right now, with the level they will be served at. `age` is
-     *  what orders two waiters of one level: the moment the flag was set for a
-     *  flagged one, the moment they started waiting for an ordinary one. A waiter
-     *  that already holds a slot is being served, so it is not in this list. */
-    const rankedWaiters = (): Array<{ sid: string; rank: number; age: number }> => {
-      const ranked: Array<{ sid: string; rank: number; age: number }> = []
-      for (const waiter of readWaiters()) {
-        if (store.read(waiter.sid)) continue
-        const flag = flagOf(waiter.sid)
-        const ticket = flag ? undefined : ticketSince(waiter.sid)
-        ranked.push(
-          flag
-            ? { sid: waiter.sid, rank: PRIORITY_RANK[flag.level], age: flag.since }
-            : { sid: waiter.sid, rank: PRIORITY_RANK.normal, age: ticket ?? waiter.since },
-        )
-      }
-      return ranked
-    }
+    /** Everyone queued right now. A waiter that already holds a slot is being
+     *  served, so it is not in this list. */
+    const rankedWaiters = (): QueueEntry[] =>
+      readWaiters()
+        .filter((waiter) => !store.read(waiter.sid))
+        .map((waiter) => entryOf(waiter.sid, waiter.since))
 
     /** Waiters of a strictly better level than `rank`: they take the next free slot
      *  first, and a holder of `rank` gives its own slot up to them. */
-    const waitingAbove = (rank: number, except?: string) =>
-      rankedWaiters().filter((waiter) => waiter.sid !== except && waiter.rank > rank)
+    const waitingAbove = (rank: number, except?: string) => outranking(rankedWaiters(), except ?? "", rank)
 
     /** When a slot last freed. The head of a level may take it at once; the next
      *  place is let through only after another `fifoGraceMs`, so a head that
@@ -1140,11 +928,9 @@ export default Plugin.define({
      *  wait began; a flagged session is ordered by when it asked for the level,
      *  exactly like `orderedWaiters`. */
     const holdsBack = (sid: string, since: number): boolean => {
-      const flag = flagOf(sid)
-      const mine = flag ? PRIORITY_RANK[flag.level] : PRIORITY_RANK.normal
-      const age = flag ? flag.since : (ticketSince(sid) ?? since)
+      const me = entryOf(sid, since)
       const waiters = rankedWaiters()
-      if (waiters.some((waiter) => waiter.sid !== sid && waiter.rank > mine)) return true
+      if (outranking(waiters, sid, me.rank).length) return true
       // The fory: a session that has just released the slot keeps the head of its
       // level for `requeueGraceMs`. It may ask for the next step at any moment in
       // that window; if it does not, the window lapses and the next place is
@@ -1159,18 +945,13 @@ export default Plugin.define({
       const isMine = (grace: { root: string }) => grace.root === myRoot
       // Windows of this level and above, plus the session's own: a lower level's
       // fory cannot delay a better one.
-      const relevant = graces.filter((grace) => isMine(grace) || rankOf(grace.root) >= mine)
+      const relevant = graces.filter((grace) => isMine(grace) || rankOf(grace.root) >= me.rank)
       if (relevant.some((grace) => !isMine(grace) && grace.until > now)) return true
       // Inside its own window the session is the reservation: neither the levels
       // nor the FIFO windows of the places behind it can hold it back.
       if (relevant.some((grace) => isMine(grace) && grace.until > now)) return false
       if (config.fifoGraceMs <= 0) return false
-      const ahead = waiters.filter(
-        (waiter) =>
-          waiter.sid !== sid &&
-          waiter.rank === mine &&
-          (waiter.age < age || (waiter.age === age && waiter.sid < sid)),
-      )
+      const ahead = aheadInLevel(waiters, me)
       if (!ahead.length) return false
       // Each place ahead gets one grace window: the head takes the slot at once,
       // place 2 after one window, place 3 after two, and so on. The window is at
@@ -1186,19 +967,10 @@ export default Plugin.define({
      *  (`⚡`, then ordinary, then `▽`), inside a level by the age that orders it.
      *  `sid` is included even before its sidecar exists, so a place is always defined. */
     const orderedWaiters = (sid?: string, since = 0): string[] => {
-      const entries = new Map<string, { rank: number; age: number }>()
-      const put = (id: string, flag: PriorityFlag | undefined, waited: number) =>
-        entries.set(
-          id,
-          flag
-            ? { rank: PRIORITY_RANK[flag.level], age: flag.since }
-            : { rank: PRIORITY_RANK.normal, age: ticketSince(id) ?? waited },
-        )
-      for (const waiter of readWaiters()) put(waiter.sid, flagOf(waiter.sid), waiter.since)
-      if (sid) put(sid, flagOf(sid), since)
-      return [...entries.entries()]
-        .sort((a, b) => b[1].rank - a[1].rank || a[1].age - b[1].age || a[0].localeCompare(b[0]))
-        .map(([id]) => id)
+      const entries = new Map<string, QueueEntry>()
+      for (const waiter of readWaiters()) entries.set(waiter.sid, entryOf(waiter.sid, waiter.since))
+      if (sid) entries.set(sid, entryOf(sid, since))
+      return [...entries.values()].sort(compareQueue).map((entry) => entry.sid)
     }
 
     /** `/prio` in the session's composer. A command callback runs immediately
@@ -1206,7 +978,7 @@ export default Plugin.define({
      *  in the queue — which is exactly when it matters. */
     async function applyLevel(sid: string, level: PriorityLevel): Promise<void> {
       waitEpoch.set(sid, epochOf(sid) + 1) // an in-flight title update must not win
-      writePriority(sid, level)
+      flags.write(sid, level)
       void syncState(sid, { level })
       const waiting = readWaitMark(sid)
       const waitedMs = waiting && typeof waiting.since === "number" ? Date.now() - waiting.since : undefined
@@ -1243,6 +1015,9 @@ export default Plugin.define({
         position: place?.position ?? null,
         total: place?.total ?? null,
         since,
+        // A waiter cannot be the holder: a `holding` left behind by a killed
+        // instance (or by the turn that has just released) is stale here.
+        holding: null,
       })
       if (!config.markWaitingTitle || config.titleMarks === "none" || marking.has(sid) || !canEditTitle()) return
       marking.add(sid)
@@ -1539,7 +1314,7 @@ export default Plugin.define({
       onChange,
       // In `request` scope the hold-back is also what orders waiters by their
       // turn ticket, so it must stay on even without `/prio`: the levels simply
-      // become inert (readPriority returns nothing when priority is off).
+      // become inert (a flag reads as nothing when priority is off).
       holdBack: config.priorityEnabled || config.lockScope === "request" ? holdsBack : undefined,
       onFree: writeFreeAt,
     })
@@ -1599,6 +1374,7 @@ export default Plugin.define({
             // request is over and the lease must not turn back into a turn lease.
             held.delete(sid)
             lock.release(sid, "step-boundary")
+            void syncState(sid, { holding: null })
           }
           writeTicket(sid)
           // A step of the parent covers its subagents. While a `task` tool runs,
@@ -1637,6 +1413,7 @@ export default Plugin.define({
               log("info", `yield ${sid}: ${who} ${ahead.length === 1 ? "outranks" : "outrank"} it`)
               held.delete(sid)
               lock.release(sid, "priority")
+              void syncState(sid, { holding: null })
             }
           }
         }
@@ -1648,6 +1425,12 @@ export default Plugin.define({
           return
         }
         held.add(sid)
+        // The badge: the holder of the slot is drawn as the active row, with its
+        // own timer. The start is the lease's `since`, not `Date.now()` — a
+        // lease that outlived a plugin reload, or a turn lease reused by the
+        // next step, must not restart the clock on every request.
+        const leaseSince = lock.snapshot().leases.find((lease) => lease.sid === sid)?.since
+        void syncState(sid, { holding: leaseSince ?? Date.now() })
         // The fory has done its job: the session is being served again.
         clearGrace(sid)
       },
@@ -1671,7 +1454,7 @@ export default Plugin.define({
               const verdict = parsePriorityArgument(input?.prompt?.text ?? "", config.priorityCommand)
               // A bare `/prio` keeps the meaning it had at two levels: on, unless
               // this session is already `⚡`. `low` is only ever asked for by name.
-              const level = verdict === "toggle" ? (levelOf(sid) === "high" ? "normal" : "high") : verdict
+              const level = verdict === "toggle" ? toggleLevel(levelOf(sid)) : verdict
               await applyLevel(sid, level)
             },
           })
@@ -1694,6 +1477,35 @@ export default Plugin.define({
           if (type === "permission.asked" && !config.releaseOnPermission) continue
           const sid = eventSessionID(event as AnyEvent)
           if (!sid) continue
+          // The cloud flag is the UI's "not gated" signal: it draws the badge and
+          // sorts the row. A session that has not made a request yet has no flag
+          // from `context`, so a freshly created cloud session looked ordinary
+          // until its first prompt. The model is on the event, so mark it now;
+          // `context` re-asserts the flag on every request, which keeps a model
+          // switch correct even if this event is missed.
+          if ((MODEL_EVENTS as readonly string[]).includes(type)) {
+            let providerID = (event as AnyEvent).data?.model?.providerID
+            if (!providerID) {
+              // A session created without an explicit model has the default one
+              // on the record, not on the event; the event is still the earliest
+              // moment the UI needs the flag.
+              try {
+                const info: any = await ctx.session.get({ sessionID: sid })
+                providerID = typeof info?.model?.providerID === "string" ? info.model.providerID : undefined
+              } catch {
+                // not readable yet: `context` will mark it at the first request
+              }
+            }
+            if (!providerID) continue
+            const local = await isLocalProvider(providerID)
+            // A fresh local session needs no flag: its `normal` level is the
+            // default and the row already sorts as local.
+            if (local && type === "session.created") continue
+            log("info", `${type} ${sid}: ${local ? "local" : "cloud"} (${providerID})`)
+            void syncState(sid, { cloud: local ? null : true })
+            void applyCloudTitle(sid, !local)
+            continue
+          }
           // A step ends one model request, not the turn: in `request` scope it
           // frees the slot and leaves the ticket alone, so the next step of this
           // session is first in line. In `turn` scope it is not a release at all.
@@ -1703,14 +1515,19 @@ export default Plugin.define({
             // cloud session's step must not reserve a local slot.
             const released = held.delete(sid)
             lock.release(sid, type)
+            if (released) void syncState(sid, { holding: null })
             // The fory: this session may ask for the next step at once, so its
             // turn keeps the head of the queue for `requeueGraceMs` (the ticket
             // it already has carries the window).
             if (released) await setGrace(sid)
             continue
           }
-          held.delete(sid)
+          // Only the instance that granted the lease clears the badge: a queued
+          // session has no `holding`, and another instance's holder must not be
+          // un-highlighted by an event this one merely observed.
+          const dropped = held.delete(sid)
           lock.release(sid, type)
+          if (dropped) void syncState(sid, { holding: null })
           // `release` only frees a slot this session held; a queued one has no
           // lease. Its wait is a separate polling loop, and the reminder tick
           // would keep re-marking the title and take the next free slot for a
@@ -1722,7 +1539,7 @@ export default Plugin.define({
           if (TURN_END_EVENTS.has(type)) dropTicket(sid)
           // A session that no longer runs cannot be the one the user needs now.
           if (type === "session.deleted" || type === "session.archived") {
-            dropPriority(sid)
+            flags.drop(sid)
             dropTicket(sid)
           }
           // A queued session has no lease, so a terminal event for it (deleted,

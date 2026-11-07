@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.6.0
-// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и бейджи приоритета/облака/места, времени ожидания и удержания слота для working-сессий в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
+// @version      0.7.0
+// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и бейджи приоритета/облака/места, времени ожидания, удержания слота и «в работе» для working-сессий в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
 // @match        https://*/*
@@ -97,6 +97,7 @@
     clock:
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.9V8l2.2 1.4"/></svg>',
     hold: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="3.6"/></svg>',
+    idle: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="8" r="5"/></svg>',
   }
   const BADGE_CSS = `
 [data-slot="sidebar-inbox-item"] .${BADGE} {
@@ -120,6 +121,12 @@
 [data-slot="sidebar-inbox-item"] .${BADGE}[data-level="high"] { color: #f59e0b; }
 [data-slot="sidebar-inbox-item"] .${BADGE}[data-level="low"] { color: #94a3b8; }
 [data-slot="sidebar-inbox-item"] .${BADGE}[data-cloud="true"] { color: #38bdf8; }
+[data-slot="sidebar-inbox-item"] .${BADGE}[data-idle="true"] {
+  color: #94a3b8;
+  border-style: dashed;
+  background: transparent;
+  font-weight: 500;
+}
 [data-slot="sidebar-inbox-item"] .${BADGE}[data-holding="true"] { border-color: #22c55e; }
 [data-slot="sidebar-inbox-item"] .${BADGE} .tl-hold { color: #22c55e; display: inline-flex; align-items: center; gap: 3px; }
 [data-slot="sidebar-inbox-item"] .${BADGE}:hover { filter: brightness(1.25); }
@@ -244,7 +251,14 @@
     return rest === 0 ? head : `${head} ${rest} ${plural(rest, "минуту", "минуты", "минут")}`
   }
 
-  const describe = (state, now) => {
+  // An idle row — a working session with no place yet — says why it has none
+  // instead of staying silent: the gate is at its next model request.
+  const describe = (state, now, idle) => {
+    if (idle) {
+      return RU
+        ? "работает, но не ждёт движок: место в очереди появится на следующем запросе модели"
+        : "running but not waiting for the engine: a queue place appears at its next model request"
+    }
     const parts = []
     if (state.cloud) parts.push(RU ? "облачная модель" : "cloud model")
     if (state.level === "high") parts.push(RU ? "высокий приоритет" : "high priority")
@@ -267,7 +281,8 @@
           state.holding !== undefined),
     )
 
-  const badgeHtml = (state, now) => {
+  const badgeHtml = (state, now, idle) => {
+    if (idle) return `${ICONS.idle}<span>${RU ? "в работе" : "working"}</span>`
     const icons = `${state.cloud ? ICONS.cloud : ""}${
       state.level === "high" ? ICONS.high : state.level === "low" ? ICONS.low : ""
     }`
@@ -292,12 +307,18 @@
   }
 
   // title -> { id, state }, refreshed from the list the client itself reads.
-  // Two seconds is enough: a level change is a metadata write, not a stream.
+  // The event stream below is the fast path; the 2s poll is the fallback.
   const rowsByTitle = new Map()
   let statesAt = 0
   let statesBusy = false
+  let statesAgain = false
   const loadStates = async () => {
-    if (statesBusy) return
+    if (statesBusy) {
+      // A read is in flight; one more follows it so an event that landed in
+      // between is not lost.
+      statesAgain = true
+      return
+    }
     statesBusy = true
     try {
       const response = await api("/api/session")
@@ -314,6 +335,10 @@
       // keep the last known map; the next tick retries
     } finally {
       statesBusy = false
+      if (statesAgain) {
+        statesAgain = false
+        void loadStates().then(() => sortInbox())
+      }
     }
   }
 
@@ -340,11 +365,13 @@
     ordered.forEach((entry, order) => {
       const value = String(order)
       if (entry.row.style.order !== value) entry.row.style.order = value
+      // Every row here is in the Working section, so it is a running session. A
+      // state with nothing to say (no place, no hold, no level, no cloud) still
+      // says that: the row is working and not queued — its place appears at its
+      // next model request, which is where the gate is.
+      const idle = !hasBadge(entry.state)
+      const view = entry.state || { level: "normal" }
       let badge = entry.row.querySelector(`.${BADGE}`)
-      if (!hasBadge(entry.state)) {
-        if (badge) badge.remove()
-        return
-      }
       if (!badge) {
         badge = document.createElement("span")
         badge.className = BADGE
@@ -352,19 +379,112 @@
         if (header) header.insertBefore(badge, header.lastElementChild)
         else entry.row.appendChild(badge)
       }
-      const html = badgeHtml(entry.state, now)
+      const html = badgeHtml(view, now, idle)
       if (badge.innerHTML !== html) badge.innerHTML = html
-      badge.dataset.level = entry.state.level
-      badge.dataset.cloud = entry.state.cloud ? "true" : "false"
-      badge.dataset.holding = entry.state.holding !== undefined ? "true" : "false"
-      badge.title = describe(entry.state, now)
+      badge.dataset.level = view.level
+      badge.dataset.cloud = view.cloud ? "true" : "false"
+      badge.dataset.holding = view.holding !== undefined ? "true" : "false"
+      badge.dataset.idle = idle ? "true" : "false"
+      badge.title = describe(view, now, idle)
       badge.onclick = (event) => {
         event.preventDefault()
         event.stopPropagation()
         if (!entry.data || !entry.data.id) return
-        void setLevel(entry.data.id, CYCLE[entry.state.level] || "normal").catch(() => {})
+        void setLevel(entry.data.id, CYCLE[view.level] || "normal").catch(() => {})
       }
     })
+  }
+
+  // The client's own event stream is the fast path for the inbox: a metadata
+  // write or a queue change arrives as an event and the list is re-read at
+  // once instead of waiting for the 2s poll. A burst (one queue change rewrites
+  // every waiter) is coalesced into one read; the poll stays as the fallback
+  // for a stream that is down.
+  const EVENT_TYPES = [
+    "session.metadata.updated",
+    "session.renamed",
+    "session.created",
+    "session.deleted",
+    "session.execution.started",
+    "session.execution.succeeded",
+    "session.execution.failed",
+    "session.execution.interrupted",
+    "session.idle",
+  ]
+  const REFRESH_MS = 120
+  const RETRY_MS = 3000
+  let refreshTimer = null
+  let streamController = null
+
+  const refreshSoon = () => {
+    if (refreshTimer !== null) return
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null
+      if (document.visibilityState !== "visible") {
+        statesAt = 0 // the poll re-reads when the tab comes back
+        return
+      }
+      void loadStates().then(() => sortInbox())
+    }, REFRESH_MS)
+  }
+
+  // A level change needs no HTTP read: the event carries the same title or
+  // metadata the list would return.
+  const applyEvent = (type, data) => {
+    if (
+      (type === "session.renamed" || type === "session.metadata.updated") &&
+      data &&
+      data.sessionID === state.id
+    ) {
+      const level =
+        type === "session.metadata.updated"
+          ? (readState(data.metadata) || {}).level || "normal"
+          : levelOf(data.title)
+      if (!state.busy && level !== state.level) {
+        state.level = level
+        render(state)
+      }
+    }
+    refreshSoon()
+  }
+
+  const listen = async () => {
+    if (!INBOX_UI || streamController) return
+    const controller = new AbortController()
+    streamController = controller
+    try {
+      // `types` is a repeated query parameter; a comma-separated list is
+      // rejected as one unknown type.
+      const query = EVENT_TYPES.map((type) => `types=${encodeURIComponent(type)}`).join("&")
+      const response = await api(`/api/event?${query}`, { signal: controller.signal })
+      if (!response.ok || !response.body) throw new Error(`event ${response.status}`)
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ""
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let end
+        while ((end = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, end)
+          buffer = buffer.slice(end + 2)
+          const line = /^data: (.*)$/m.exec(frame)
+          if (!line) continue // a heartbeat, not an event
+          try {
+            const event = JSON.parse(line[1])
+            applyEvent(event && event.type, event && event.data)
+          } catch {
+            refreshSoon()
+          }
+        }
+      }
+    } catch {
+      // The stream closed with the page or the server went away.
+    } finally {
+      if (streamController === controller) streamController = null
+    }
+    if (!streamController) setTimeout(() => void listen(), RETRY_MS)
   }
 
   const ROUTE = /^\/server\/[^/]+\/session\/([^/?#]+)/
@@ -458,8 +578,10 @@
     }
   }
 
-  // The pill hides itself when the server part is off (`priorityEnabled: false`
-  // registers no command), the same way the desktop pill does.
+  // The pill hides itself only when the server *answered* that `/prio` is not
+  // registered (`priorityEnabled: false`); an unreachable or still-starting
+  // server hides nothing. A failed probe is not cached, so the next refresh
+  // runs it again — the same rule as the desktop pill.
   const known = new Map()
   const commandExists = async (directory) => {
     if (!COMMAND) return true
@@ -713,6 +835,8 @@
     if (INBOX_UI) {
       void loadStates().then(() => sortInbox())
       sortInbox()
+      // The stream is the fast path; the poll below remains the fallback.
+      void listen()
     }
     setInterval(() => {
       if (document.visibilityState === "visible") {

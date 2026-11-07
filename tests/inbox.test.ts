@@ -7,7 +7,7 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import test from "node:test"
 
-import { applyInboxView, BADGE_CLASS, inboxLevel, type InboxRowData } from "../src/inbox.ts"
+import { applyInboxView, BADGE_CLASS, inboxLevel, startInboxView, type InboxRowData } from "../src/inbox.ts"
 
 type Fake = {
   children: Fake[]
@@ -188,7 +188,7 @@ test("a waiting row shows how long it waits, in words and without a title change
   assert.match(badgeOf(waiting)!.title, /waiting 2 h 5 min/)
 })
 
-test("a badge is drawn only where there is something to say", () => {
+test("a working row always says something: a place in the queue, or that it is not queued", () => {
   const doc = document()
   const high = row(doc, "high")
   const ordinary = row(doc, "ordinary")
@@ -208,23 +208,44 @@ test("a badge is drawn only where there is something to say", () => {
   const highBadge = badgeOf(high)
   assert.ok(highBadge, "the high row has a badge")
   assert.equal(highBadge.dataset.level, "high")
+  assert.equal(highBadge.dataset.idle, "false")
   assert.match(highBadge.innerHTML, /2\/5/)
   assert.match(highBadge.title, /высокий приоритет/)
   assert.match(highBadge.title, /2\/5 в очереди/)
 
-  assert.equal(badgeOf(ordinary), undefined, "an ordinary row without a place stays clean")
+  // The row is in the Working section, so it is running; with no place to show,
+  // it says exactly that instead of staying silent.
+  const ordinaryBadge = badgeOf(ordinary)
+  assert.ok(ordinaryBadge, "a working row without a place still has a badge")
+  assert.equal(ordinaryBadge.dataset.idle, "true")
+  assert.match(ordinaryBadge.innerHTML, /в работе/)
+  assert.match(ordinaryBadge.title, /не ждёт движок/)
 
   const cloudBadge = badgeOf(cloud)
   assert.ok(cloudBadge)
   assert.equal(cloudBadge.dataset.cloud, "true")
+  assert.equal(cloudBadge.dataset.idle, "false")
   assert.match(cloudBadge.title, /облачная модель/)
 
   highBadge.onclick?.({ preventDefault() {}, stopPropagation() {} })
   assert.deepEqual(clicked, ["ses_high"])
 
-  // Clearing the state removes the badge again.
-  applyInboxView(root as unknown as ParentNode, [{ id: "ses_high", title: "high", state: state("normal") }])
-  assert.equal(badgeOf(high), undefined)
+  // Once a place appears, the idle badge becomes the queue badge on the same
+  // element — no remount, so the row does not flicker.
+  const since = 1_700_000_000_000
+  applyInboxView(
+    root as unknown as ParentNode,
+    [
+      { id: "ses_high", title: "high", state: state("high", { position: 2, total: 5 }) },
+      { id: "ses_ordinary", title: "ordinary", state: { level: "normal", position: 3, total: 5, since } },
+      { id: "ses_cloud", title: "cloud", state: state("normal", { cloud: true }) },
+    ],
+    undefined,
+    since + 60_000,
+  )
+  assert.equal(ordinaryBadge.dataset.idle, "false")
+  assert.match(ordinaryBadge.innerHTML, /3\/5/)
+  assert.match(ordinaryBadge.innerHTML, /1 мин/)
 })
 
 test("the view tolerates a section without rows and a missing section", () => {
@@ -233,6 +254,78 @@ test("the view tolerates a section without rows and a missing section", () => {
   assert.equal(applyInboxView(root as unknown as ParentNode, []), false)
   assert.equal(applyInboxView(node() as unknown as ParentNode, []), false)
   assert.equal(doc.styles.length, 0, "nothing is injected when there is nothing to draw")
+})
+
+test("an event re-reads the rows at once instead of waiting for the poll", async () => {
+  const doc = document()
+  const high = row(doc, "high")
+  const { root } = mount([high])
+
+  let loads = 0
+  let refresh: (() => void) | undefined
+  const stop = startInboxView({
+    intervalMs: 5,
+    reloadMs: 60_000,
+    refreshDebounceMs: 0,
+    root: () => root as unknown as ParentNode,
+    visible: () => true,
+    load: async () => {
+      loads += 1
+      return [{ id: "ses_high", title: "high", state: state("high", { position: loads, total: 5 }) }]
+    },
+    watch: (fn) => {
+      refresh = fn
+      return () => {}
+    },
+  })
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(loads, 1, "the first tick reads once")
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(loads, 1, "the poll waits for reloadMs")
+
+    refresh?.()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(loads, 2, "the event cuts the poll short")
+    const badge = high.firstElementChild?.children.find((child) => child.className === BADGE_CLASS)
+    assert.match(badge?.innerHTML ?? "", /2\/5/, "the re-read landed on the row")
+  } finally {
+    stop()
+  }
+})
+
+test("a burst of events becomes one read", async () => {
+  const doc = document()
+  const high = row(doc, "high")
+  const { root } = mount([high])
+
+  let loads = 0
+  let refresh: (() => void) | undefined
+  const stop = startInboxView({
+    intervalMs: 1_000,
+    reloadMs: 60_000,
+    refreshDebounceMs: 20,
+    root: () => root as unknown as ParentNode,
+    visible: () => true,
+    load: async () => {
+      loads += 1
+      return [{ id: "ses_high", title: "high", state: state("high", { position: 1, total: 5 }) }]
+    },
+    watch: (fn) => {
+      refresh = fn
+      return () => {}
+    },
+  })
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(loads, 1)
+    // One queue change rewrites every waiter, so the stream delivers a burst.
+    for (let index = 0; index < 5; index += 1) refresh?.()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    assert.equal(loads, 2, "five events read once")
+  } finally {
+    stop()
+  }
 })
 
 test("the Tampermonkey script reads the same metadata and draws the same badge", () => {
@@ -245,4 +338,9 @@ test("the Tampermonkey script reads the same metadata and draws the same badge",
   assert.match(source, /tl-badge/)
   assert.match(source, /\/api\/session/)
   assert.match(source, /metadata/)
+  // The idle badge and the event-driven refresh match the GUI half.
+  assert.match(source, /data-idle="true"/)
+  assert.match(source, /в работе/)
+  assert.match(source, /\/api\/event/)
+  assert.match(source, /session\.metadata\.updated/)
 })

@@ -41,6 +41,8 @@ export type InboxViewOptions = {
   intervalMs?: number
   /** How often the rows' states are re-read from the loader. */
   reloadMs?: number
+  /** How long a burst of events waits before it becomes one read. */
+  refreshDebounceMs?: number
   /** The document (or a test double) to look in. */
   root?: () => ParentNode | null
   /** Skip work while the tab is hidden. */
@@ -51,6 +53,9 @@ export type InboxViewOptions = {
   cycle?: (row: InboxRowData) => void
   /** The language of the badge text; reactive so a language switch redraws. */
   lang?: () => Lang
+  /** A live stream of changes: it is handed a function that re-reads the rows
+   *  at once, instead of waiting for the next poll. Returns its own cleanup. */
+  watch?: (refresh: () => void) => () => void
 }
 
 const WORKING = '[data-slot="sidebar-inbox-working"]'
@@ -82,6 +87,12 @@ export const BADGE_CSS = `
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-level="high"] { color: #f59e0b; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-level="low"] { color: #94a3b8; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-cloud="true"] { color: #38bdf8; }
+[data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-idle="true"] {
+  color: #94a3b8;
+  border-style: dashed;
+  background: transparent;
+  font-weight: 500;
+}
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}[data-holding="true"] { border-color: #22c55e; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS} .tl-hold { color: #22c55e; display: inline-flex; align-items: center; gap: 3px; }
 [data-slot="sidebar-inbox-item"] .${BADGE_CLASS}:hover { filter: brightness(1.25); }
@@ -97,20 +108,37 @@ const ICON = {
   clock:
     '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="8" r="5.6"/><path d="M8 4.9V8l2.2 1.4"/></svg>',
   hold: '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="3.6"/></svg>',
+  idle: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="8" r="5"/></svg>',
 } as const
 
 const WORDS = {
-  ru: { cloud: "облачная модель", high: "высокий приоритет", low: "низкий приоритет", place: (p: string) => `${p} в очереди` },
-  en: { cloud: "cloud model", high: "high priority", low: "low priority", place: (p: string) => `${p} in queue` },
+  ru: {
+    cloud: "облачная модель",
+    high: "высокий приоритет",
+    low: "низкий приоритет",
+    place: (p: string) => `${p} в очереди`,
+    idle: "в работе",
+    idleHint: "работает, но не ждёт движок: место в очереди появится на следующем запросе модели",
+  },
+  en: {
+    cloud: "cloud model",
+    high: "high priority",
+    low: "low priority",
+    place: (p: string) => `${p} in queue`,
+    idle: "working",
+    idleHint: "running but not waiting for the engine: a queue place appears at its next model request",
+  },
 } as const
 
 /**
  * Human-readable description of a state, used as the badge's tooltip. The wait
  * is spelled out here in full ("ждёт 9 минут") while the badge itself only has
- * room for the short form ("9 мин").
+ * room for the short form ("9 мин"). An idle row — a working session with no
+ * place yet — says why it has none.
  */
-export function describeState(state: TurnLockState, now = Date.now(), lang: Lang = "ru"): string {
+export function describeState(state: TurnLockState, now = Date.now(), lang: Lang = "ru", idle = false): string {
   const words = WORDS[lang]
+  if (idle) return words.idleHint
   const parts: string[] = []
   if (state.cloud) parts.push(words.cloud)
   if (state.level === "high") parts.push(words.high)
@@ -121,7 +149,8 @@ export function describeState(state: TurnLockState, now = Date.now(), lang: Lang
   return parts.join(" · ")
 }
 
-/** A row needs a badge only when it has something to say. */
+/** Whether the state itself has something to say. A row in the Working section
+ *  always gets a badge; without this it says "working, not queued". */
 function hasBadge(state: TurnLockState | undefined): state is TurnLockState {
   if (!state) return false
   return (
@@ -133,7 +162,8 @@ function hasBadge(state: TurnLockState | undefined): state is TurnLockState {
   )
 }
 
-function badgeHtml(state: TurnLockState, now: number, lang: Lang): string {
+function badgeHtml(state: TurnLockState, now: number, lang: Lang, idle = false): string {
+  if (idle) return `${ICON.idle}<span>${WORDS[lang].idle}</span>`
   const icons = `${state.cloud ? ICON.cloud : ""}${state.level === "high" ? ICON.high : state.level === "low" ? ICON.low : ""}`
   const place = state.position !== undefined && state.total !== undefined ? `${state.position}/${state.total}` : ""
   // The wait is the one part that changes on its own, so it is drawn from the
@@ -232,28 +262,27 @@ export function applyInboxView(
     }
 
     const state = entry.state
-    if (!hasBadge(state)) {
-      const stale = badges.get(entry.element)
-      if (stale) {
-        stale.remove()
-        badges.delete(entry.element)
-        changed = true
-      }
-      return
-    }
+    // Every row here is in the Working section, so it is a running session. A
+    // state with nothing to say (no place, no hold, no level, no cloud) still
+    // says that: the row is working and not queued — its place appears at its
+    // next model request, which is where the gate is.
+    const idle = !hasBadge(state)
+    const view: TurnLockState = state ?? { level: "normal" }
 
     const badge = badges.get(entry.element) ?? mountBadge(entry.element, doc)
-    const html = badgeHtml(state, now, lang)
+    const html = badgeHtml(view, now, lang, idle)
     if (badge.innerHTML !== html) {
       badge.innerHTML = html
       changed = true
     }
-    const cloud = state.cloud ? "true" : "false"
-    if (badge.dataset.level !== state.level) badge.dataset.level = state.level
+    const cloud = view.cloud ? "true" : "false"
+    if (badge.dataset.level !== view.level) badge.dataset.level = view.level
     if (badge.dataset.cloud !== cloud) badge.dataset.cloud = cloud
-    const holding = state.holding !== undefined ? "true" : "false"
+    const holding = view.holding !== undefined ? "true" : "false"
     if (badge.dataset.holding !== holding) badge.dataset.holding = holding
-    badge.title = describeState(state, now, lang)
+    const idleFlag = idle ? "true" : "false"
+    if (badge.dataset.idle !== idleFlag) badge.dataset.idle = idleFlag
+    badge.title = describeState(view, now, lang, idle)
     badge.onclick = (event: Event) => {
       event.preventDefault()
       event.stopPropagation()
@@ -274,42 +303,80 @@ export function startInboxView(options: InboxViewOptions = {}): () => void {
   const visible =
     options.visible ?? (() => typeof document === "undefined" || document.visibilityState === "visible")
 
-  // A state change is a metadata write, not a stream, so re-reading the list
-  // once every `reloadMs` is enough — and the read is skipped while the section
-  // is not on screen, so a session route costs nothing.
+  // A state change is a metadata write, not a stream, so the poll is only the
+  // fallback: a subscribed event re-reads at once, and a burst of writes (one
+  // queue change rewrites every waiter) is coalesced into a single read.
   const reloadMs = options.reloadMs ?? 2_000
+  const debounceMs = options.refreshDebounceMs ?? 120
   const lang = options.lang ?? (() => "ru" as const)
   let rows: readonly InboxRowData[] = []
   let loading = false
   let attemptedAt = 0
-  const tick = () => {
-    if (!visible()) return
-    const node = root()
-    if (!node) return
-    applyInboxView(node, rows, options.cycle, Date.now(), lang())
+  let again = false
+  let pending: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+
+  const read = () => {
     if (!options.load || loading) return
-    if (!node.querySelector(WORKING)) return
-    if (attemptedAt !== 0 && Date.now() - attemptedAt < reloadMs) return
+    const node = root()
+    if (!node || !node.querySelector(WORKING)) return
     loading = true
     attemptedAt = Date.now()
     options
       .load()
       .then((next) => {
         rows = next
-        const again = root()
-        if (again) applyInboxView(again, rows, options.cycle, Date.now(), lang())
+        const current = root()
+        if (current) applyInboxView(current, rows, options.cycle, Date.now(), lang())
       })
       .catch(() => {
         // A failed read keeps the last known state; the next tick retries.
       })
       .finally(() => {
         loading = false
+        if (again) {
+          again = false
+          read()
+        }
       })
   }
 
+  const tick = () => {
+    if (!visible()) return
+    const node = root()
+    if (!node) return
+    applyInboxView(node, rows, options.cycle, Date.now(), lang())
+    if (attemptedAt !== 0 && Date.now() - attemptedAt < reloadMs) return
+    read()
+  }
+
+  // The fast path. An event means the rows are stale now, so the poll's window
+  // is cut short; the debounce turns the burst from one queue change into one
+  // read, and a read already in flight schedules exactly one more.
+  const refresh = () => {
+    if (stopped || pending !== undefined) return
+    pending = setTimeout(() => {
+      pending = undefined
+      if (loading) {
+        again = true
+        return
+      }
+      attemptedAt = 0
+      tick()
+    }, debounceMs)
+    if (typeof (pending as { unref?: () => void }).unref === "function") (pending as { unref: () => void }).unref()
+  }
+
+  const unwatch = options.watch?.(refresh)
   tick()
   const timer = setInterval(tick, intervalMs)
   // A cosmetic sort must not keep a Node process alive (tests, CLI hosts).
   if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref()
-  return () => clearInterval(timer)
+  return () => {
+    stopped = true
+    clearInterval(timer)
+    if (pending !== undefined) clearTimeout(pending)
+    pending = undefined
+    unwatch?.()
+  }
 }

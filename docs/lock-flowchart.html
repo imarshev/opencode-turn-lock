@@ -1,0 +1,874 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>turn-lock — схема развилок</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #151b23;
+    --panel-2: #1b2330;
+    --line: #263041;
+    --text: #dbe3ee;
+    --dim: #8b98ab;
+    --green: #3ecf8e;
+    --amber: #e8b04b;
+    --blue: #5aa9ff;
+    --violet: #a98cff;
+    --red: #ff7b7b;
+    --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: radial-gradient(1100px 500px at 15% -10%, #1a2333 0%, var(--bg) 60%);
+    color: var(--text);
+    font: 14px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 30;
+    padding: 12px 18px 10px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(14,17,22,.92);
+    backdrop-filter: blur(6px);
+  }
+  .head-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 16px; }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  h1 span { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 8px; }
+  .legend { margin-left: auto; display: flex; flex-wrap: wrap; gap: 10px; font-size: 11.5px; color: var(--dim); }
+  .legend i { font-style: normal; display: inline-flex; align-items: center; gap: 5px; }
+  .sw { width: 18px; height: 3px; border-radius: 2px; display: inline-block; }
+  .sw.start { background: var(--violet); } .sw.decision { background: var(--amber); }
+  .sw.action { background: var(--blue); } .sw.term { background: var(--green); }
+  .sw.note { background: #4a576d; }
+
+  .traces { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; align-items: center; }
+  .traces .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: #66738a; margin-right: 2px; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 5px 9px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  button:hover { background: #243044; border-color: #38465e; }
+  button.on { background: #221d3a; border-color: var(--violet); color: #ddd2ff; }
+  .caption { margin-top: 8px; font-size: 12.5px; color: #c3cede; min-height: 18px; }
+  .caption b { color: #fff; }
+  .caption .hint { color: #66738a; }
+
+  .canvas-wrap { overflow: auto; padding: 14px 18px 60px; }
+  .canvas { position: relative; width: 1260px; height: 2390px; margin: 0 auto; }
+  .canvas svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .canvas svg path { fill: none; stroke: #3a475c; stroke-width: 1.6; }
+  .canvas svg path.dash { stroke-dasharray: 5 5; }
+  .canvas svg path.on { stroke: var(--violet); stroke-width: 2.4; }
+  .canvas svg path.dim { opacity: .18; }
+  .canvas svg text {
+    font-family: var(--mono); font-size: 11px; fill: #8b98ab;
+    paint-order: stroke; stroke: var(--bg); stroke-width: 4px; stroke-linejoin: round;
+  }
+  .canvas svg text.on { fill: #d9ccff; }
+  .canvas svg text.dim { opacity: .25; }
+
+  .section {
+    position: absolute; left: 600px; width: 660px;
+    display: flex; align-items: baseline; gap: 10px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .14em; color: #66738a;
+    border-top: 1px dashed #1d2532; padding-top: 7px;
+  }
+  .section b { color: #9aa7ba; font-weight: 600; }
+  .section span { text-transform: none; letter-spacing: 0; color: #556176; font-size: 11.5px; }
+
+  .node {
+    position: absolute; z-index: 2;
+    background: var(--panel); border: 1px solid var(--line); border-left-width: 3px;
+    border-radius: 9px; padding: 8px 11px 9px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.25);
+    cursor: pointer; transition: opacity .18s, border-color .18s, transform .12s;
+  }
+  .node:hover { border-color: #45536c; }
+  .node:focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
+  .node.sel { border-color: var(--violet); box-shadow: 0 0 0 1px rgba(169,140,255,.35), 0 2px 14px rgba(0,0,0,.35); }
+  .node.dim { opacity: .22; }
+  .node .kind { font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase; color: #66738a; margin-bottom: 3px; }
+  .node .t { font-weight: 650; font-size: 13.5px; line-height: 1.3; }
+  .node .s { font-size: 11.5px; color: #9aa7ba; margin-top: 3px; }
+  .node .s code, .node .b code { font-family: var(--mono); font-size: 10.5px; color: #b8c4d6; }
+  .node ul.b { margin: 6px 0 0; padding-left: 16px; font-size: 11.5px; color: #b8c4d6; }
+  .node ul.b li { margin: 2px 0; }
+  .node .tag {
+    display: inline-block; margin-top: 6px; font-family: var(--mono); font-size: 10px;
+    padding: 1px 6px; border-radius: 20px; border: 1px solid var(--line); color: var(--dim);
+  }
+  .node.start { border-left-color: var(--violet); }
+  .node.decision { border-left-color: var(--amber); }
+  .node.action { border-left-color: var(--blue); }
+  .node.term { border-left-color: var(--green); }
+  .node.exit { border-left-color: var(--red); }
+  .node.note { border-left-color: #4a576d; border-style: dashed; background: #121821; }
+  .node.wait { border-left-color: var(--amber); background: #1a1a12; }
+
+  .drawer {
+    position: fixed; top: 0; right: 0; width: 410px; height: 100vh; z-index: 40;
+    background: #121821; border-left: 1px solid var(--line);
+    transform: translateX(102%); transition: transform .2s ease;
+    display: flex; flex-direction: column;
+  }
+  .drawer.open { transform: none; }
+  .drawer .dhead { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: flex-start; }
+  .drawer .dhead .kind { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: #66738a; }
+  .drawer .dhead h2 { margin: 2px 0 0; font-size: 15px; line-height: 1.3; }
+  .drawer .dbody { padding: 12px 16px 30px; overflow: auto; font-size: 12.5px; color: #c3cede; }
+  .drawer .dbody p { margin: 0 0 10px; }
+  .drawer .dbody .kv { margin: 0 0 10px; }
+  .drawer .dbody .kv .k { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #66738a; display: block; margin-bottom: 2px; }
+  .drawer .dbody code { font-family: var(--mono); font-size: 11px; color: #b8c4d6; background: #0f141c; border: 1px solid #1f2836; border-radius: 4px; padding: 0 3px; }
+  .drawer .dbody ul { margin: 4px 0 10px; padding-left: 16px; }
+  .drawer .dbody li { margin: 3px 0; }
+  .drawer .close { margin-left: auto; background: transparent; border: 1px solid var(--line); padding: 1px 8px; font-size: 15px; line-height: 1.4; }
+  .drawer .refs { font-family: var(--mono); font-size: 11px; color: #8b98ab; }
+  .drawer .refs div { padding: 2px 0; border-bottom: 1px solid #182030; }
+  .drawer .refs div:last-child { border-bottom: 0; }
+
+  .turncard {
+    margin: 0 18px 40px; max-width: 1224px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel); padding: 12px 16px; font-size: 12.5px; color: #c3cede;
+  }
+  .turncard h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
+  .turncard code { font-family: var(--mono); font-size: 11px; color: #b8c4d6; }
+  .turncard b { color: var(--text); }
+  @media (max-width: 900px) {
+    .drawer { width: 100vw; }
+    .canvas-wrap { padding-left: 8px; padding-right: 8px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="head-row">
+    <h1>turn-lock <span>развилки логики: что проверяется и в каком порядке</span></h1>
+    <div class="legend">
+      <i><span class="sw start"></span>старт</i>
+      <i><span class="sw decision"></span>развилка</i>
+      <i><span class="sw action"></span>действие</i>
+      <i><span class="sw term"></span>выход</i>
+      <i><span class="sw note"></span>заметка</i>
+    </div>
+  </div>
+  <div class="traces" id="traces">
+    <span class="lbl">показать путь</span>
+  </div>
+  <div class="caption" id="caption"><span class="hint">Клик по узлу — условие, ветки и ссылки на код. Кнопки сверху подсвечивают один путь по схеме.</span></div>
+</header>
+
+<div class="canvas-wrap">
+  <div class="canvas" id="canvas">
+    <svg id="wires" viewBox="0 0 1260 2390" preserveAspectRatio="none"></svg>
+  </div>
+</div>
+
+<div class="turncard">
+  <h3>Чем отличается <code>lockScope: "turn"</code></h3>
+  <div>
+    Вход и взятие слота те же, но границей служит весь ход: <code>session.step.ended</code> / <code>.failed</code>
+    игнорируются (<code>src/index.ts:1587</code>), слот отпускается только на <code>session.idle</code>,
+    <code>execution.*</code>, <code>deleted</code>, <code>archived</code>, <code>inbox.cancelled</code>, <code>form</code>,
+    <code>permission</code>. Вместо тикетов возврата работает мягкая уступка: держатель, увидев в очереди более
+    высокий уровень, отдаёт слот и встаёт заново (<code>src/index.ts:1443</code>). Подagents получают
+    <code>covered</code> / <code>exempt</code> от родителя (<code>resolveGate</code>). Цена — сессия держит движок
+    между шагами, зато кэш контекста не вытесняется.
+  </div>
+</div>
+
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="dhead">
+    <div>
+      <div class="kind" id="dKind">узел</div>
+      <h2 id="dTitle">—</h2>
+    </div>
+    <button class="close" id="dClose" title="закрыть">×</button>
+  </div>
+  <div class="dbody" id="dBody"></div>
+</aside>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------- layout
+  const COL = { A: 40, B: 490, C: 910 };
+  const W = { A: 330, B: 320, C: 310 };
+
+  const NODES = [
+    // ---------------------------------------------------------- 1. вход
+    {
+      id: "s_start", col: "A", y: 30, h: 58, kind: "start", label: "старт",
+      title: "Хук context",
+      sub: "перед каждым запросом к модели",
+      why: "Движок вызывает хук прямо перед отправкой запроса — и первого, и продолжения после инструментов. Пока колбэк не вернулся, запрос не уходит: это единственная точка, где можно придержать запрос, не ломая ход.",
+      refs: ["src/index.ts:1372 — ctx.session.hook(\"context\", …)", "src/index.ts:1369 — хук обслуживает только агентский цикл"],
+      yes: "запрос локальный → проверить провайдера",
+    },
+    {
+      id: "d_local", col: "A", y: 124, h: 80, kind: "decision", label: "развилка",
+      title: "Провайдер локальный?",
+      sub: "localProviders или loopback baseURL",
+      why: "Гейтятся только локальные модели: у локального движка один слот на запрос. Облако масштабируется само, его сессии не должны стоять в очереди.",
+      refs: [
+        "src/index.ts:194 — localProviders: [\"strata\"]",
+        "src/index.ts:423 — isLocalBaseUrl: 127.0.0.1, localhost, ::1, 0.0.0.0, 127.x.x.x",
+        "src/index.ts:1358 — неизвестный провайдер считается облаком",
+      ],
+      yes: "да → к выбору границы",
+      no: "нет → выход без лиза",
+    },
+    {
+      id: "term_cloud", col: "C", y: 124, h: 66, kind: "term", label: "выход",
+      title: "Выход: облако не гейтится",
+      sub: "сессия помечается cloud",
+      why: "Хук возвращается сразу, лиза нет, очередь не растёт. Флаг cloud пишется в метаданные и (при titleMarks: all) в заголовок — UI рисует такую сессию отдельно.",
+      refs: ["src/index.ts:1391-1394"],
+      yes: "конец",
+    },
+    {
+      id: "d_scope", col: "A", y: 242, h: 80, kind: "decision", label: "развилка",
+      title: "lockScope?",
+      sub: "request (по умолчанию) | turn",
+      why: "Решает, что покрывает слот: один запрос к модели или весь ход. От этого зависит, где слот отпускается и нужны ли тикеты возврата.",
+      refs: ["src/index.ts:208 — lockScope: \"request\"", "src/index.ts:1587 — в turn step-события игнорируются"],
+      yes: "request → подготовка шага",
+      no: "turn → другая граница (карточка внизу)",
+    },
+    {
+      id: "note_turn", col: "C", y: 242, h: 118, kind: "note", label: "ветка",
+      title: "turn: слот на весь ход",
+      sub: "step-события не отпускают",
+      why: "Слот живёт до session.idle / execution.* / deleted / archived / inbox.cancelled / form / permission. Вместо тикетов — мягкая уступка: держатель отдаёт слот, если в очереди есть более высокий уровень.",
+      refs: ["src/index.ts:1443-1453 — yield", "src/index.ts:1588-1590 — step игнорируется"],
+    },
+    {
+      id: "n_req", col: "A", y: 360, h: 122, kind: "action", label: "действие",
+      title: "Подготовка request-шага",
+      sub: "две проверки до очереди",
+      why: "Если этот инстанс уже считает, что держит лиз, а пришёл новый context без step-события — прошлый запрос кончился: лиз снимается и выдаётся тикет. Если родитель (или другой предок) держит слот, ребёнок едет на нём: свой лиз не нужен, иначе родитель ждёт ребёнка, а ребёнок — слот.",
+      refs: [
+        "src/index.ts:1401-1411 — held.has(sid) → release + ticket",
+        "src/index.ts:1417-1426 — coveredBy(sid) → covered",
+      ],
+      yes: "лиз снят → брать заново; покрыт родителем → выход",
+    },
+    {
+      id: "term_covered", col: "C", y: 360, h: 72, kind: "term", label: "выход",
+      title: "covered: едет на слоте родителя",
+      sub: "lock.refresh(parent), слот не тратится",
+      why: "Ребёнок не встаёт в очередь и не занимает второй слот. Родительский лиз продлевается (seen = now), чтобы он не выглядел мёртвым, пока ребёнок работает.",
+      refs: ["src/index.ts:1418-1425"],
+    },
+
+    // --------------------------------------------------------- 2. очередь
+    {
+      id: "d_cancel", col: "A", y: 516, h: 78, kind: "decision", label: "развилка",
+      title: "Ожидание отменено?",
+      sub: "cancelWait: idle, deleted, inbox.cancelled",
+      why: "Отмена ставит метку на cancelTtlMs (не меньше двух опросов). Проверяется в начале каждого витка цикла, чтобы брошенная сессия не забрала слот, когда он освободится.",
+      refs: ["src/index.ts:1629 — lock.cancelWait", "src/core.ts:205-208 — проверка в цикле"],
+      yes: "да → выход из очереди",
+      no: "нет → проверить лиз",
+    },
+    {
+      id: "term_cancel", col: "C", y: 516, h: 64, kind: "exit", label: "выход",
+      title: "Ожидание снято",
+      sub: "granted: false, reason: cancelled",
+      why: "Хук возвращается, запрос к модели не уходит. Заголовок и метаданные очищаются.",
+      refs: ["src/core.ts:206-207"],
+    },
+    {
+      id: "d_lease", col: "A", y: 620, h: 78, kind: "decision", label: "развилка",
+      title: "Лиз уже есть?",
+      sub: "повторный вход в acquire",
+      why: "Если лиз на эту сессию уже лежит в сторе, acquire просто обновляет seen и возвращает granted. Это не новый grant: счётчик grants не растёт, тикет не снимается.",
+      refs: ["src/core.ts:211-215"],
+      yes: "да → re-acquire без нового grant",
+      no: "нет → проверка очереди",
+    },
+    {
+      id: "term_reacquire", col: "C", y: 620, h: 72, kind: "term", label: "выход",
+      title: "Re-acquire",
+      sub: "seen = now, grants не меняется",
+      why: "Так выглядит продолжение того же держания: слот уже за сессией, очередь не двигается.",
+      refs: ["src/core.ts:211-215"],
+    },
+    {
+      id: "d_holdback", col: "A", y: 724, h: 196, kind: "decision", label: "развилка",
+      title: "holdsBack? Слот зарезервирован?",
+      sub: "три причины подождать, даже если слот свободен",
+      lines: [
+        "1. Есть ждущий более высокого уровня (⚡ обгоняет).",
+        "2. Тикет возврата не поднят: grants ≤ releasedGrants, и есть кому отдать слот.",
+        "3. Впереди в своём уровне, и FIFO-окно ещё не истекло.",
+      ],
+      why: "Свободный слот — не значит доступный. Уровень: ⚡ > обычный > ▽. Тикет: пока слот не выдали другому, возвращаться некуда — иначе слот пинг-понгом вернётся к той же сессии. FIFO: каждое место впереди даёт fifoGraceMs (не меньше 2×pollMs = 400 мс), чтобы голова успела проснуться; зависшая голова не держит слот дольше окна.",
+      refs: [
+        "src/index.ts:908-935 — holdsBack",
+        "src/index.ts:911 — outranking: уровень выше",
+        "src/index.ts:917-925 — тикет не поднят + есть не-defer ждущий",
+        "src/index.ts:926-934 — FIFO: ahead × max(fifoGraceMs, 2×pollMs)",
+        "src/priority.ts:112-122 — beforeInLevel",
+      ],
+      yes: "да → ждать",
+      no: "нет → проверить лимит",
+    },
+    {
+      id: "n_wait", col: "B", y: 724, h: 96, kind: "wait", label: "ожидание",
+      title: "Ждать: sleep(pollMs)",
+      sub: "200 мс, затем новый виток",
+      why: "Сессия не блокирует процесс: она спит pollMs и заново читает общий стор. Пока ждёт, ей пишется метка в заголовок/метаданные (⏳ место из N и время), обновляемая раз в remindEveryMs. Ждать можно до acquireTimeoutMs = 16 ч.",
+      refs: [
+        "src/core.ts:241 — await sleep(pollMs)",
+        "src/index.ts:209 — pollMs: 200",
+        "src/index.ts:981-1030 — markWaiting",
+      ],
+      yes: "→ снова проверка отмены",
+    },
+    {
+      id: "d_full", col: "A", y: 960, h: 82, kind: "decision", label: "развилка",
+      title: "Живых лизов ≥ limit?",
+      sub: "limit = 1, лиз жив, пока свежий",
+      why: "Считаются только свежие лизы: если seen не обновлялся дольше leaseTimeoutMs (2 ч), лиз считается мёртвым и вычищается. Это защита от процесса, который умер, не отпустив слот.",
+      refs: ["src/core.ts:172-173", "src/core.ts:137 — isExpired", "src/index.ts:204 — leaseTimeoutMs: 2 ч"],
+      yes: "да → проверить таймаут",
+      no: "нет → писать лиз",
+    },
+    {
+      id: "d_timeout", col: "B", y: 960, h: 112, kind: "decision", label: "развилка",
+      title: "Ждём ≥ acquireTimeoutMs?",
+      sub: "16 ч; onTimeout: proceed | hold",
+      why: "Аварийный клапан, а не штатный путь: сессия ждёт очередь честно, но не бесконечно. Через 16 ч при proceed она берёт over-лиз сверх лимита, чтобы мёртвый держатель не заклинил агент. hold — продолжать ждать.",
+      refs: [
+        "src/index.ts:202-203 — 16 ч, proceed",
+        "src/core.ts:227-231 — over-лиз + событие timeout",
+      ],
+      yes: "истекло → over-limit лиз",
+      no: "нет → ждать дальше",
+    },
+    {
+      id: "term_over", col: "C", y: 960, h: 82, kind: "exit", label: "выход",
+      title: "Over-limit лиз",
+      sub: "over: true, движок получает два запроса",
+      why: "Лиз пишется с флагом over и не считается обычным grant. В трассе видно timeout и grant с overLimit: true — это сигнал, что кто-то держал слот слишком долго.",
+      refs: ["src/core.ts:228-231", "src/index.ts:1173 — overLimit в событии"],
+    },
+    {
+      id: "n_take", col: "A", y: 1084, h: 92, kind: "action", label: "действие",
+      title: "Записать лиз",
+      sub: "since + джиттер, seen, pid, owner",
+      why: "Запись атомарная (tmp + rename). since получает субмиллисекундный джиттер — детерминированный тай-брейк между процессами, которые пишут в одну миллисекунду.",
+      refs: ["src/core.ts:174-183"],
+    },
+    {
+      id: "d_post", col: "A", y: 1208, h: 86, kind: "decision", label: "развилка",
+      title: "После записи лизов ≤ limit?",
+      sub: "пост-проверка гонки",
+      why: "Два процесса могли записать лиз одновременно. Проигравший снимает свой лиз и продолжает ждать. onTake (grants++) срабатывает только на новом лизе — не на re-acquire и не на over-limit.",
+      refs: ["src/core.ts:189-197", "src/core.ts:84 — onTake", "src/index.ts:1344 — onTake: bumpGrants"],
+      yes: "да → слот выдан",
+      no: "нет → снять свой лиз и ждать",
+    },
+    {
+      id: "n_unlucky", col: "B", y: 1208, h: 82, kind: "action", label: "действие",
+      title: "Проиграл гонку",
+      sub: "удалить свой лиз, вернуться в ожидание",
+      why: "Лимит остаётся честным: в сторе не может оказаться больше limit живых лизов, даже если два процесса стартовали одновременно.",
+      refs: ["src/core.ts:196-197"],
+    },
+    {
+      id: "n_grant", col: "A", y: 1330, h: 98, kind: "action", label: "действие",
+      title: "GRANT",
+      sub: "onTake → grants++, тикет удалён",
+      why: "Слот выдан. onTake увеличивает общий счётчик grants в slot-free.json — это сигнал возвращенцам, что слот реально передан другому. Тикет сессии удаляется: право использовано. Метаданные получают holding, заголовок очищается.",
+      refs: ["src/index.ts:1471-1481", "src/index.ts:847-855 — bumpGrants", "src/index.ts:1480 — returnTickets.drop"],
+      yes: "хук возвращается",
+    },
+    {
+      id: "term_model", col: "C", y: 1330, h: 92, kind: "term", label: "выход",
+      title: "Запрос уходит в модель",
+      sub: "дальше — снова хук context",
+      why: "Хук возвращается, движок отправляет запрос. Слот живёт до конца этого запроса — до session.step.ended / .failed (request-скоуп).",
+      refs: ["src/index.ts:1471-1482"],
+    },
+    {
+      id: "note_order", col: "C", y: 1084, h: 160, kind: "note", label: "правило",
+      title: "Порядок очереди",
+      sub: "compareQueue",
+      lines: [
+        "1. Уровень: ⚡ high → обычный → ▽ low.",
+        "2. Внутри уровня: boost (по releasedAt).",
+        "3. Затем обычные — по createdAt.",
+        "4. Затем defer — в конце уровня.",
+        "5. При равенстве — по sid.",
+      ],
+      why: "Уровень решает всё: ⚡-ждущий обгоняет вернувшуюся сессию, созданную раньше. Внутри уровня возраст — абсолютное время создания сессии, поэтому вернувшаяся после инструментов не моложе тех, кто встал, пока она работала.",
+      refs: ["src/priority.ts:127-133 — compareQueue", "src/priority.ts:112-122 — beforeInLevel", "src/index.ts:940-945 — orderedWaiters"],
+    },
+
+    // ----------------------------------------------------- 3. освобождение
+    {
+      id: "j_event", col: "A", y: 1450, h: 44, kind: "note", label: "поток",
+      title: "Событие из потока движка",
+      sub: "ctx.event.subscribe",
+      why: "Поток общий на сервер: каждое событие видят все инстансы всех локаций. Поэтому отпускает только тот инстанс, который обслуживал запрос (held.has), — иначе один инстанс снял бы лиз, который держит другой.",
+      refs: ["src/index.ts:1518-1524 — subscribe", "src/index.ts:1592-1601 — held.has(sid)"],
+    },
+    {
+      id: "d_step", col: "A", y: 1544, h: 112, kind: "decision", label: "развилка",
+      title: "session.step.ended / .failed?",
+      sub: "request-скоуп и лиз держит этот инстанс",
+      lines: [
+        "turn-скоуп → игнор.",
+        "лиз чужой / уже снят → игнор.",
+      ],
+      why: "step.ended приходит в конце каждого запроса к модели. Это граница, на которой слот освобождается: инструменты и продолжение выполняются без движка.",
+      refs: ["src/index.ts:1587-1601"],
+      yes: "да → посмотреть finish",
+      no: "нет → терминальные события",
+    },
+    {
+      id: "d_finish", col: "A", y: 1684, h: 96, kind: "decision", label: "развилка",
+      title: "finish = tool-calls | length?",
+      sub: "шаг продолжится?",
+      why: "tool-calls — модель попросила инструменты; length — упёрлась в лимит токенов. В обоих случаях сессия вернётся с новым запросом, поэтому получает тикет. stop и остальные исходы — ход закончен, тикет не нужен.",
+      refs: ["src/index.ts:1602-1610"],
+      yes: "да → release + тикет",
+      no: "нет (stop) → release без тикета",
+    },
+    {
+      id: "n_release_ticket", col: "A", y: 1804, h: 102, kind: "action", label: "действие",
+      title: "release + тикет возврата",
+      sub: "<root>.turn.json, TTL 5 мин",
+      why: "Слот свободен сразу. Тикет записывает releasedAt, expiresAt = +5 мин и releasedGrants = текущий grants. Ключ — root сессии: сабагент читает тикет родителя. Запись атомарная.",
+      refs: [
+        "src/index.ts:1604-1610",
+        "src/tickets.ts:109-139 — write",
+        "src/index.ts:215 — returnTicketTtlMs: 5 мин",
+      ],
+      yes: "сессия вернётся новым context",
+    },
+    {
+      id: "n_release_plain", col: "B", y: 1804, h: 92, kind: "action", label: "действие",
+      title: "release без тикета",
+      sub: "возвращаться некуда",
+      why: "Ход закончен (stop): сессия больше не придёт в этом ходе, место в очереди ей не нужно.",
+      refs: ["src/index.ts:1604-1606"],
+    },
+    {
+      id: "d_term", col: "B", y: 1544, h: 118, kind: "decision", label: "развилка",
+      title: "Терминальное событие?",
+      sub: "idle, execution.*, deleted, archived, inbox.cancelled, form, permission",
+      why: "Терминальные события закрывают ход или сессию. form.created и permission.asked отпускают слот только при releaseOnForm / releaseOnPermission: агент ждёт человека, движок может обслужить другую сессию.",
+      refs: ["src/index.ts:253-265 — RELEASE_EVENTS", "src/index.ts:1539-1546 — releaseOnForm / releaseOnPermission"],
+      yes: "да → release + cancelWait",
+      no: "нет → ничего не делаем",
+    },
+    {
+      id: "n_term", col: "C", y: 1544, h: 128, kind: "action", label: "действие",
+      title: "release + cancelWait + drop ticket",
+      sub: "form / permission → тикет",
+      why: "Слот снимается, ожидание отменяется (если сессия стояла в очереди), тикет удаляется: ход закончился. Исключение — form/permission: ход продолжится после ответа человека, поэтому пишется тикет, как на границе шага.",
+      refs: ["src/index.ts:1620-1643"],
+    },
+    {
+      id: "d_ticket", col: "A", y: 1928, h: 96, kind: "decision", label: "развилка",
+      title: "Тикет возврата жив?",
+      sub: "TTL 5 мин, root-aware",
+      why: "Просроченный или битый тикет читается как отсутствующий и удаляется. Без тикета сессия встаёт в обычную очередь — по времени создания, которое не меняется.",
+      refs: ["src/tickets.ts:82-107 — read", "src/tickets.ts:68-71 — keyOf(root)"],
+      yes: "да → проверить grants",
+      no: "нет / истёк → обычная очередь",
+    },
+    {
+      id: "term_normal", col: "B", y: 1928, h: 82, kind: "term", label: "выход",
+      title: "Обычная очередь",
+      sub: "уровень → createdAt → sid",
+      why: "Возврат без тикета ничем не отличается от нового ожидания: место определяется уровнем и абсолютным временем создания сессии.",
+      refs: ["src/priority.ts:127-133"],
+    },
+    {
+      id: "d_grants", col: "A", y: 2046, h: 96, kind: "decision", label: "развилка",
+      title: "grants > releasedGrants?",
+      sub: "слот уже выдали другому?",
+      why: "Ключевая развилка возврата. grants — сколько раз слот выдавали кому-то с момента, как сессия его отпустила. Если никого не пустили, возвращаться некуда: слот всё ещё «её», и забрать его — значит отобрать у очереди. Если пустили — сессия была обойдена и получает право вернуться вперёд.",
+      refs: ["src/index.ts:884 — readGrants() > ticket.releasedGrants", "src/tickets.ts:124 — releasedGrants", "src/index.ts:847-855 — bumpGrants"],
+      yes: "да → boost",
+      no: "нет → defer",
+    },
+    {
+      id: "n_boost", col: "A", y: 2164, h: 96, kind: "term", label: "выход",
+      title: "boost: первым в уровне",
+      sub: "среди boost — по releasedAt",
+      why: "Сессия была обойдена, пока работала: теперь она встаёт в начало своего уровня. Кто раньше отпустил слот, тот раньше и вернётся. Уровень при этом не меняется: ⚡-ждущий всё равно выше.",
+      refs: ["src/index.ts:884", "src/priority.ts:112-122"],
+      yes: "слот свободен → берёт сразу",
+    },
+    {
+      id: "n_defer", col: "B", y: 2164, h: 110, kind: "wait", label: "ожидание",
+      title: "defer: в конце своего уровня",
+      sub: "не отбирает слот назад",
+      why: "Сессия вернулась раньше, чем слот выдали другому. Если бы она брала слот сразу, быстрый инструмент отбирал бы его у очереди — пинг-понг. Поэтому она ждёт первого grant другому. Двое defer не блокируют друг друга: holdsBack считает только не-defer ждущих, иначе они заклинили бы друг друга до 16 ч.",
+      refs: ["src/index.ts:917-925", "src/index.ts:882-886 — entry.defer"],
+      yes: "→ ждёт в очереди, как обычная",
+    },
+    {
+      id: "term_take", col: "C", y: 2280, h: 86, kind: "term", label: "выход",
+      title: "Берёт слот",
+      sub: "первый же виток опроса",
+      why: "Тикет удаляется при взятии слота: право использовано один раз.",
+      refs: ["src/index.ts:1480"],
+    },
+  ];
+
+  // ---------------------------------------------------------------- edges
+  const EDGES = [
+    { id: "e1", from: "s_start", to: "d_local" },
+    { id: "e2", from: "d_local", to: "term_cloud", kind: "r", label: "нет" },
+    { id: "e3", from: "d_local", to: "d_scope", kind: "v", label: "да" },
+    { id: "e4", from: "d_scope", to: "n_req", kind: "v", label: "request" },
+    { id: "e5", from: "d_scope", to: "note_turn", kind: "r", label: "turn" },
+    { id: "e6", from: "n_req", to: "term_covered", kind: "r", label: "родитель держит" },
+    { id: "e7", from: "n_req", to: "d_cancel", kind: "v", label: "свой слот" },
+    { id: "e8", from: "d_cancel", to: "term_cancel", kind: "r", label: "да" },
+    { id: "e9", from: "d_cancel", to: "d_lease", kind: "v", label: "нет" },
+    { id: "e10", from: "d_lease", to: "term_reacquire", kind: "r", label: "да" },
+    { id: "e11", from: "d_lease", to: "d_holdback", kind: "v", label: "нет" },
+    { id: "e12", from: "d_holdback", to: "n_wait", kind: "r", label: "да" },
+    { id: "e13", from: "d_holdback", to: "d_full", kind: "v", label: "нет" },
+    { id: "e14", from: "d_full", to: "d_timeout", kind: "r", label: "да: мест нет" },
+    { id: "e15", from: "d_full", to: "n_take", kind: "v", label: "нет: место есть" },
+    { id: "e16", from: "d_timeout", to: "term_over", kind: "r", label: "16 ч → over" },
+    { id: "e17", from: "d_timeout", to: "n_wait", kind: "up", dy: 12, label: "нет → ждать" },
+    { id: "e18", from: "n_take", to: "d_post", kind: "v" },
+    { id: "e19", from: "d_post", to: "n_unlucky", kind: "r", label: "нет: гонка" },
+    { id: "e20", from: "d_post", to: "n_grant", kind: "v", label: "да" },
+    { id: "e21", from: "n_grant", to: "term_model", kind: "r", label: "хук вернулся" },
+    { id: "e22", from: "n_wait", to: "d_cancel", kind: "loop", lane: 24, laneY: 942, dy: -6, label: "через 200 мс" },
+    { id: "e23", from: "n_unlucky", to: "d_cancel", kind: "loop", lane: 12, laneY: 1318, dy: 6 },
+    { id: "e24", from: "j_event", to: "d_step", kind: "v" },
+    { id: "e25", from: "j_event", to: "d_term", kind: "r", dash: true, label: "другой тип" },
+    { id: "e26", from: "d_step", to: "d_finish", kind: "v", label: "да" },
+    { id: "e27", from: "d_finish", to: "n_release_ticket", kind: "v", label: "да" },
+    { id: "e28", from: "d_finish", to: "n_release_plain", kind: "r", label: "нет: stop" },
+    { id: "e29", from: "n_release_ticket", to: "d_ticket", kind: "v", label: "вернётся" },
+    { id: "e30", from: "d_ticket", to: "d_grants", kind: "v", label: "жив" },
+    { id: "e31", from: "d_ticket", to: "term_normal", kind: "r", label: "нет / истёк" },
+    { id: "e32", from: "d_grants", to: "n_boost", kind: "v", label: "да" },
+    { id: "e33", from: "d_grants", to: "n_defer", kind: "r", label: "нет" },
+    { id: "e34", from: "n_boost", to: "term_take", kind: "r", label: "слот свободен" },
+    { id: "e35", from: "d_term", to: "n_term", kind: "r", label: "да" },
+  ];
+
+  const SECTIONS = [
+    { y: 0, n: "1", title: "Вход и подготовка", hint: "хук context, локальность провайдера, граница слота" },
+    { y: 484, n: "2", title: "Очередь и взятие слота", hint: "цикл ожидания: резерв, лимит, гонка, таймаут" },
+    { y: 1422, n: "3", title: "Освобождение и возврат", hint: "поток событий, тикет возврата, boost / defer" },
+  ];
+
+  const TRACES = [
+    {
+      id: "first", label: "Первый запрос",
+      caption: "Провайдер локальный, слот свободен, очередь пуста: лиз пишется сразу, grants++.",
+      nodes: ["s_start", "d_local", "d_scope", "n_req", "d_cancel", "d_lease", "d_holdback", "d_full", "n_take", "d_post", "n_grant", "term_model"],
+      edges: ["e1", "e3", "e4", "e7", "e9", "e11", "e13", "e15", "e18", "e20", "e21"],
+    },
+    {
+      id: "cloud", label: "Облако",
+      caption: "Облачная модель не гейтится: хук выходит сразу, лиза нет, очередь не растёт.",
+      nodes: ["s_start", "d_local", "term_cloud"],
+      edges: ["e1", "e2"],
+    },
+    {
+      id: "covered", label: "Сабагент",
+      caption: "Ребёнок внутри шага родителя едет на его слоте: свой лиз не нужен, иначе дедлок пары.",
+      nodes: ["s_start", "d_local", "d_scope", "n_req", "term_covered"],
+      edges: ["e1", "e3", "e4", "e6"],
+    },
+    {
+      id: "wait", label: "Ожидание",
+      caption: "Слот занят или впереди очередь: сессия спит pollMs и опрашивает стор заново — до 16 ч.",
+      nodes: ["s_start", "d_local", "d_scope", "n_req", "d_cancel", "d_lease", "d_holdback", "n_wait"],
+      edges: ["e1", "e3", "e4", "e7", "e9", "e11", "e12", "e22"],
+    },
+    {
+      id: "timeout", label: "Таймаут 16 ч",
+      caption: "Аварийный клапан: 16 ч ожидания → over-лиз сверх лимита, чтобы мёртвый держатель не заклинил агент.",
+      nodes: ["d_cancel", "d_lease", "d_holdback", "d_full", "d_timeout", "term_over"],
+      edges: ["e9", "e11", "e13", "e14", "e16"],
+    },
+    {
+      id: "handover", label: "Конец запроса",
+      caption: "step.ended с tool-calls: слот свободен сразу, сессии остаётся тикет с releasedGrants = grants.",
+      nodes: ["j_event", "d_step", "d_finish", "n_release_ticket", "d_ticket"],
+      edges: ["e24", "e26", "e27", "e29"],
+    },
+    {
+      id: "defer", label: "defer",
+      caption: "Вернулась раньше, чем слот выдали другому: defer — стоит в конце уровня и не отбирает слот назад.",
+      nodes: ["d_ticket", "d_grants", "n_defer", "n_wait"],
+      edges: ["e30", "e33"],
+    },
+    {
+      id: "boost", label: "boost",
+      caption: "После выдачи другому grants вырос → тикет поднят: boost, первое место в своём уровне.",
+      nodes: ["d_ticket", "d_grants", "n_boost", "term_take"],
+      edges: ["e30", "e32", "e34"],
+    },
+    {
+      id: "priority", label: "⚡ вне очереди",
+      caption: "⚡-ждущий обгоняет обычного: holdsBack (условие 1) держит его до освобождения слота.",
+      nodes: ["d_holdback", "n_wait"],
+      edges: ["e12"],
+    },
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const canvas = $("canvas");
+  const svg = $("wires");
+  const nodeEls = new Map();
+  let selected = null;
+  let activeTrace = null;
+
+  // ---------------------------------------------------------------- render
+  function renderSections() {
+    for (const sec of SECTIONS) {
+      const el = document.createElement("div");
+      el.className = "section";
+      el.style.top = sec.y + "px";
+      el.innerHTML = "<b>" + esc(sec.n) + "</b><b>" + esc(sec.title) + "</b><span>" + esc(sec.hint) + "</span>";
+      canvas.appendChild(el);
+    }
+  }
+
+  function renderNodes() {
+    for (const node of NODES) {
+      const el = document.createElement("div");
+      el.className = "node " + node.kind;
+      el.dataset.id = node.id;
+      el.style.left = COL[node.col] + "px";
+      el.style.top = node.y + "px";
+      el.style.width = W[node.col] + "px";
+      el.style.minHeight = node.h + "px";
+      el.tabIndex = 0;
+      el.setAttribute("role", "button");
+      el.innerHTML =
+        '<div class="kind">' + esc(node.label) + "</div>" +
+        '<div class="t">' + esc(node.title) + "</div>" +
+        (node.sub ? '<div class="s">' + esc(node.sub) + "</div>" : "") +
+        (node.lines ? '<ul class="b">' + node.lines.map((l) => "<li>" + esc(l) + "</li>").join("") + "</ul>" : "");
+      el.addEventListener("click", () => openNode(node.id));
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openNode(node.id); }
+      });
+      canvas.appendChild(el);
+      nodeEls.set(node.id, el);
+    }
+  }
+
+  const rectOf = (id) => {
+    const el = nodeEls.get(id);
+    return { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight };
+  };
+
+  function pathFor(edge) {
+    const a = rectOf(edge.from);
+    const b = rectOf(edge.to);
+    const ax = a.x + a.w / 2;
+    const bx = b.x + b.w / 2;
+    const ay = a.y + a.h;
+    const by = b.y;
+
+    if (!edge.kind || edge.kind === "v") {
+      if (Math.abs(ax - bx) < 1) return "M" + ax + "," + ay + " L" + bx + "," + by;
+      const mid = ay + Math.max(18, (by - ay) / 2);
+      return "M" + ax + "," + ay + " V" + mid + " H" + bx + " V" + by;
+    }
+    if (edge.kind === "r" || edge.kind === "l") {
+      const sx = edge.kind === "r" ? a.x + a.w : a.x;
+      const tx = edge.kind === "r" ? b.x : b.x + b.w;
+      const sy = a.y + a.h / 2;
+      const ty = b.y + b.h / 2;
+      const dir = edge.kind === "r" ? 1 : -1;
+      if (Math.abs(sy - ty) < 2) return "M" + sx + "," + sy + " H" + tx;
+      const bend = sx + dir * 26;
+      return "M" + sx + "," + sy + " H" + bend + " V" + ty + " H" + tx;
+    }
+    if (edge.kind === "up") {
+      const sx = a.x;
+      const sy = a.y + a.h / 2;
+      const lane = a.x - 30;
+      const tx = b.x;
+      const ty = b.y + b.h / 2 + (edge.dy || 0);
+      return "M" + sx + "," + sy + " H" + lane + " V" + ty + " H" + tx;
+    }
+    // loop: out of the bottom, along a lane on the left, up into the target's left edge
+    const sx = a.x + a.w / 2;
+    const sy = a.y + a.h;
+    const laneY = edge.laneY;
+    const tx = b.x;
+    const ty = b.y + b.h / 2 + (edge.dy || 0);
+    return (
+      "M" + sx + "," + sy +
+      " V" + laneY +
+      " H" + edge.lane +
+      " V" + ty +
+      " H" + tx
+    );
+  }
+
+  function labelPoint(edge) {
+    const a = rectOf(edge.from);
+    const b = rectOf(edge.to);
+    if (!edge.kind || edge.kind === "v") {
+      return { x: a.x + a.w / 2 + 8, y: a.y + a.h + 15, anchor: "start" };
+    }
+    if (edge.kind === "r") {
+      return { x: a.x + a.w + 14, y: a.y + a.h / 2 - 7, anchor: "start" };
+    }
+    if (edge.kind === "l") {
+      return { x: a.x - 14, y: a.y + a.h / 2 - 7, anchor: "end" };
+    }
+    if (edge.kind === "up") {
+      return { x: a.x - 26, y: (a.y + a.h / 2 + b.y + b.h / 2) / 2, anchor: "end" };
+    }
+    return { x: a.x - 20, y: edge.laneY - 6, anchor: "end" };
+  }
+
+  function renderEdges() {
+    svg.innerHTML = "";
+    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+    defs.innerHTML =
+      '<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
+      '<path d="M0,0 L10,5 L0,10 z" fill="#3a475c"></path></marker>' +
+      '<marker id="arrowOn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
+      '<path d="M0,0 L10,5 L0,10 z" fill="#a98cff"></path></marker>';
+    svg.appendChild(defs);
+
+    for (const edge of EDGES) {
+      const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("d", pathFor(edge));
+      p.setAttribute("marker-end", "url(#arrow)");
+      p.dataset.id = edge.id;
+      if (edge.dash) p.classList.add("dash");
+      svg.appendChild(p);
+
+      if (edge.label) {
+        const pt = labelPoint(edge);
+        const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        t.setAttribute("x", pt.x);
+        t.setAttribute("y", pt.y);
+        t.setAttribute("text-anchor", pt.anchor);
+        t.dataset.id = edge.id;
+        t.textContent = edge.label;
+        svg.appendChild(t);
+      }
+    }
+  }
+
+  // --------------------------------------------------------------- drawer
+  function openNode(id) {
+    const node = NODES.find((n) => n.id === id);
+    if (!node) return;
+    selected = id;
+    for (const [nid, el] of nodeEls) el.classList.toggle("sel", nid === id);
+    $("dKind").textContent = node.label;
+    $("dTitle").textContent = node.title;
+    const body = [];
+    if (node.sub) body.push("<p>" + esc(node.sub) + "</p>");
+    if (node.why) body.push("<p>" + esc(node.why) + "</p>");
+    if (node.yes || node.no) {
+      body.push('<div class="kv"><span class="k">ветки</span>');
+      if (node.yes) body.push("<div>✓ " + esc(node.yes) + "</div>");
+      if (node.no) body.push("<div>✕ " + esc(node.no) + "</div>");
+      body.push("</div>");
+    }
+    if (node.refs && node.refs.length) {
+      body.push('<div class="kv"><span class="k">где в коде</span><div class="refs">' +
+        node.refs.map((r) => "<div>" + esc(r) + "</div>").join("") + "</div></div>");
+    }
+    $("dBody").innerHTML = body.join("");
+    $("drawer").classList.add("open");
+    $("drawer").setAttribute("aria-hidden", "false");
+  }
+
+  function closeDrawer() {
+    $("drawer").classList.remove("open");
+    $("drawer").setAttribute("aria-hidden", "true");
+    selected = null;
+    for (const el of nodeEls.values()) el.classList.remove("sel");
+  }
+
+  // --------------------------------------------------------------- traces
+  function setTrace(id) {
+    const trace = TRACES.find((t) => t.id === id) || null;
+    activeTrace = trace ? trace.id : null;
+    const nodeSet = trace ? new Set(trace.nodes) : null;
+    const edgeSet = trace ? new Set(trace.edges) : null;
+
+    for (const [nid, el] of nodeEls) {
+      el.classList.toggle("dim", Boolean(nodeSet) && !nodeSet.has(nid));
+    }
+    for (const p of svg.querySelectorAll("path")) {
+      p.classList.toggle("on", Boolean(edgeSet) && edgeSet.has(p.dataset.id));
+      p.classList.toggle("dim", Boolean(edgeSet) && !edgeSet.has(p.dataset.id));
+      p.setAttribute("marker-end", edgeSet && edgeSet.has(p.dataset.id) ? "url(#arrowOn)" : "url(#arrow)");
+    }
+    for (const t of svg.querySelectorAll("text")) {
+      t.classList.toggle("on", Boolean(edgeSet) && edgeSet.has(t.dataset.id));
+      t.classList.toggle("dim", Boolean(edgeSet) && !edgeSet.has(t.dataset.id));
+    }
+    for (const b of $("traces").querySelectorAll("button[data-trace]")) {
+      b.classList.toggle("on", b.dataset.trace === activeTrace);
+    }
+    $("caption").innerHTML = trace
+      ? "<b>" + esc(trace.label) + ".</b> " + esc(trace.caption)
+      : '<span class="hint">Клик по узлу — условие, ветки и ссылки на код. Кнопки сверху подсвечивают один путь по схеме.</span>';
+    if (trace) {
+      const first = nodeEls.get(trace.nodes[0]);
+      if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }
+
+  function renderTraces() {
+    for (const trace of TRACES) {
+      const b = document.createElement("button");
+      b.dataset.trace = trace.id;
+      b.textContent = trace.label;
+      b.addEventListener("click", () => setTrace(activeTrace === trace.id ? null : trace.id));
+      $("traces").appendChild(b);
+    }
+    const reset = document.createElement("button");
+    reset.textContent = "показать всё";
+    reset.addEventListener("click", () => setTrace(null));
+    $("traces").appendChild(reset);
+  }
+
+  // ----------------------------------------------------------------- boot
+  renderSections();
+  renderNodes();
+  renderTraces();
+  $("dClose").addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+
+  // Fit the fixed 1260px canvas into the window: the whole diagram stays
+  // visible on a laptop, and the connectors keep their coordinates because
+  // `zoom` scales layout and paint together.
+  const fit = () => {
+    const wrap = document.querySelector(".canvas-wrap");
+    const avail = wrap.clientWidth - 36;
+    const z = Math.min(1, Math.max(0.6, avail / 1260));
+    canvas.style.zoom = String(z);
+  };
+  fit();
+  renderEdges();
+  window.addEventListener("resize", () => { fit(); renderEdges(); if (activeTrace) setTrace(activeTrace); });
+})();
+</script>
+</body>
+</html>

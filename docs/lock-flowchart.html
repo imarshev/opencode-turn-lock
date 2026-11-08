@@ -136,6 +136,50 @@
   .turncard h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
   .turncard code { font-family: var(--mono); font-size: 11px; color: #b8c4d6; }
   .turncard b { color: var(--text); }
+
+  /* ---------------------------------------------------------- glossary */
+  .glossary {
+    margin: 10px 18px 0; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel);
+  }
+  .glossary > summary {
+    cursor: pointer; list-style: none; padding: 9px 14px;
+    display: flex; align-items: center; gap: 10px;
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim);
+  }
+  .glossary > summary::-webkit-details-marker { display: none; }
+  .glossary > summary b { color: var(--text); font-weight: 600; }
+  .glossary > summary .cnt { text-transform: none; letter-spacing: 0; color: #5d6a80; font-size: 11px; }
+  .glossary > summary .arrow { margin-left: auto; color: #5d6a80; transition: transform .15s; }
+  .glossary[open] > summary .arrow { transform: rotate(90deg); }
+  .glossary .body { padding: 0 14px 12px; }
+  .glossary .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .glossary input {
+    flex: 1 1 240px; min-width: 160px; background: #0f141c; color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; font: inherit; font-size: 12px;
+  }
+  .glossary input:focus { outline: 2px solid rgba(169,140,255,.35); outline-offset: 1px; }
+  .glossary .hint { font-size: 11px; color: #5d6a80; }
+  .glossary .groups {
+    max-height: 268px; overflow: auto; margin-top: 9px;
+    display: flex; flex-direction: column; gap: 12px; padding-right: 4px;
+  }
+  .glossary h4 { margin: 0 0 6px; font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: #66738a; font-weight: 600; }
+  .glossary .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 7px; }
+  .gterm {
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px 7px;
+    background: var(--panel-2); cursor: pointer; transition: border-color .12s, background .12s;
+  }
+  .gterm:hover { border-color: #3b4b66; }
+  .gterm.on { border-color: #ffd479; background: #2a2410; }
+  .gterm .n { display: flex; justify-content: space-between; gap: 8px; font-weight: 650; font-size: 12.5px; }
+  .gterm .k { font-family: var(--mono); font-size: 10px; color: #66738a; white-space: nowrap; }
+  .gterm .d { font-size: 11.5px; color: #9aa7ba; margin-top: 3px; }
+  .gterm .w { font-family: var(--mono); font-size: 9.5px; color: #5d6a80; margin-top: 4px; }
+  .gterm.zero .w { color: var(--red); }
+  .node.hit { border-color: #ffd479; box-shadow: 0 0 0 1px rgba(255,212,121,.35), 0 2px 14px rgba(0,0,0,.35); }
+  .node.hit .t { color: #ffe9b3; }
+
   @media (max-width: 900px) {
     .drawer { width: 100vw; }
     .canvas-wrap { padding-left: 8px; padding-right: 8px; }
@@ -157,8 +201,22 @@
   <div class="traces" id="traces">
     <span class="lbl">показать путь</span>
   </div>
-  <div class="caption" id="caption"><span class="hint">Клик по узлу — условие, ветки и ссылки на код. Кнопки сверху подсвечивают один путь по схеме.</span></div>
+  <div class="caption" id="caption"><span class="hint">Клик по узлу — условие, ветки и ссылки на код. Кнопки сверху подсвечивают путь, клик по термину — узлы, где он участвует.</span></div>
 </header>
+
+<details class="glossary" id="glossary" open>
+  <summary>
+    <b>Словарь терминов</b><span class="cnt" id="glossaryCount"></span>
+    <span class="arrow">›</span>
+  </summary>
+  <div class="body">
+    <div class="bar">
+      <input id="glossaryFilter" type="search" placeholder="фильтр: слот, тикет, grants, defer…" autocomplete="off">
+      <span class="hint">клик по термину подсвечивает узлы, где он участвует</span>
+    </div>
+    <div class="groups" id="glossaryGroups"></div>
+  </div>
+</details>
 
 <div class="canvas-wrap">
   <div class="canvas" id="canvas">
@@ -248,7 +306,7 @@
     {
       id: "n_req", col: "A", y: 360, h: 122, kind: "action", label: "действие",
       title: "Подготовка request-шага",
-      sub: "две проверки до очереди",
+      sub: "две проверки: держит ли родитель слот",
       why: "Если этот инстанс уже считает, что держит лиз, а пришёл новый context без step-события — прошлый запрос кончился: лиз снимается и выдаётся тикет. Если родитель (или другой предок) держит слот, ребёнок едет на нём: свой лиз не нужен, иначе родитель ждёт ребёнка, а ребёнок — слот.",
       refs: [
         "src/index.ts:1401-1411 — held.has(sid) → release + ticket",
@@ -259,7 +317,7 @@
     {
       id: "term_covered", col: "C", y: 360, h: 72, kind: "term", label: "выход",
       title: "covered: едет на слоте родителя",
-      sub: "lock.refresh(parent), слот не тратится",
+      sub: "covered · exempt: свой слот не берётся",
       why: "Ребёнок не встаёт в очередь и не занимает второй слот. Родительский лиз продлевается (seen = now), чтобы он не выглядел мёртвым, пока ребёнок работает.",
       refs: ["src/index.ts:1418-1425"],
     },
@@ -332,7 +390,8 @@
     {
       id: "d_full", col: "A", y: 960, h: 82, kind: "decision", label: "развилка",
       title: "Живых лизов ≥ limit?",
-      sub: "limit = 1, лиз жив, пока свежий",
+      sub: "лимит = 1, лиз жив, пока свежий",
+      lines: ["stale-лиз (2 ч без heartbeat) вычищает sweep."],
       why: "Считаются только свежие лизы: если seen не обновлялся дольше leaseTimeoutMs (2 ч), лиз считается мёртвым и вычищается. Это защита от процесса, который умер, не отпустив слот.",
       refs: ["src/core.ts:172-173", "src/core.ts:137 — isExpired", "src/index.ts:204 — leaseTimeoutMs: 2 ч"],
       yes: "да → проверить таймаут",
@@ -396,6 +455,24 @@
       refs: ["src/index.ts:1471-1482"],
     },
     {
+      id: "note_files", col: "C", y: 740, h: 190, kind: "note", label: "файлы",
+      title: "Sidecar-файлы",
+      sub: "общий каталог %TEMP%/opencode/turn-lock",
+      lines: [
+        "slot-free.json — at + grants",
+        "<sid>.lease.json — держатель",
+        "<sid>.wait.json — ждущий",
+        "<root>.turn.json — тикет возврата",
+        "<sid>.prio.json — уровень",
+      ],
+      why: "Один каталог на все инстансы плагина (по одному на локацию), поэтому лимит и очередь общие для всех. Запись атомарная: tmp + rename; битый файл читается как отсутствующий.",
+      refs: [
+        "src/index.ts:817 — slot-free.json",
+        "src/tickets.ts:72 — *.turn.json",
+        "src/index.ts:237 — dir",
+      ],
+    },
+    {
       id: "note_order", col: "C", y: 1084, h: 160, kind: "note", label: "правило",
       title: "Порядок очереди",
       sub: "compareQueue",
@@ -421,7 +498,7 @@
     {
       id: "d_step", col: "A", y: 1544, h: 112, kind: "decision", label: "развилка",
       title: "session.step.ended / .failed?",
-      sub: "request-скоуп и лиз держит этот инстанс",
+      sub: "граница шага · request-скоуп · свой лиз",
       lines: [
         "turn-скоуп → игнор.",
         "лиз чужой / уже снят → игнор.",
@@ -627,6 +704,108 @@
     },
   ];
 
+  // ------------------------------------------------------------ glossary
+  // The vocabulary of the gate. `match` is the lowercase stem the diagram
+  // searches for in a node's visible text: the count on each card is computed
+  // from it, so a term that stops appearing on the diagram says so instead of
+  // lying.
+  const GLOSSARY = [
+    {
+      group: "Слот и лиз",
+      items: [
+        { id: "slot", name: "слот", code: "slot", match: ["слот"],
+          def: "Право отправить один запрос к модели. Слотов ровно limit; пока сессия выполняет инструменты, её слот свободен." },
+        { id: "lease", name: "лиз", code: "<sid>.lease.json", match: ["лиз"],
+          def: "Запись о том, что сессия держит слот: since, seen, pid, owner, over. Лежит в общем каталоге, поэтому лимит общий для всех процессов." },
+        { id: "holder", name: "держатель", code: "holder", match: ["держит", "держател"],
+          def: "Сессия с живым лизом. Держателя holdsBack не трогает: проверка идёт только там, где слот берут заново." },
+        { id: "waiter", name: "ждущий", code: "<sid>.wait.json", match: ["ждущ", "ждёт", "ждать"],
+          def: "Сессия, которая опрашивает стор в цикле. Слот не держит и в лимит не считается." },
+        { id: "limit", name: "лимит", code: "limit = 1", match: ["лимит"],
+          def: "Сколько лизов может быть живо одновременно. Один: локальный движок обслуживает один запрос за раз." },
+        { id: "grant", name: "grant", code: "AcquireResult", match: ["grant"],
+          def: "Выдача слота: новый лиз записан и прошёл пост-проверку. Не grant: re-acquire и over-limit." },
+        { id: "grants", name: "grants", code: "slot-free.json", match: ["grants"],
+          def: "Общий счётчик выдач. Растёт только на новом лизе; по нему возвращенец понимает, что его обошли." },
+        { id: "reacquire", name: "re-acquire", code: "seen = now", match: ["re-acquire"],
+          def: "Повторный вход в acquire при уже существующем лизе: обновляется seen, новый grant не выдаётся." },
+        { id: "stale", name: "stale-лиз", code: "leaseTimeoutMs", match: ["stale"],
+          def: "Лиз, у которого seen не обновлялся дольше 2 ч: считается мёртвым и удаляется sweep-ом." },
+        { id: "heartbeat", name: "heartbeat", code: "refreshEveryMs", match: ["heartbeat"],
+          def: "Продление seen каждые 20 с у всех лизов процесса: долгая генерация не выглядит мёртвой." },
+        { id: "overlimit", name: "over-limit лиз", code: "over: true", match: ["over-limit", "over: true"],
+          def: "Лиз сверх лимита после acquireTimeoutMs. Аварийный клапан, а не штатный путь." },
+      ],
+    },
+    {
+      group: "Очередь и приоритет",
+      items: [
+        { id: "queue", name: "очередь", code: "compareQueue", match: ["очеред"],
+          def: "Все ждущие в порядке обслуживания: уровень → boost → обычные → defer → возраст → sid." },
+        { id: "level", name: "уровень", code: "high | normal | low", match: ["уровен"],
+          def: "Приоритет из /prio: ⚡ high обгоняет обычный, ▽ low стоит за всеми. Внутри уровня решает возраст." },
+        { id: "holdsback", name: "holdsBack", code: "reserve", match: ["holdsback"],
+          def: "Резерв свободного слота: ждущий не берёт его, если впереди уровень выше, тикет не поднят или не истекло FIFO-окно." },
+        { id: "fifo", name: "FIFO-окно", code: "fifoGraceMs", match: ["fifo"],
+          def: "Каждое место впереди получает 2 с (не меньше 2×pollMs), чтобы забрать слот. Зависшая голова не держит очередь дольше окна." },
+        { id: "poll", name: "pollMs", code: "200 мс", match: ["pollms"],
+          def: "Интервал опроса стора ждущей сессией." },
+        { id: "acquireTimeout", name: "acquireTimeoutMs", code: "16 ч", match: ["acquiretimeout"],
+          def: "Сколько можно ждать до аварийного клапана. Сессии ждут очередь честно, а не до первого свободного окна." },
+        { id: "onTimeout", name: "onTimeout", code: "proceed | hold", match: ["ontimeout"],
+          def: "Что делать по таймауту: proceed — взять over-лиз, hold — продолжать ждать." },
+        { id: "createdAt", name: "createdAt", code: "session.time.created", match: ["createdat"],
+          def: "Абсолютное время создания сессии — ключ сортировки внутри уровня. Возвращенец не моложе тех, кто встал, пока он работал." },
+      ],
+    },
+    {
+      group: "Возврат после запроса",
+      items: [
+        { id: "ticket", name: "тикет возврата", code: "<root>.turn.json", match: ["тикет"],
+          def: "Право вернуться в начало своего уровня. Пишется на границе шага, живёт 5 мин и удаляется при взятии слота." },
+        { id: "releasedAt", name: "releasedAt", code: "ticket field", match: ["releasedat"],
+          def: "Момент, когда сессия отпустила слот. Среди boost-сессий порядок по нему: кто раньше отпустил, тот раньше едет." },
+        { id: "releasedGrants", name: "releasedGrants", code: "ticket field", match: ["releasedgrants"],
+          def: "Значение grants на момент отпускания. Пока grants ≤ releasedGrants, тикет не поднят." },
+        { id: "boost", name: "boost", code: "grants > releasedGrants", match: ["boost"],
+          def: "Тикет поднят: возвращенец идёт первым в своём уровне." },
+        { id: "defer", name: "defer", code: "grants ≤ releasedGrants", match: ["defer"],
+          def: "Тикет не поднят: возвращенец стоит в конце уровня и не отбирает слот назад. Другие defer его не блокируют." },
+        { id: "ttl", name: "TTL тикета", code: "returnTicketTtlMs", match: ["ttl"],
+          def: "5 мин. Просроченный тикет читается как отсутствующий: сессия встаёт в обычную очередь." },
+        { id: "root", name: "root", code: "rootOf(sid)", match: ["root"],
+          def: "Верхний предок сессии. Тикет хранится под root, поэтому сабагент читает право родителя." },
+        { id: "covered", name: "covered", code: "subagent", match: ["covered"],
+          def: "Ребёнок едет на слоте родителя: свой лиз не берётся, иначе пара дедлочится." },
+        { id: "exempt", name: "exempt", code: "subagent", match: ["exempt"],
+          def: "Родитель не гейтится (turn-скоуп, облако) — ребёнок тоже не гейтится." },
+      ],
+    },
+    {
+      group: "Границы, события, файлы",
+      items: [
+        { id: "scope", name: "lockScope", code: "request | turn", match: ["lockscope"],
+          def: "Что покрывает слот: один запрос к модели (по умолчанию) или весь ход." },
+        { id: "step", name: "граница шага", code: "session.step.ended", match: ["граница шага", "step.ended"],
+          def: "Конец одного запроса к модели. В request-скоупе здесь слот отпускается, а продолжающемуся шагу достаётся тикет." },
+        { id: "finish", name: "finish", code: "tool-calls | length | stop", match: ["finish"],
+          def: "Исход шага: tool-calls и length значат «продолжу» и дают тикет; stop — ход закончен." },
+        { id: "terminal", name: "терминальные события", code: "idle, execution.*, …", match: ["терминальн"],
+          def: "Конец хода или сессии: отпускают слот, отменяют ожидание, снимают тикет. form/permission отпускают, но оставляют тикет." },
+        { id: "release", name: "release", code: "release(sid, reason)", match: ["release "],
+          def: "Снятие лиза: слот свободен, в slot-free.json обновляется at." },
+        { id: "cancelwait", name: "cancelWait", code: "cancel", match: ["cancelwait"],
+          def: "Отмена ожидания терминальным событием: брошенная сессия не заберёт слот." },
+        { id: "sweep", name: "sweep", code: "sweepMs = 60 с", match: ["sweep"],
+          def: "Периодическая чистка: мёртвые лизы и просроченные тикеты." },
+        { id: "sidecar", name: "sidecar", code: "общий каталог", match: ["sidecar"],
+          def: "Файлы состояния: лизы, ожидания, тикеты, уровни. Один каталог на все инстансы плагина." },
+        { id: "provider", name: "локальный провайдер", code: "localProviders", match: ["провайдер"],
+          def: "strata или loopback baseURL. Гейтятся только локальные модели; облако в очереди не стоит." },
+      ],
+    },
+  ];
+
   const $ = (id) => document.getElementById(id);
   const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const canvas = $("canvas");
@@ -634,6 +813,7 @@
   const nodeEls = new Map();
   let selected = null;
   let activeTrace = null;
+  let activeTerm = null;
 
   // ---------------------------------------------------------------- render
   function renderSections() {
@@ -807,6 +987,7 @@
   // --------------------------------------------------------------- traces
   function setTrace(id) {
     const trace = TRACES.find((t) => t.id === id) || null;
+    clearHighlight();
     activeTrace = trace ? trace.id : null;
     const nodeSet = trace ? new Set(trace.nodes) : null;
     const edgeSet = trace ? new Set(trace.edges) : null;
@@ -828,7 +1009,7 @@
     }
     $("caption").innerHTML = trace
       ? "<b>" + esc(trace.label) + ".</b> " + esc(trace.caption)
-      : '<span class="hint">Клик по узлу — условие, ветки и ссылки на код. Кнопки сверху подсвечивают один путь по схеме.</span>';
+      : DEFAULT_CAPTION;
     if (trace) {
       const first = nodeEls.get(trace.nodes[0]);
       if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -849,10 +1030,98 @@
     $("traces").appendChild(reset);
   }
 
+  // ------------------------------------------------------------- glossary
+  const DEFAULT_CAPTION =
+    '<span class="hint">Клик по узлу — условие, ветки и ссылки на код. Кнопки сверху подсвечивают путь, клик по термину — узлы, где он участвует.</span>';
+
+  const termById = new Map();
+  const visibleText = (node) =>
+    [node.label, node.title, node.sub || "", ...(node.lines || [])].join(" ").toLowerCase();
+  const termNodes = (term) =>
+    NODES.filter((node) => { const text = visibleText(node); return term.match.some((m) => text.includes(m)); });
+
+  function clearHighlight() {
+    activeTrace = null;
+    activeTerm = null;
+    for (const el of nodeEls.values()) el.classList.remove("hit", "dim");
+    for (const p of svg.querySelectorAll("path")) {
+      p.classList.remove("dim", "on");
+      p.setAttribute("marker-end", "url(#arrow)");
+    }
+    for (const t of svg.querySelectorAll("text")) t.classList.remove("dim", "on");
+    for (const c of document.querySelectorAll(".gterm")) c.classList.remove("on");
+    for (const b of $("traces").querySelectorAll("button[data-trace]")) b.classList.remove("on");
+    $("caption").innerHTML = DEFAULT_CAPTION;
+  }
+
+  function toggleTerm(id) {
+    const term = termById.get(id);
+    if (!term) return;
+    const wasActive = activeTerm === id;
+    clearHighlight();
+    if (wasActive) return;
+    activeTerm = id;
+    const hits = new Set(termNodes(term).map((node) => node.id));
+    for (const [nid, el] of nodeEls) {
+      el.classList.toggle("hit", hits.has(nid));
+      el.classList.toggle("dim", !hits.has(nid));
+    }
+    for (const p of svg.querySelectorAll("path")) p.classList.add("dim");
+    for (const t of svg.querySelectorAll("text")) t.classList.add("dim");
+    for (const c of document.querySelectorAll(".gterm")) c.classList.toggle("on", c.dataset.term === id);
+    $("caption").innerHTML =
+      "<b>" + esc(term.name) + ".</b> " + esc(term.def) +
+      ' <span class="hint">· узлов на схеме: ' + hits.size + "</span>";
+    const first = NODES.find((node) => hits.has(node.id));
+    if (first) nodeEls.get(first.id).scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  function renderGlossary() {
+    const groups = $("glossaryGroups");
+    let total = 0;
+    for (const group of GLOSSARY) {
+      const wrap = document.createElement("div");
+      const head = document.createElement("h4");
+      head.textContent = group.group;
+      wrap.appendChild(head);
+      const grid = document.createElement("div");
+      grid.className = "grid";
+      for (const term of group.items) {
+        termById.set(term.id, term);
+        const hits = termNodes(term);
+        total += 1;
+        const card = document.createElement("div");
+        card.className = "gterm" + (hits.length ? "" : " zero");
+        card.dataset.term = term.id;
+        card.dataset.search = (term.name + " " + term.code + " " + term.def).toLowerCase();
+        card.innerHTML =
+          '<div class="n"><span>' + esc(term.name) + '</span><span class="k">' + esc(term.code) + "</span></div>" +
+          '<div class="d">' + esc(term.def) + "</div>" +
+          '<div class="w">' + (hits.length ? hits.length + " узл. на схеме" : "нет на схеме") + "</div>";
+        card.addEventListener("click", () => toggleTerm(term.id));
+        grid.appendChild(card);
+      }
+      wrap.appendChild(grid);
+      groups.appendChild(wrap);
+    }
+    $("glossaryCount").textContent = "· " + total + " терминов";
+    $("glossaryFilter").addEventListener("input", (event) => {
+      const query = event.target.value.trim().toLowerCase();
+      for (const card of document.querySelectorAll(".gterm")) {
+        card.style.display = !query || card.dataset.search.includes(query) ? "" : "none";
+      }
+      for (const wrap of document.querySelectorAll("#glossaryGroups > div")) {
+        const any = [...wrap.querySelectorAll(".gterm")].some((card) => card.style.display !== "none");
+        wrap.style.display = any ? "" : "none";
+      }
+    });
+  }
+
   // ----------------------------------------------------------------- boot
   renderSections();
   renderNodes();
   renderTraces();
+  renderGlossary();
   $("dClose").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
 

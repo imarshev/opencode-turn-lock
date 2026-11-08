@@ -917,6 +917,42 @@ test("a new waiter updates the total of the ones ahead of it", async () => {
   }
 })
 
+test("a waiting subagent takes no visible place in the queue", async () => {
+  // The session list draws root sessions only: a child's row is nested under
+  // its parent. Counting children as separate places made a badge say `1/3`
+  // over two visible rows — the counter promised rows the list cannot show.
+  const harness = await setup(
+    { limit: 1, remindEveryMs: 0, lockScope: "request" },
+    {
+      parents: { ses_child: "ses_parent" },
+      titles: { ses_1: "one", ses_parent: "parent", ses_child: "child" },
+      created: { ses_1: 1, ses_parent: 2, ses_child: 3 },
+    },
+  )
+  try {
+    await harness.context("ses_1") // holds the only slot
+    const parent = harness.context("ses_parent")
+    await until(() => readState(harness.metadata.get("ses_parent"))?.position === 1, "the parent waits")
+    assert.equal(readState(harness.metadata.get("ses_parent"))?.total, 1)
+
+    const child = harness.context("ses_child")
+    await until(() => readState(harness.metadata.get("ses_child"))?.since !== undefined, "the child waits")
+
+    const mark = JSON.parse(readFileSync(join(harness.dir, "ses_child.wait.json"), "utf8"))
+    assert.equal(mark.child, true, "the sidecar records the ancestry for other instances")
+    assert.equal(readState(harness.metadata.get("ses_child"))?.position, undefined, "a child has no visible place")
+    assert.equal(readState(harness.metadata.get("ses_child"))?.total, undefined)
+    assert.equal(readState(harness.metadata.get("ses_parent"))?.total, 1, "the parent's total ignores the child")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await parent
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_parent" } })
+    await child
+  } finally {
+    await harness.teardown()
+  }
+})
+
 test("a priority switch republishes the places of the whole queue", async () => {
   const harness = await setup(
     { limit: 1, remindEveryMs: 0 },

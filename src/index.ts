@@ -615,7 +615,16 @@ export default Plugin.define({
       }
     }
 
-    type WaitMark = { pid?: number; owner?: string; since?: number; createdAt?: number; markedAt?: number }
+    type WaitMark = {
+      pid?: number
+      owner?: string
+      since?: number
+      createdAt?: number
+      markedAt?: number
+      /** A subagent: it waits for the engine, but its session list row is hidden
+       *  under the parent, so it must not take a visible queue place. */
+      child?: boolean
+    }
 
     const readWaitMark = (sid: string): WaitMark | undefined => {
       try {
@@ -638,10 +647,15 @@ export default Plugin.define({
      *  the ordering key: the absolute creation time of the session. Another
      *  instance (one plugin per location, all sharing this directory) cannot ask
      *  the server about a session it does not own, and the age has to mean the
-     *  same thing for everyone. */
-    const writeWaitMark = (sid: string, since: number, created?: number) => {
+     *  same thing for everyone.
+     *
+     *  `child` is sticky: a reminder tick or a late `createdAt` fill rewrites the
+     *  file without knowing the ancestry, and must not turn a subagent into a
+     *  root in the queue. */
+    const writeWaitMark = (sid: string, since: number, created?: number, child?: boolean) => {
       try {
         mkdirSync(config.dir, { recursive: true })
+        const isChild = child === true || (child === undefined && readWaitMark(sid)?.child === true)
         writeFileSync(
           waitPath(sid),
           JSON.stringify({
@@ -650,6 +664,7 @@ export default Plugin.define({
             owner,
             since,
             ...(created !== undefined ? { createdAt: created } : {}),
+            ...(isChild ? { child: true } : {}),
             markedAt: Date.now(),
           }),
           "utf8",
@@ -701,7 +716,7 @@ export default Plugin.define({
      *  ignored. `createdAt` is the session's absolute creation time, carried in
      *  the sidecar because another instance cannot read a session it does not
      *  own; it is the key the queue is actually ordered by. */
-    const readWaiters = (): Array<{ sid: string; since: number; createdAt?: number }> => {
+    const readWaiters = (): Array<{ sid: string; since: number; createdAt?: number; child?: boolean }> => {
       let names: string[]
       try {
         names = readdirSync(config.dir)
@@ -716,7 +731,7 @@ export default Plugin.define({
       // `remindEveryMs: 0` there is no heartbeat, so age proves nothing and the
       // liveness of the process stays the only signal.
       const staleAfterMs = config.remindEveryMs > 0 ? Math.max(config.remindEveryMs * 3, 5 * 60_000) : Infinity
-      const waiters: Array<{ sid: string; since: number; createdAt?: number }> = []
+      const waiters: Array<{ sid: string; since: number; createdAt?: number; child?: boolean }> = []
       for (const name of names) {
         if (!name.endsWith(".wait.json")) continue
         const sid = name.slice(0, -".wait.json".length)
@@ -731,15 +746,41 @@ export default Plugin.define({
           continue
         }
         const created = typeof mark.createdAt === "number" && mark.createdAt > 0 ? mark.createdAt : undefined
-        waiters.push({ sid, since, createdAt: created })
+        waiters.push({ sid, since, createdAt: created, ...(mark.child === true ? { child: true } : {}) })
       }
       return waiters.sort((a, b) => a.since - b.since || a.sid.localeCompare(b.sid))
     }
 
-    const placeOf = (sid: string, since: number): QueuePlace => {
-      const order = orderedWaiters(sid, since)
+    /**
+     * Whether this waiter is a subagent. A child waits for the engine exactly
+     * like a session, but it has no row of its own in the session list: its
+     * wait belongs to the parent's turn, and counting it as a separate place
+     * made the badge say `1/10` over a list of six visible sessions. The sidecar
+     * is authoritative (it is the shared record), and the parent cache is the
+     * fallback for a mark that could not be written.
+     */
+    const isChildWaiter = (sid: string): boolean => {
+      const mark = readWaitMark(sid)
+      if (mark) return mark.child === true
+      return parents.get(sid) != null
+    }
+
+    /** Waiters in visual order: the ones the session list can show. Children
+     *  keep their place in the *serving* order (`orderedWaiters`), not in this
+     *  one. */
+    const visibleWaiters = (sid?: string, since = 0): string[] => {
+      const marks = readWaiters()
+      const hidden = new Set(marks.filter((waiter) => waiter.child === true).map((waiter) => waiter.sid))
+      // A mark that could not be written still has its ancestry in this process.
+      if (sid && !marks.some((waiter) => waiter.sid === sid) && parents.get(sid) != null) hidden.add(sid)
+      return orderedWaiters(sid, since).filter((id) => !hidden.has(id))
+    }
+
+    const placeOf = (sid: string, since: number): QueuePlace | undefined => {
+      if (isChildWaiter(sid)) return undefined
+      const order = visibleWaiters(sid, since)
       const index = order.indexOf(sid)
-      return { position: index + 1, total: order.length }
+      return index < 0 ? undefined : { position: index + 1, total: order.length }
     }
 
     /** A place belongs to the queue, not to one waiter: when the head is served
@@ -760,16 +801,27 @@ export default Plugin.define({
         try {
           while (placesDirty) {
             placesDirty = false
-            const order = orderedWaiters()
+            const waiters = readWaiters()
+            // Only the rows the session list can draw take a place: a subagent
+            // has no row of its own, so counting it made the badge promise more
+            // waiters than the list shows. It keeps waiting (and its `since`),
+            // it just does not get a `position`.
+            const order = visibleWaiters()
             const total = order.length
             // `since` comes from the wait sidecar, not from a previous write: a
             // waiter restored after a plugin reload (or marked by another
             // instance) has a sidecar but may have no `since` in its metadata,
             // and a place without a start time draws no timer in the UI.
-            const starts = new Map(readWaiters().map((waiter) => [waiter.sid, waiter.since]))
+            const starts = new Map(waiters.map((waiter) => [waiter.sid, waiter.since]))
             for (const [index, id] of order.entries()) {
               const since = starts.get(id)
               await syncState(id, { position: index + 1, total, ...(since ? { since } : {}) })
+            }
+            // A child that was counted by an older version (or before its
+            // ancestry was known) must lose the place it never had a row for.
+            for (const waiter of waiters) {
+              if (waiter.child !== true) continue
+              await syncState(waiter.sid, { position: null, total: null })
             }
           }
         } catch (error) {
@@ -984,8 +1036,12 @@ export default Plugin.define({
       // The sidecar carries the ordering key, so it is written with the mark,
       // not after a server round-trip. A cold cache (a wait restored after a hot
       // reload) is filled in the background and the age is published then.
+      // The ancestry is cached by the gate that sent this session here; a child
+      // is recorded as such, so every instance can tell a hidden row from a
+      // visible one without asking a server that may not own the session.
       const known = createdAt.get(sid) ?? readWaitMark(sid)?.createdAt
-      writeWaitMark(sid, since, known)
+      const child = parents.has(sid) ? parents.get(sid) != null : undefined
+      writeWaitMark(sid, since, known, child)
       if (known === undefined) {
         void createdAtOf(sid).then((created) => {
           if (created === undefined) return

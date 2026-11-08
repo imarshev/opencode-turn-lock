@@ -212,8 +212,8 @@ async function setup(
       remindEveryMs: 0,
       sweepMs: 60_000,
       // The tests below spell out the limit they exercise; the shipped default
-      // (1) is asserted separately. The handoff is off unless a test asks for
-      // it, so a step boundary frees the slot at once in the older tests.
+      // (1) is asserted separately. `handoffMs` is a legacy key the plugin still
+      // accepts; it has no effect now, so a step boundary always frees the slot.
       limit: 2,
       handoffMs: 0,
       // The original behaviour is the reference for these tests; the request
@@ -1574,8 +1574,8 @@ test("default wait tick fits a visible countdown", () => {
   assert.equal(mod.DEFAULTS.remindEveryMs, 60_000)
 })
 
-test("default timeout is 4 hours (long-running goals stay serialised)", () => {
-  assert.equal(mod.DEFAULTS.acquireTimeoutMs, 4 * 60 * 60_000)
+test("default timeout is 16 hours (long-running goals stay serialised)", () => {
+  assert.equal(mod.DEFAULTS.acquireTimeoutMs, 16 * 60 * 60_000)
   assert.equal(mod.DEFAULTS.onTimeout, "proceed")
   assert.equal(mod.DEFAULTS.markWaitingTitle, true)
 })
@@ -1713,18 +1713,38 @@ test("request scope: a session gets its place back on the step after it released
   }
 })
 
-test("request scope: no turn ticket is written any more", async () => {
+test("request scope: a continuing step releases the slot and leaves a return ticket", async () => {
   const harness = await setup({ lockScope: "request" })
   try {
     await harness.context("ses_1")
-    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), false, "the queue no longer keeps a ticket")
+    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), false, "a held slot has no ticket")
 
     harness.bus.emit({
       type: "session.step.ended",
       data: { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "tool-calls" },
     })
     await until(() => !existsSync(join(harness.dir, "ses_1.lease.json")), "the step released the slot")
-    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), false, "nothing is left behind")
+    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), true, "the continuing session keeps its place")
+
+    const ticket = JSON.parse(readFileSync(join(harness.dir, "ses_1.turn.json"), "utf8"))
+    assert.equal(ticket.sid, "ses_1")
+    assert.equal(typeof ticket.releasedGrants, "number", "the ticket records how many grants had happened")
+    assert.ok(ticket.expiresAt > ticket.releasedAt, "the ticket has a deadline")
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: a stop step leaves no return ticket", async () => {
+  const harness = await setup({ lockScope: "request" })
+  try {
+    await harness.context("ses_1")
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop" },
+    })
+    await until(() => !existsSync(join(harness.dir, "ses_1.lease.json")), "the stop step released the slot")
+    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), false, "a finished run has no place to keep")
   } finally {
     await harness.teardown()
   }
@@ -1952,6 +1972,47 @@ test("request scope: a subagent queues at its parent's level", async () => {
   }
 })
 
+test("request scope: a subagent rides its parent's return ticket", async () => {
+  const harness = await setup(
+    { lockScope: "request", limit: 1 },
+    { parents: { ses_child: "ses_parent" }, created: { ses_parent: 100, ses_child: 150, ses_other: 50, ses_late: 900 } },
+  )
+  try {
+    await harness.context("ses_parent")
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_parent", assistantMessageID: "msg_p", finish: "tool-calls" },
+    })
+    await until(() => existsSync(join(harness.dir, "ses_parent.turn.json")), "the parent left a ticket")
+
+    // The other session takes the freed slot, which lifts the parent's ticket.
+    await harness.context("ses_other")
+
+    // The child asks next; it reads the parent's ticket through rootOf.
+    let childDone = false
+    const child = harness.context("ses_child").then(() => {
+      childDone = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_child.wait.json")), "the child is queued")
+
+    // A session created much later queues behind it.
+    let lateDone = false
+    const late = harness.context("ses_late").then(() => {
+      lateDone = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_late.wait.json")), "the later waiter is queued")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_other" } })
+    await until(() => childDone, "the child is served on the parent's ticket")
+    await wait(150)
+    assert.equal(lateDone, false, "an ordinary later session waits behind the ticket")
+    void child
+    void late
+  } finally {
+    await harness.teardown()
+  }
+})
+
 test("boot drops turn tickets left by a previous version", async () => {
   const harness = await setup({}, {}, (dir) => {
     writeFileSync(
@@ -1994,24 +2055,26 @@ test("turn scope: step events do not free the slot", async () => {
   }
 })
 
-// --- request scope: handoff and creation-time order ------------------------
+// --- request scope: the step boundary and the return ticket -----------------
 //
-// A step boundary is not a pause: `finish: "tool-calls"` is followed by a tool
-// within milliseconds, and `finish: "length"` may be continued at once. The
-// lease is kept across that gap (`handoffMs`) and released on the first
-// `session.tool.called` (or the continuation request). The queue itself is
-// ordered by the absolute session creation time, not by when a wait began.
+// A step boundary ends one model request: the slot is freed at once, so the
+// engine can serve the next session while this one runs its tools. A
+// `finish: "tool-calls"` or `"length"` step leaves a return ticket, so the
+// session that comes back for the next request is served at the front of its
+// level — but only after another session has actually been admitted, so the
+// release is a real handover rather than a bounce.
 
-test("shipped defaults: one slot, 200 ms polling, a 1 s handoff", () => {
+test("shipped defaults: one slot, 200 ms polling, no handoff, a 5-minute ticket", () => {
   assert.equal(mod.DEFAULTS.limit, 1, "the engine serves one request at a time")
   assert.equal(mod.DEFAULTS.pollMs, 200)
-  assert.equal(mod.DEFAULTS.handoffMs, 1_000)
+  assert.equal(mod.DEFAULTS.handoffMs, 0, "the slot frees at step.ended")
+  assert.equal(mod.DEFAULTS.returnTicketTtlMs, 5 * 60_000)
   assert.equal(mod.DEFAULTS.lockScope, "request")
   assert.equal("requeueGraceMs" in mod.DEFAULTS, false, "the fory is gone")
 })
 
-test("request scope: a tool-calls step keeps the slot until the tool starts", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+test("request scope: a tool-calls step frees the slot at once", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1 })
   try {
     await harness.context("ses_a")
     let bDone = false
@@ -2024,16 +2087,9 @@ test("request scope: a tool-calls step keeps the slot until the tool starts", as
       type: "session.step.ended",
       data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "tool-calls" },
     })
-    await wait(120)
-    assert.equal(bDone, false, "the slot is not freed in the gap before the tool")
-    assert.ok(existsSync(join(harness.dir, "ses_a.lease.json")), "the lease survives the step boundary")
-
-    harness.bus.emit({
-      type: "session.tool.called",
-      data: { sessionID: "ses_a", assistantMessageID: "msg_a", id: "tool_1", input: {}, executed: true },
-    })
-    await until(() => bDone, "the tool start frees the slot")
-    assert.equal(existsSync(join(harness.dir, "ses_a.lease.json")), false, "the lease is gone once the tool runs")
+    await until(() => bDone, "the end of the request admits the waiter")
+    assert.equal(existsSync(join(harness.dir, "ses_a.lease.json")), false, "the slot is free while the tools run")
+    assert.equal(existsSync(join(harness.dir, "ses_a.turn.json")), true, "the returning session keeps its place")
     void b
   } finally {
     await harness.teardown()
@@ -2041,13 +2097,14 @@ test("request scope: a tool-calls step keeps the slot until the tool starts", as
 })
 
 test("request scope: a sibling instance does not free a lease it did not take", async () => {
-  // Every plugin instance (one per location) receives every server event. The
-  // holder keeps the lease across a tool-calls boundary; the other instance must
-  // not drop it just because it also saw the step end.
+  // Every plugin instance (one per location) receives every server event, but
+  // only the instance that served the request may decide what its boundary
+  // means. The holder frees its own slot; the sibling only records why it left
+  // the lease alone, and the holder's return ticket survives.
   const bus = makeEventBus()
   const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
-  const holder = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 }, {}, undefined, { dir, bus })
-  const sibling = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 }, {}, undefined, { dir, bus })
+  const holder = await setup({ lockScope: "request", limit: 1 }, {}, undefined, { dir, bus })
+  const sibling = await setup({ lockScope: "request", limit: 1 }, {}, undefined, { dir, bus })
   try {
     await holder.context("ses_1")
     assert.ok(existsSync(join(dir, "ses_1.lease.json")), "the holder took the slot")
@@ -2056,14 +2113,17 @@ test("request scope: a sibling instance does not free a lease it did not take", 
       type: "session.step.ended",
       data: { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "tool-calls" },
     })
-    await wait(80)
-    assert.ok(existsSync(join(dir, "ses_1.lease.json")), "the sibling leaves the held lease alone")
+    await until(() => !existsSync(join(dir, "ses_1.lease.json")), "the holder frees its own slot")
+    assert.equal(existsSync(join(dir, "ses_1.turn.json")), true, "the holder wrote the return ticket")
 
-    bus.emit({
-      type: "session.tool.called",
-      data: { sessionID: "ses_1", assistantMessageID: "msg_1", id: "tool_1", input: {}, executed: true },
-    })
-    await until(() => !existsSync(join(dir, "ses_1.lease.json")), "the holder frees the slot at the tool")
+    const ignored = sibling
+      .traceLines()
+      .filter((line) => line.ev === "event.ignore")
+      .map((line) => line.why)
+    assert.ok(
+      ignored.some((why) => String(why).includes("does not hold")),
+      "the sibling says it did not hold the lease",
+    )
   } finally {
     await sibling.teardown()
     await holder.teardown()
@@ -2071,7 +2131,7 @@ test("request scope: a sibling instance does not free a lease it did not take", 
 })
 
 test("request scope: a stop step frees the slot at once", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+  const harness = await setup({ lockScope: "request", limit: 1 })
   try {
     await harness.context("ses_a")
     let bDone = false
@@ -2091,8 +2151,8 @@ test("request scope: a stop step frees the slot at once", async () => {
   }
 })
 
-test("request scope: a length step holds the slot for the continuation", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+test("request scope: a length step frees the slot and leaves a ticket", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1 })
   try {
     await harness.context("ses_a")
     let bDone = false
@@ -2105,23 +2165,33 @@ test("request scope: a length step holds the slot for the continuation", async (
       type: "session.step.ended",
       data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "length" },
     })
-    await wait(80)
-    assert.equal(bDone, false, "a truncated step keeps the slot for its continuation")
+    await until(() => bDone, "a truncated step frees the slot too")
+    assert.equal(existsSync(join(harness.dir, "ses_a.turn.json")), true, "the continuation keeps its place")
 
-    // The continuation is the same session asking again: the lease is reused,
-    // not released and retaken.
-    await harness.context("ses_a")
-    assert.equal(existsSync(join(harness.dir, "ses_a.wait.json")), false, "the continuation does not queue")
-    await wait(80)
-    assert.equal(bDone, false, "the waiter is still behind the held lease")
+    // The continuation comes back as a normal request: it queues, but its
+    // ticket is already lifted by b's admission, so it is boosted.
+    let aDone = false
+    const a = harness.context("ses_a").then(() => {
+      aDone = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_a.wait.json")), "the continuation is queued")
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_b", assistantMessageID: "msg_b", finish: "tool-calls" },
+    })
+    await until(() => aDone, "the continuation takes the next slot")
+    void a
     void b
   } finally {
     await harness.teardown()
   }
 })
 
-test("request scope: the handoff lapses when no tool ever starts", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 60 })
+test("request scope: a fast tool cannot take the slot back before the waiter is admitted", async () => {
+  // The tool that follows a step may finish in milliseconds, so the session can
+  // ask for the model again before the waiter has even polled. The ticket must
+  // not let it bounce the slot back: the handover has to happen first.
+  const harness = await setup({ lockScope: "request", limit: 1 })
   try {
     await harness.context("ses_a")
     let bDone = false
@@ -2134,7 +2204,21 @@ test("request scope: the handoff lapses when no tool ever starts", async () => {
       type: "session.step.ended",
       data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "tool-calls" },
     })
-    await until(() => bDone, "the slot is freed once the handoff window lapses")
+    // a comes back at once, before b has polled.
+    let aDone = false
+    const a = harness.context("ses_a").then(() => {
+      aDone = true
+    })
+    await until(() => bDone, "the queued waiter is admitted first")
+    await wait(150)
+    assert.equal(aDone, false, "the returning session waits for the handover to finish")
+
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_b", assistantMessageID: "msg_b", finish: "tool-calls" },
+    })
+    await until(() => aDone, "the returning session takes the next slot")
+    void a
     void b
   } finally {
     await harness.teardown()
@@ -2185,7 +2269,7 @@ test("request scope: the creation time travels in the wait sidecar", async () =>
 })
 
 test("request scope: the trace records the gate, the step and the release", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+  const harness = await setup({ lockScope: "request", limit: 1 })
   try {
     await harness.context("ses_a")
     harness.bus.emit({
@@ -2216,31 +2300,26 @@ test("request scope: the trace records the gate, the step and the release", asyn
   }
 })
 
-test("request scope: the trace records a handoff and the tool that ends it", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+test("request scope: the trace records a returning step and its ticket", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1 })
   try {
     await harness.context("ses_a")
     harness.bus.emit({
       type: "session.step.ended",
       data: { sessionID: "ses_a", assistantMessageID: "msg_a", finish: "tool-calls" },
     })
-    await wait(60)
-    harness.bus.emit({
-      type: "session.tool.called",
-      data: { sessionID: "ses_a", assistantMessageID: "msg_a", id: "tool_1", input: {}, executed: true },
-    })
-    await until(() => !existsSync(join(harness.dir, "ses_a.lease.json")), "the tool start frees the slot")
+    await until(() => existsSync(join(harness.dir, "ses_a.turn.json")), "the ticket is written")
 
     const lines = harness.traceLines()
-    const arm = lines.find((line) => line.ev === "handoff.arm")
-    assert.equal(arm?.sid, "ses_a")
-    assert.equal(arm?.kind, "tool")
-    assert.equal(typeof arm?.delayMs, "number", "the handoff delay is delayMs, not the envelope ms")
-    const tool = lines.find((line) => line.ev === "tool.release")
-    assert.equal(tool?.sid, "ses_a")
-    assert.equal(typeof tool?.gapMs, "number", "the tool line says how long the gap lasted")
+    const step = lines.find((line) => line.ev === "step.release")
+    assert.equal(step?.sid, "ses_a")
+    assert.equal(step?.finish, "tool-calls")
+    assert.equal(step?.returning, true, "the step says the run continues")
     const release = lines.find((line) => line.ev === "release")
-    assert.equal(release?.reason, "tool started")
+    assert.equal(release?.reason, "step-boundary", "the release reason names the boundary")
+    const ticket = lines.find((line) => line.ev === "ticket.write")
+    assert.equal(ticket?.sid, "ses_a")
+    assert.equal(ticket?.why, "step-boundary")
   } finally {
     await harness.teardown()
   }
@@ -2249,15 +2328,15 @@ test("request scope: the trace records a handoff and the tool that ends it", asy
 test("request scope: a sibling instance traces why it left the lease alone", async () => {
   const bus = makeEventBus()
   const dir = mkdtempSync(join(tmpdir(), "turn-lock-plugin-"))
-  const holder = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 }, {}, undefined, { dir, bus })
-  const sibling = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 }, {}, undefined, { dir, bus })
+  const holder = await setup({ lockScope: "request", limit: 1 }, {}, undefined, { dir, bus })
+  const sibling = await setup({ lockScope: "request", limit: 1 }, {}, undefined, { dir, bus })
   try {
     await holder.context("ses_1")
     bus.emit({
       type: "session.step.ended",
       data: { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "tool-calls" },
     })
-    await wait(80)
+    await until(() => !existsSync(join(dir, "ses_1.lease.json")), "the holder released its slot")
     const ignored = sibling
       .traceLines()
       .filter((line) => line.ev === "event.ignore")
@@ -2266,7 +2345,7 @@ test("request scope: a sibling instance traces why it left the lease alone", asy
       ignored.some((why) => String(why).includes("does not hold")),
       "the sibling says it did not hold the lease",
     )
-    assert.ok(holder.traceLines().some((line) => line.ev === "handoff.arm"), "the holder armed the handoff")
+    assert.ok(holder.traceLines().some((line) => line.ev === "ticket.write"), "the holder wrote the return ticket")
   } finally {
     await sibling.teardown()
     await holder.teardown()
@@ -2294,7 +2373,7 @@ test("request scope: unloading the plugin closes the stream line", async () => {
 })
 
 test("request scope: a step with no finish frees the slot at once", async () => {
-  const harness = await setup({ lockScope: "request", limit: 1, handoffMs: 2_000 })
+  const harness = await setup({ lockScope: "request", limit: 1 })
   try {
     await harness.context("ses_a")
     let bDone = false

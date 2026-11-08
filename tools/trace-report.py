@@ -112,11 +112,12 @@ class Report:
         self.released_sid = Counter()
         self.stale_sid = Counter()
         self.finishes = Counter()
-        self.arm = 0
-        self.fire = 0
-        self.tool_release = 0
         self.step_release = 0
-        self.step_handoff = 0
+        self.returning = 0
+        self.tickets = 0
+        self.ticket_why = Counter()
+        self.boosted = 0
+        self.deferred = 0
         self.waits = 0
         self.grants = 0
         self.grant_waits: list[float] = []
@@ -194,16 +195,13 @@ class Report:
             sid = row.get("sid")
             if sid:
                 self.taken_sid[sid] += 1
-        elif ev == "step.handoff":
-            self.step_handoff += 1
-        elif ev == "handoff.arm":
-            self.arm += 1
-        elif ev == "handoff.fire":
-            self.fire += 1
-        elif ev == "tool.release":
-            self.tool_release += 1
         elif ev == "step.release":
             self.step_release += 1
+            if row.get("returning"):
+                self.returning += 1
+        elif ev == "ticket.write":
+            self.tickets += 1
+            self.ticket_why[row.get("why") or "?"] += 1
         elif ev == "wait":
             self.waits += 1
         elif ev == "grant":
@@ -234,10 +232,16 @@ class Report:
             leases = row.get("leases") or []
             self.last_snapshot[pid] = leases
             limit = self.boot_limit.get(pid, 1)
-            if len(leases) > limit and not all(lease.get("over") for lease in leases[limit:]):
+            # Order does not matter: an over-limit lease may sit anywhere in the
+            # list, so count the ordinary ones instead of slicing by position.
+            ordinary = [lease for lease in leases if not lease.get("over")]
+            if len(ordinary) > limit:
                 self.snapshot_over_limit.append(
-                    f"{fmt_ms(ms)} pid {pid}: {len(leases)} лизов при limit {limit}"
+                    f"{fmt_ms(ms)} pid {pid}: {len(ordinary)} обычных лизов при limit {limit}"
                 )
+            queue = row.get("queue") or []
+            self.boosted = sum(1 for entry in queue if entry.get("boost") is not None)
+            self.deferred = sum(1 for entry in queue if entry.get("defer"))
             lease_timeout = self.boot_lease_timeout.get(pid)
             if lease_timeout:
                 for lease in leases:
@@ -316,12 +320,15 @@ class Report:
         print()
 
     def _print_steps(self) -> None:
-        print(f"границы шага: step.handoff={self.step_handoff}  arm={self.arm}"
-              f"  fire={self.fire}  tool.release={self.tool_release}  step.release={self.step_release}")
+        print(f"границы шага: step.release={self.step_release} (возвратных={self.returning})"
+              f"  ticket.write={self.tickets}")
+        if self.ticket_why:
+            print("  тикеты: " + ", ".join(f"{why}={count}" for why, count in self.ticket_why.most_common()))
         if self.finishes:
             print("  finish: " + ", ".join(f"{name}={count}" for name, count in self.finishes.most_common()))
         timer = sum(1 for row in self.releases if row.get("reason") in TIMER_RELEASES)
         print(f"  отпущено таймером (не событием): {timer}")
+        print(f"  в последнем срезе: boost={self.boosted}  defer={self.deferred}")
         print()
 
     def _print_queue(self) -> None:

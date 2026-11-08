@@ -198,3 +198,39 @@ test("simultaneous acquires across instances never exceed the limit", async () =
   lockB.release("b", "test")
   assert.equal(store.list().length, 0)
 })
+
+test("onTake fires exactly once per new lease, never on re-acquire or timeout", async () => {
+  const store = memoryStore()
+  let takes = 0
+  const lock = createTurnLock({
+    store,
+    limit: 1,
+    pollMs: 10,
+    acquireTimeoutMs: 80,
+    onTimeout: "proceed",
+    onTake: () => {
+      takes += 1
+    },
+  })
+
+  const first = await lock.acquire("holder")
+  assert.equal(first.granted, true)
+  assert.equal(takes, 1, "a fresh lease bumps the counter")
+
+  // A re-acquire by the current holder must not bump it again.
+  const again = await lock.acquire("holder")
+  assert.equal(again.granted, true)
+  assert.equal(takes, 1, "re-acquire by the holder does not count as a new grant")
+
+  lock.release("holder", "idle")
+  const second = await lock.acquire("newcomer")
+  assert.equal(second.granted, true)
+  assert.equal(takes, 2, "the next holder counts once")
+
+  // An over-limit timeout does not go through a new-lease write, so it must not
+  // count either.
+  const over = await lock.acquire("over")
+  assert.equal(over.granted, true)
+  assert.equal(over.overLimit, true)
+  assert.equal(takes, 2, "an over-limit timeout grant does not bump the counter")
+})

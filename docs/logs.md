@@ -36,7 +36,7 @@
 - `sid` — id сессии OpenCode (`ses_...`).
 - День файла считается по **локальному** календарю.
 
-Поля оболочки (`t`, `ms`, `pid`, `owner`, `ev`) пишутся последними и не могут быть перекрыты полем события — в частности, длительность handoff лежит в `delayMs`, а не в `ms`.
+Поля оболочки (`t`, `ms`, `pid`, `owner`, `ev`) пишутся последними и не могут быть перекрыты полем события — поэтому длительности в событиях лежат в собственных полях (`delayMs`, `gapMs`, `ageMs`), а не в `ms`.
 
 `since` у лизы — не целое: к нему добавлен случайный дробный сдвиг, чтобы две лизы, взятые в одну миллисекунду, имели детерминированный порядок. `ageMs` = `Date.now() - since`, округлённый.
 
@@ -46,8 +46,8 @@
 
 | `ev` | Поля | Смысл |
 |---|---|---|
-| `boot` | `scope`, `limit`, `handoffMs`, `leaseTimeoutMs`, `pollMs`, `refreshEveryMs`, `sweepMs`, `timeoutMs`, `onTimeout`, `localProviders`, `dir`, `logFile`, `traceFile`, `pruned`, `prunedSids`, `tickets`, `restored`, `orphans`, `source`, `node` | инстанс поднялся; здесь же эффективный конфиг и уборка на старте |
-| `shutdown` | `held`, `waiting`, `handoffs`, `events` | инстанс выгружается: что он считал своим |
+| `boot` | `scope`, `limit`, `returnTicketTtlMs`, `leaseTimeoutMs`, `pollMs`, `refreshEveryMs`, `sweepMs`, `timeoutMs`, `onTimeout`, `localProviders`, `dir`, `logFile`, `traceFile`, `pruned`, `prunedSids`, `tickets`, `restored`, `orphans`, `source`, `node` | инстанс поднялся; здесь же эффективный конфиг и уборка на старте |
+| `shutdown` | `held`, `waiting`, `events` | инстанс выгружается: что он считал своим |
 | `stream.open` | `types` | подписка на события открылась |
 | `stream.closed` | `events`, `livedMs`, `lastEventAgoMs`, `aborted`, `how`, `error` | подписка закрылась. `how: "ended"` — итератор завершился (в том числе по `abort` при выгрузке), `how: "threw"` — исключение. `aborted: false` — поток встал сам |
 
@@ -55,12 +55,12 @@
 
 | `ev` | Поля | Смысл |
 |---|---|---|
-| `event.recv` | `type`, `sid`, `finish`, `status`, `held`, `handoff`, `waiting`, `n` | событие получено; `held`/`handoff`/`waiting` — что инстанс про эту сессию думал в этот момент |
+| `event.recv` | `type`, `sid`, `finish`, `status`, `held`, `waiting`, `n` | событие получено; `held`/`waiting` — что инстанс про эту сессию думал в этот момент |
 | `event.ignore` | `type`, `sid`, `why` | событие сознательно пропущено, причина в `why` |
 | `event.drop` | `type`, `why` | событие выброшено до обработки (нет `sid`; `session.status` не `idle`) |
 | `event.model` | `type`, `sid`, `providerID`, `local` | определён провайдер сессии (local/cloud) |
 
-Основные `why` у `event.ignore`: `step of a lease this instance does not hold` (соседний инстанс не трогает чужой лиз), `no handoff armed` (инструмент без взведённого handoff), `turn scope`, `releaseOnForm=false`, `releaseOnPermission=false`.
+Основные `why` у `event.ignore`: `step of a lease this instance does not hold` (соседний инстанс не трогает чужой лиз), `turn scope`, `releaseOnForm=false`, `releaseOnPermission=false`.
 
 ### Гейт (`context`)
 
@@ -68,8 +68,7 @@
 |---|---|---|
 | `context.enter` | `sid`, `providerID`, `scope` | запрос дошёл до гейта |
 | `context.cloud` | `sid`, `providerID` | облачный провайдер — не гейтится |
-| `context.continue` | `sid`, `handoff` | продолжение шага на уже взятом лизе (`refresh`, без release/acquire) |
-| `context.reacquire` | `sid`, `why` | шаг держал лиз, но нового события шага не было — лиз отпущен и взят заново |
+| `context.reacquire` | `sid`, `why` | шаг держал лиз, но нового события шага не было — лиз отпущен, тикет возврата записан, слот берётся заново |
 | `context.covered` | `sid`, `root` | сабагент едет на лизе родителя |
 | `context.subagent` | `sid`, `kind`, `root` | `turn`-режим: сабагент покрыт родителем или освобождён |
 | `yield` | `sid`, `ahead[]`, `level` | мягкая уступка слота ждущему более высокого уровня |
@@ -89,30 +88,27 @@
 
 `rank` в трассе: `low=0`, `normal=1`, `high=2`.
 
-### Граница шага и отпускание
+### Граница шага, отпускание и возврат
 
 | `ev` | Поля | Смысл |
 |---|---|---|
-| `step.handoff` | `type`, `sid`, `finish`, `handoffMs` | шаг закончился с `tool-calls`/`length` — лиз держится через границу |
-| `handoff.arm` | `sid`, `kind`, `delayMs`, `replaced` | взведён таймер страховки (`kind`: `tool`/`continue`) |
-| `handoff.fire` | `sid`, `kind`, `delayMs` | таймер сработал раньше реального события |
-| `tool.release` | `sid`, `kind`, `gapMs` | инструмент стартовал и отпустил лиз; `gapMs` — длина зазора |
-| `step.release` | `type`, `sid`, `finish` | шаг отпустил лиз сразу (`stop`, `error`, пустой `finish`) |
-| `terminal` | `type`, `sid`, `held`, `handoff` | терминальное событие прогона |
-| `release` | `sid`, `reason`, `held`, `since`, `ageMs` | лиз отпущен: причина и сколько держали |
+| `step.release` | `type`, `sid`, `finish`, `returning` | шаг отпустил лиз; `returning: true` у `tool-calls`/`length` — прогон продолжится, сессии положен тикет возврата |
+| `ticket.write` | `sid`, `why` | записан тикет возврата (`why`: `step-boundary` или тип паузы `form.*`/`permission.*`) |
+| `terminal` | `type`, `sid`, `held` | терминальное событие прогона |
+| `release` | `sid`, `reason`, `held`, `since`, `ageMs` | лиз отпущен: причина и сколько держали. `reason: "step-boundary"` — конец запроса к модели |
 | `stale` | `sid`, `ageMs` | лиз выброшен как просроченный (нет `refresh` дольше `leaseTimeoutMs`) |
 
 ### Фон
 
 | `ev` | Поля | Смысл |
 |---|---|---|
-| `heartbeat` | `held[]`, `handoffs[]`, `waiting[]` | тик `refreshEveryMs` |
+| `heartbeat` | `held[]`, `waiting[]` | тик `refreshEveryMs` |
 | `refresh` | `sid`, `source` | обновлён `seen` лизы |
 | `sweep` | `leases` | тик уборки |
-| `snapshot` | `leases[]`, `queue[]`, `held[]`, `handoffs[]`, `waiting[]`, `events`, `lastEventAgoMs` | раз в `traceEveryMs` — срез состояния |
+| `snapshot` | `leases[]`, `queue[]`, `held[]`, `waiting[]`, `events`, `lastEventAgoMs` | раз в `traceEveryMs` — срез состояния |
 
 Элемент `snapshot.leases`: `sid`, `since`, `seen`, `ageMs`, `staleMs` (сколько прошло с последнего refresh), `over`, `pid`, `owner`.
-Элемент `snapshot.queue`: `sid`, `rank`, `position` (1 — первый), `age` (ключ сортировки: `createdAt` сессии или начало ожидания).
+Элемент `snapshot.queue`: `sid`, `rank`, `position` (1 — первый **в порядке обслуживания**, а не по времени ожидания), `age` (ключ сортировки: `createdAt` сессии или начало ожидания), `boost` (время отпускания, если тикет возврата уже «поднят» передачей слота; иначе `null`), `defer` (`true` — сессия ждёт, пока её тикет не поднимут).
 
 `snapshot` — становой хребет разбора: даже если все событийные строки потерялись, минутный срез показывает, кто держал слот и кто ждал.
 
@@ -131,11 +127,19 @@
 
 // <sid>.prio.json  — только у ⚡/▽
 { "sid": "ses_...", "pid": 29156, "owner": "...", "since": 1794006795911, "level": "high" }
+
+// <sid>.turn.json — тикет возврата; у сабагента лежит под именем родителя
+{ "sid": "ses_...", "pid": 29156, "owner": "...", "releasedAt": 1794006795911,
+  "expiresAt": 1794007095911, "releasedGrants": 42 }
+
+// slot-free.json — когда слот освободился и сколько выдач уже было
+{ "at": 1794006795900, "grants": 43 }
 ```
 
 - `seen` — последний refresh; `leaseTimeoutMs` без обновления → `stale`.
 - `markedAt` — последний тик ожидания; три подряд пропущенных тика → файл считается брошенным.
 - `createdAt` — абсолютное время создания сессии, ключ сортировки очереди (переживает перезапуск инстанса).
+- `expiresAt` — тикет возврата живёт `returnTicketTtlMs` (5 мин по умолчанию); `releasedGrants` — значение общего счётчика `grants` в момент отпускания. Пока `grants` не вырос, вернувшаяся сессия `defer` (не отбирает слот у очереди); как только вырос — `boost` (первая в своём уровне).
 
 ## Как разбирать
 
@@ -158,9 +162,9 @@ $all = Get-Content $f | ForEach-Object { $_ | ConvertFrom-Json }   # ~5 тыс. 
 $all | Where-Object ev -eq 'release' |
   Select-Object @{n='time';e={([DateTimeOffset]::FromUnixTimeMilliseconds([long]$_.ms)).ToLocalTime().ToString('HH:mm:ss')}}, sid, reason, ageMs
 
-# границы шагов
-$all | Where-Object { $_.ev -in @('step.handoff','handoff.arm','handoff.fire','tool.release','step.release') } |
-  Select-Object @{n='time';e={([DateTimeOffset]::FromUnixTimeMilliseconds([long]$_.ms)).ToLocalTime().ToString('HH:mm:ss')}}, ev, sid, finish, kind, gapMs
+# границы шагов и возвраты
+$all | Where-Object { $_.ev -in @('step.release','ticket.write','release') } |
+  Select-Object @{n='time';e={([DateTimeOffset]::FromUnixTimeMilliseconds([long]$_.ms)).ToLocalTime().ToString('HH:mm:ss')}}, ev, sid, finish, returning, why, reason, ageMs
 
 # поток событий жив?
 $all | Where-Object { $_.ev -in @('stream.open','stream.closed') } |
@@ -181,7 +185,7 @@ Select-String -Path $f -Pattern '"ev":"release"' | ForEach-Object { $_.Line | Co
 
 ```bash
 jq -r 'select(.ev=="release") | [.t,.sid,.reason,.ageMs] | @tsv' lock-*.jsonl
-jq -r 'select(.ev=="step.handoff" or .ev=="tool.release" or .ev=="handoff.fire") | [.t,.sid,.ev,(.finish//.kind)] | @tsv' lock-*.jsonl
+jq -r 'select(.ev=="step.release" or .ev=="ticket.write") | [.t,.sid,.ev,(.finish//.why),.returning] | @tsv' lock-*.jsonl
 jq -c 'select(.ev=="stream.open" or .ev=="stream.closed")' lock-*.jsonl
 jq -c 'select(.ev=="snapshot")' lock-*.jsonl | tail -5
 ```
@@ -195,8 +199,8 @@ jq -c 'select(.ev=="snapshot")' lock-*.jsonl | tail -5
 | 1 | Поток событий был жив? | `stream.open`/`stream.closed`, `snapshot.lastEventAgoMs` | на каждый `pid` один `open` и один `closed` с `aborted:true` (перезапуск); `lastEventAgoMs` — секунды | `closed` с `aborted:false`; `open` без `closed` у живого pid; минуты без `event.recv` при активных сессиях |
 | 2 | Лиз отпускал владелец? | `event.recv.held`, `event.ignore.why` | на событие ровно один инстанс с `held:true`, остальные — `does not hold` | два инстанса с `held:true` на одну сессию → двойной release |
 | 3 | Каждому взятию — свой release? | `lease.taken` vs `release` + `stale` + `shutdown.held` | каждое `lease.taken` закрыто `release`; незакрытых на конец нет | `taken` без `release`/`stale` → слот утёк до `leaseTimeoutMs` |
-| 4 | Не держали лишнего? | `release.ageMs`, `snapshot.staleMs` | возраст ≈ длительность запроса/шага; `staleMs` — десятки секунд | `ageMs` ≈ `leaseTimeoutMs`, `staleMs` растёт до минуты и больше |
-| 5 | Таймер не подменял событие? | `handoff.fire`, `release.reason` = `no tool started`/`no continuation` | единицы за сутки (шаг без продолжения) | часто → события не доходят, `handoffMs` маскирует потерю |
+| 4 | Не держали лишнего? | `release.ageMs`, `snapshot.staleMs` | `ageMs` ≈ длительность одного запроса к модели (секунды–десятки секунд); `staleMs` — десятки секунд | `ageMs` в десятки минут → лиз держится через инструменты, `release.reason` не `step-boundary` |
+| 5 | Возврат не превратился в вечное удержание? | `ticket.write`, `step.release.returning`, `snapshot.queue.boost/defer` | `ticket.write` на каждый `tool-calls`/`length`; `defer` снимается первой же выдачей слота | тикетов больше, чем `step.release`, или `defer` держится минутами при живой очереди |
 | 6 | Лимит не превышался? | `acquire.result.overLimit`, `grant.overLimit`, `timeout`, `snapshot.leases` | длина `leases` ≤ `limit`; `overLimit` только после `timeout` | два обычных лиза при `limit:1`, `overLimit` без `timeout` |
 | 7 | Порядок очереди соблюдался? | `snapshot.queue` (`position`, `rank`, `age`), `grant.waitedMs`, `wait.blocked` | слот получает `position:1` своего уровня; `waitedMs` растёт монотонно | выдан не первый, хотя первый жив и не `over` |
 | 8 | Шаги не терялись? | `context.reacquire` | 0–единицы | регулярно → `step.ended` не доходит, лиз держится до таймера |
@@ -208,7 +212,9 @@ jq -c 'select(.ev=="snapshot")' lock-*.jsonl | tail -5
 
 ## Особенности текущей версии
 
-- **`session.tool.called` приходит раньше `session.step.ended`** (замер 07.11.2026: +323 мс). Поэтому `tool.release` почти всегда 0, а `handoffMs` фактически закрывает только зазор `step.ended → следующий context`. Лиз при этом держится весь шаг, включая выполнение инструмента, и освобождается на `stop`. Это не ошибка, но при разборе не надо считать `tool.release: 0` поломкой.
+- **Слот освобождается на `session.step.ended`, а не на `session.tool.called`.** `tool.called` приходит раньше `step.ended` (замер 07.11.2026: медиана −0.32 с, 90% пар), поэтому отпускание на инструменте не срабатывало и лиз жил весь прогон. Теперь конец запроса — единственная точка отпускания; `release.reason` = `step-boundary`, а `handoffMs` принимается только для совместимости и не используется.
+- **Возврат держится на тикете, а не на времени создания.** `tool-calls`/`length` пишут `<sid>.turn.json`; пока общий счётчик `grants` не вырос, сессия `defer` и не отбирает слот у очереди, после первой выдачи — `boost` и первая в своём уровне. Тикет живёт `returnTicketTtlMs` (5 мин) и удаляется при взятии слота. У сабагента тикет лежит под именем родителя (`rootOf`), поэтому родитель и ребёнок не встают друг за другом.
+- **`snapshot.queue.position` — реальный порядок обслуживания** (`compareQueue`), а не порядок по времени ожидания; `boost`/`defer` в срезе показывают, как сработал тикет.
 - **Каждое событие видно во всех инстансах.** `event.recv` дублируется по числу локаций; `held:true` должен быть ровно у одного. Это главный тест на «сосед не трогает чужой лиз».
 - **`snapshot` пишется каждым инстансом**, поэтому в одном срезе `leases` повторяются — это одна и та же картина с разных процессов, а не разные лизы.
 - **`t` в UTC.** Не путать с локальным временем в человеческом логе (`turn-lock.log` тоже UTC, `toISOString`).

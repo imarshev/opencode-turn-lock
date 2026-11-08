@@ -90,18 +90,46 @@ export function parsePriorityArgument(text: string, command: string): PriorityLe
  * comes back after a tool is still older than everyone who queued while it
  * worked. A flag only supplies the level; inside a level the oldest session is
  * served first.
+ *
+ * Two optional overrides come from a *return ticket* (a session released its
+ * slot at a step boundary and is coming back for the next request):
+ * `boost` is the moment the session released — a returning session with a
+ * "lifted" ticket goes to the front of its level, ordered among its boosted
+ * fellows by release time; `defer` marks a returning session whose ticket is
+ * not yet lifted — it waits behind everyone while its slot handoff settles. A
+ * session is never both boosted and deferred.
  */
-export type QueueEntry = { sid: string; rank: number; age: number }
+export type QueueEntry = { sid: string; rank: number; age: number; boost?: number; defer?: boolean }
 
 /** A queue entry for `sid` at `level`, ordered by `age`. */
 export function levelEntry(sid: string, level: PriorityLevel, age: number): QueueEntry {
   return { sid, rank: PRIORITY_RANK[level], age }
 }
 
-/** The order waiters are served in: better level, then older, then id. The id
- *  keeps two waiters with the same age deterministic across processes. */
+/** Whether `left` is served before `right` inside the same level: a boosted
+ *  session first (ordered by release time, earliest first), then a plain one,
+ *  then a deferred one, then by age, then by id. */
+export function beforeInLevel(left: QueueEntry, right: QueueEntry): boolean {
+  const leftBoost = left.boost !== undefined
+  const rightBoost = right.boost !== undefined
+  if (leftBoost !== rightBoost) return leftBoost
+  if (leftBoost && rightBoost && left.boost !== right.boost) return (left.boost ?? 0) < (right.boost ?? 0)
+  const leftDefer = left.defer === true
+  const rightDefer = right.defer === true
+  if (leftDefer !== rightDefer) return !leftDefer
+  if (left.age !== right.age) return left.age < right.age
+  return left.sid < right.sid
+}
+
+/** The order waiters are served in: better level, then the in-level order
+ *  (`beforeInLevel`), then id. The id keeps two identical entries deterministic
+ *  across processes. */
 export function compareQueue(left: QueueEntry, right: QueueEntry): number {
-  return right.rank - left.rank || left.age - right.age || left.sid.localeCompare(right.sid)
+  const rank = right.rank - left.rank
+  if (rank !== 0) return rank
+  if (beforeInLevel(left, right)) return -1
+  if (beforeInLevel(right, left)) return 1
+  return 0
 }
 
 /** Waiters of a strictly better level than `rank`: they take the next free slot
@@ -110,13 +138,10 @@ export function outranking(entries: readonly QueueEntry[], sid: string, rank: nu
   return entries.filter((entry) => entry.sid !== sid && entry.rank > rank)
 }
 
-/** Waiters of the same level that go before `self`: an older age, or the same
- *  age and a smaller id. These are the places the FIFO grace windows protect. */
+/** Waiters of the same level that go before `self`, in the exact serving order
+ *  (`beforeInLevel`). These are the places the FIFO grace windows protect. */
 export function aheadInLevel(entries: readonly QueueEntry[], self: QueueEntry): QueueEntry[] {
   return entries.filter(
-    (entry) =>
-      entry.sid !== self.sid &&
-      entry.rank === self.rank &&
-      (entry.age < self.age || (entry.age === self.age && entry.sid < self.sid)),
+    (entry) => entry.sid !== self.sid && entry.rank === self.rank && beforeInLevel(entry, self),
   )
 }

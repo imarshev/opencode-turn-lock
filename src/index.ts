@@ -4,11 +4,12 @@
 // Why: the local engine (strata on 18500) serves one request at a time and
 // switches context per request, so N interleaved agent sessions thrash the
 // conversation cache. By default the slot covers one *request*: it is taken in
-// the `context` hook and freed when that request's tools start. A
-// `session.step.ended` with `finish: "tool-calls"` therefore does not free the
-// slot at once: the lease is kept until the first `session.tool.called` (or
-// `handoffMs`), so another session cannot slip into the gap between the model
-// answer and the tool. The queue is ordered by the absolute session creation
+// the `context` hook and freed at the end of that request (`session.step.ended`).
+// A `finish: "tool-calls"` or `"length"` step also writes a *return ticket* for
+// the session, so when it sends the next request it is served at the front of
+// its level — but only once someone has actually been admitted since it released
+// (otherwise it would grab back the slot it just freed while a sibling stood at
+// the head of the queue). The queue is ordered by the absolute session creation
 // time (`session.time.created`), not by when the wait began: inside a level the
 // oldest session is served first. `lockScope: "turn"` restores the whole-turn
 // lease.
@@ -55,11 +56,12 @@
 //     "limit": 1,                       // concurrent local sessions
 //     "localProviders": ["strata"],     // provider ids treated as local
 //     "localHosts": ["127.0.0.1", "localhost", "::1", "0.0.0.0"],
-//     "acquireTimeoutMs": 14400000,     // 4 h: max wait before onTimeout applies
+//     "acquireTimeoutMs": 57600000,     // 16 h: max wait before onTimeout applies (fail-open last resort)
 //     "onTimeout": "proceed",           // "proceed" (fail-open) | "hold"
 //     "leaseTimeoutMs": 7200000,        // lease without refresh = abandoned
 //     "pollMs": 200,
-//     "handoffMs": 1000,                // hold the slot across a step boundary until its first tool starts
+//     "returnTicketTtlMs": 300000,      // how long a released step's return right stays fresh (5 min)
+//     "handoffMs": 0,                   // legacy, accepted but unused; 0 = the slot frees at step.ended
 //     "fifoGraceMs": 2000,              // how long place 1 may take a freed slot before place 2 gets it
 //     "refreshEveryMs": 20000,
 //     "sweepMs": 60000,
@@ -100,6 +102,7 @@ import {
   type QueueEntry,
 } from "./priority.ts"
 import { createPriorityFlags } from "./priority-store.ts"
+import { createReturnTickets } from "./tickets.ts"
 import { readState, withState, type TurnLockState } from "./state.ts"
 import { fileStore, processAlive } from "./store-file.ts"
 import { createTrace, type TraceFields } from "./trace.ts"
@@ -140,13 +143,16 @@ export type TurnLockConfig = {
   leaseTimeoutMs: number
   /** What one lease covers: a single model request (`request`, the default) or
    *  the whole turn (`turn`). In `request` scope the slot is freed when the
-   *  step's tools start, and taken again by the next request of the session. */
+   *  step ends, and returned to the session at the front of its level when it
+   *  asks again. */
   lockScope: "request" | "turn"
-  /** How long a `request`-scope lease is kept across a step boundary while the
-   *  first tool of that step starts (`finish: "tool-calls"`) or a continuation
-   *  arrives (`finish: "length"`). This is not a queue reservation: the slot is
-   *  freed at the tool event, and the timer is only the fallback for a step
-   *  that never continues. 0 frees the slot at `step.ended` at once. */
+  /** How long a released step's *return ticket* stays valid. While the ticket
+   *  is alive and its holder comes back for the next request, it is served at
+   *  the front of its level (once someone has been admitted since it released);
+   *  an older ticket is dropped. 0 disables the return priority entirely. */
+  returnTicketTtlMs: number
+  /** Legacy, accepted for compatibility but unused: the slot now always frees
+   *  at `step.ended`. Kept so an old config line cannot error. */
   handoffMs: number
   pollMs: number
   /** How long the head of a level may take a freed slot before the next waiter
@@ -190,21 +196,24 @@ export const DEFAULTS: TurnLockConfig = {
   // A long queued turn is normal here: the point is to let one goal finish
   // before the next session is admitted, and goals can take hours. The timeout
   // is only the last-resort anti-deadlock (a live holder refreshes its lease
-  // every refreshEveryMs, so a wedged holder is the case it covers).
-  acquireTimeoutMs: 4 * 60 * 60_000,
+  // every refreshEveryMs, so a wedged holder is the case it covers). It is kept
+  // high on purpose: sessions are meant to wait their turn honestly, and only
+  // fail open as a last resort.
+  acquireTimeoutMs: 16 * 60 * 60_000,
   onTimeout: "proceed",
   leaseTimeoutMs: 2 * 60 * 60_000,
-  // One lease per model request: the slot is free while a tool runs, and the
-  // queue is ordered by the session's creation time, so its next step is still
-  // first in line. `"turn"` restores the old whole-turn lease.
+  // One lease per model request: the slot is freed at the end of each request,
+  // and the returning session holds a five-minute return ticket that puts it at
+  // the front of its level. `"turn"` restores the old whole-turn lease.
   lockScope: "request",
   pollMs: 200,
-  // A step boundary is not a real pause: the next thing that happens is either
-  // a tool starting (a few milliseconds) or a continuation request. Keeping the
-  // slot for that moment costs nothing — the engine is idle anyway — and it
-  // stops another session from taking the slot in the gap. The timer is only
-  // the fallback for a step that never continues.
-  handoffMs: 1_000,
+  // The return ticket replaces the old handoff: the slot is freed at
+  // `step.ended` at once, and the ticket is what stops the returning session
+  // from being pushed behind waiters that joined while it worked. It only lives
+  // 5 minutes — a session that does not come back within the window simply
+  // queues again. `handoffMs` is accepted for compatibility but no longer used.
+  returnTicketTtlMs: 5 * 60_000,
+  handoffMs: 0,
   // The head of a level gets two poll ticks to take a freed slot; if it does not
   // (dead process, wedged event loop), the next place is served instead.
   fifoGraceMs: 2_000,
@@ -266,12 +275,7 @@ export const RELEASE_EVENTS = [
  *  cloud flag then — not at the first request. */
 const MODEL_EVENTS = ["session.created", "session.model.selected"] as const
 
-/** The first tool of a step. In `request` scope the slot is kept across the
- *  step boundary until one of these arrives, so another session cannot slip
- *  into the gap between the model answer and the tool that follows it. */
-const HANDOFF_EVENTS = ["session.tool.called"] as const
-
-const EVENT_TYPES = [...RELEASE_EVENTS, ...MODEL_EVENTS, ...HANDOFF_EVENTS] as string[]
+const EVENT_TYPES = [...RELEASE_EVENTS, ...MODEL_EVENTS] as string[]
 
 /** Events after which this session's run is over, so a wait it queued must not
  *  outlive it. `form.*` and `permission.*` are deliberately absent: there the
@@ -284,6 +288,19 @@ const END_OF_RUN_EVENTS = new Set<string>([
   "session.deleted",
   "session.archived",
 ])
+
+/** Terminal-event releases after which the session is expected to continue
+ *  (a pause for the human). The run resumes, so the session keeps its place by
+ *  getting a return ticket, exactly like an expected-continuation step. */
+const RETURNING_RELEASE_EVENTS = new Set<string>([
+  "form.created",
+  "form.replied",
+  "form.cancelled",
+  "permission.asked",
+  "permission.replied",
+])
+
+const isRunContinuing = (type: string): boolean => RETURNING_RELEASE_EVENTS.has(type)
 
 /** Fields of an OpenCode V2 event the lock cares about. */
 type AnyEvent = {
@@ -356,6 +373,7 @@ function mergeConfig(base: TurnLockConfig, raw: unknown): TurnLockConfig {
     leaseTimeoutMs: asNumber(value.leaseTimeoutMs, base.leaseTimeoutMs, 1_000),
     pollMs: Math.max(5, asNumber(value.pollMs, base.pollMs, 5)),
     handoffMs: Math.max(0, asNumber(value.handoffMs, base.handoffMs, 0)),
+    returnTicketTtlMs: Math.max(0, asNumber(value.returnTicketTtlMs, base.returnTicketTtlMs, 0)),
     fifoGraceMs: Math.max(0, asNumber(value.fifoGraceMs, base.fifoGraceMs, 0)),
     refreshEveryMs: Math.max(0, asNumber(value.refreshEveryMs, base.refreshEveryMs, 0)),
     sweepMs: Math.max(1_000, asNumber(value.sweepMs, base.sweepMs, 1_000)),
@@ -480,14 +498,6 @@ export default Plugin.define({
     const store = fileStore(config.dir)
     const pruned = store.pruneDead(processAlive)
     const held = new Set<string>()
-    /** Steps whose slot is kept across the boundary until the first tool of that
-     *  step starts (or a continuation request arrives). Not a queue reservation:
-     *  the slot is freed at the tool event, and the timer only covers a step
-     *  that never continues. */
-    const handoffs = new Map<
-      string,
-      { kind: "tool" | "continue"; timer?: ReturnType<typeof setTimeout>; at: number }
-    >()
     const owner = String(ctx?.location?.directory ?? "")
 
     // The decision trace (trace.ts). Every line carries the instance's pid and
@@ -680,32 +690,10 @@ export default Plugin.define({
       }
     }
 
-    /** Turn tickets are gone: the queue no longer keeps a place across steps.
-     *  Files from a previous version are only noise now; drop them on boot
-     *  unless another live process still owns one. */
-    const pruneTickets = (): number => {
-      let names: string[]
-      try {
-        names = readdirSync(config.dir)
-      } catch {
-        return 0
-      }
-      let removed = 0
-      for (const name of names) {
-        if (!name.endsWith(".turn.json")) continue
-        const path = join(config.dir, name)
-        try {
-          const value = JSON.parse(readFileSync(path, "utf8"))
-          const pid = typeof value?.pid === "number" ? value.pid : undefined
-          if (pid !== undefined && pid !== process.pid && processAlive(pid)) continue
-          unlinkSync(path)
-          removed += 1
-        } catch {
-          // a broken or already removed file is not a ticket
-        }
-      }
-      return removed
-    }
+    /** Return tickets that have expired or belong to a dead process are dropped on
+     *  boot; these are the only `.turn.json` files the plugin keeps, so the old
+     *  "tickets are gone, drop them all" cleanup is replaced by the sweep. */
+    const pruneTickets = (): number => returnTickets.sweep(processAlive)
 
     /** Everyone waiting right now, oldest wait first. The sidecars are the only
      *  shared record of waiters (the store holds granted leases only), so the
@@ -819,15 +807,84 @@ export default Plugin.define({
     const levelOf = flags.levelOf
     const rankOf = flags.rankOf
 
+    /** When a slot last freed. The head of a level may take it at once; the next
+     *  place is let through only after another `fifoGraceMs`, so a head that
+     *  stopped polling cannot hold the slot. The same file carries the shared
+     *  grant counter (`grants`): how many times a fresh lease has been admitted,
+     *  which lets a returning session tell whether it was overtaken while it was
+     *  away. An older file with only `at`, or no file at all, reads as grants 0,
+     *  so nothing depends on the field existing. */
+    const slotFreePath = join(config.dir, "slot-free.json")
+
+    const readSlotFree = (): { at: number; grants: number } => {
+      try {
+        const value = JSON.parse(readFileSync(slotFreePath, "utf8"))
+        return {
+          at: typeof value?.at === "number" ? value.at : 0,
+          grants: typeof value?.grants === "number" ? value.grants : 0,
+        }
+      } catch {
+        return { at: 0, grants: 0 }
+      }
+    }
+
+    const readFreeAt = (): number => readSlotFree().at
+
+    /** Current grant counter: how many fresh leases have been admitted. */
+    const readGrants = (): number => readSlotFree().grants
+
+    const writeFreeAt = (at: number): void => {
+      try {
+        mkdirSync(config.dir, { recursive: true })
+        const grants = readSlotFree().grants
+        writeFileSync(slotFreePath, JSON.stringify({ at, ...(grants ? { grants } : {}) }), "utf8")
+      } catch {
+        // best-effort: without the file the queue falls back to the first awake
+      }
+    }
+
+    /** Count one more admitted lease. Wired to the core's `onTake`. */
+    const bumpGrants = (): void => {
+      try {
+        mkdirSync(config.dir, { recursive: true })
+        const { at, grants } = readSlotFree()
+        writeFileSync(slotFreePath, JSON.stringify({ ...(at ? { at } : {}), grants: grants + 1 }), "utf8")
+      } catch {
+        // best-effort
+      }
+    }
+
+    // The return ticket: a session that released its slot at a step boundary
+    // and means to continue holds a short right to be served at the front of its
+    // level. The module is root-aware (a subagent rides its parent's ticket) and
+    // reads the grant counter above.
+    const returnTickets = createReturnTickets({
+      dir: config.dir,
+      ttlMs: config.returnTicketTtlMs,
+      owner,
+      rootOf: (sid) => roots.get(sid),
+      readGrants,
+    })
+
     /**
      * One waiter as the queue sees it. The age is the absolute creation time of
      * the session; when the server does not report it, the start of this wait is
      * the fallback. A flag only supplies the level — inside a level the oldest
-     * session is still served first.
+     * session is still served first. A live return ticket changes that: if a
+     * new grant has happened since the session released, it is `boost`ed to the
+     * front of its level; otherwise it is `defer`red until its ticket is lifted.
      */
     const entryOf = (sid: string, waited: number, created?: number): QueueEntry => {
       const flag = flagOf(sid)
-      return levelEntry(sid, flag?.level ?? "normal", created ?? createdAt.get(sid) ?? waited)
+      const entry = levelEntry(sid, flag?.level ?? "normal", created ?? createdAt.get(sid) ?? waited)
+      const ticket = returnTickets.read(sid)
+      if (ticket) {
+        // An overtaken session comes back to the front of its level; a session
+        // whose release has not been overtaken yet simply waits its turn.
+        if (readGrants() > ticket.releasedGrants) entry.boost = ticket.releasedAt
+        else entry.defer = true
+      }
+      return entry
     }
 
     /** Everyone queued right now. A waiter that already holds a slot is being
@@ -841,37 +898,31 @@ export default Plugin.define({
      *  first, and a holder of `rank` gives its own slot up to them. */
     const waitingAbove = (rank: number, except?: string) => outranking(rankedWaiters(), except ?? "", rank)
 
-    /** When a slot last freed. The head of a level may take it at once; the next
-     *  place is let through only after another `fifoGraceMs`, so a head that
-     *  stopped polling cannot hold the slot. */
-    const slotFreePath = join(config.dir, "slot-free.json")
-
-    const readFreeAt = (): number => {
-      try {
-        const value = JSON.parse(readFileSync(slotFreePath, "utf8"))
-        return typeof value?.at === "number" ? value.at : 0
-      } catch {
-        return 0
-      }
-    }
-
-    const writeFreeAt = (at: number): void => {
-      try {
-        mkdirSync(config.dir, { recursive: true })
-        writeFileSync(slotFreePath, JSON.stringify({ at }), "utf8")
-      } catch {
-        // best-effort: without the file the queue falls back to the first awake
-      }
-    }
-
     /** May `sid` take a free slot? No, while anyone goes before it: a better
      *  level always, and an older waiter of its own level until the head has had
-     *  its `fifoGraceMs`. `since` is when this wait began; the age that orders it
+     *  its `fifoGraceMs`. A returning session additionally holds back while its
+     *  release has not been overtaken and others queue behind it — it must not
+     *  grab back the slot it just freed until a grant lifts its ticket and
+     *  boosts it forward. `since` is when this wait began; the age that orders it
      *  is the session's creation time, exactly like `orderedWaiters`. */
     const holdsBack = (sid: string, since: number): boolean => {
       const me = entryOf(sid, since)
       const waiters = rankedWaiters()
       if (outranking(waiters, sid, me.rank).length) return true
+      // Return-ticket staging: while the releasing session has not been overtaken
+      // (grants <= releasedGrants), it must not take a free slot either — the slot
+      // it freed would ping-pong back to it before a sibling at the head gets a
+      // turn. Once a grant lifts the ticket the entry is boosted and this check
+      // lets go.
+      const ticket = returnTickets.read(sid)
+      if (ticket && readGrants() <= ticket.releasedGrants) {
+        // Only a waiter that can actually take the slot is worth deferring for.
+        // If everyone else is deferred too, no grant can ever lift a ticket, so
+        // the oldest deferred session must go first instead of deadlocking
+        // until `acquireTimeoutMs`.
+        const others = waiters.some((waiter) => waiter.sid !== sid && !waiter.defer)
+        if (others) return true
+      }
       if (config.fifoGraceMs <= 0) return false
       const ahead = aheadInLevel(waiters, me)
       if (!ahead.length) return false
@@ -1290,6 +1341,7 @@ export default Plugin.define({
       // levels simply become inert (a flag reads as nothing when priority is off).
       holdBack: config.priorityEnabled || config.lockScope === "request" ? holdsBack : undefined,
       onFree: writeFreeAt,
+      onTake: bumpGrants,
     })
 
     // Provider locality, cached until config/provider updates.
@@ -1346,22 +1398,15 @@ export default Plugin.define({
           // inherits its parent's level; the same lookup records the session's
           // absolute creation time, which orders the queue.
           await rootOf(sid)
-          const handoff = handoffs.get(sid)
-          if (handoff) {
-            // This request continues the step the slot was kept for (a `length`
-            // continuation, or a step whose tool never started). The lease is
-            // already held; releasing and retaking it would open exactly the gap
-            // the handoff exists to close.
-            if (handoff.timer) clearTimeout(handoff.timer)
-            handoffs.delete(sid)
-            lock.refresh(sid)
-            t("context.continue", { sid, handoff: handoff.kind })
-          } else if (held.has(sid)) {
+          if (held.has(sid)) {
             // A step event was lost: this is a new context, so the previous
             // request is over and the lease must not turn back into a turn lease.
             t("context.reacquire", { sid, why: "no step event for the held lease" })
             held.delete(sid)
             lock.release(sid, "step-boundary")
+            // The run continues, so the released request hands back a return
+            // ticket: the session comes next time at the front of its level.
+            returnTickets.write(sid)
             void syncState(sid, { holding: null })
           }
           // A step of the parent covers its subagents. While a `task` tool runs,
@@ -1430,6 +1475,9 @@ export default Plugin.define({
         // next step, must not restart the clock on every request.
         const leaseSince = lock.snapshot().leases.find((lease) => lease.sid === sid)?.since
         t("lease.taken", { sid, since: leaseSince ?? null, level: levelOf(sid) })
+        // The session now holds the slot, so its return right has been used up;
+        // the next release writes a fresh ticket.
+        returnTickets.drop(sid)
         void syncState(sid, { holding: leaseSince ?? Date.now() })
       },
     )
@@ -1462,28 +1510,6 @@ export default Plugin.define({
       }
     }
 
-    /** Keep a `request`-scope lease across a step boundary for a moment: the step
-     *  is followed either by its first tool (`finish: "tool-calls"`) or by a
-     *  continuation request (`finish: "length"`), and freeing the slot in that
-     *  gap would let another session take it before the engine is really free.
-     *  The lease is released on the matching event; the timer is only the
-     *  fallback for a step that never continues. */
-    const armHandoff = (sid: string, kind: "tool" | "continue"): void => {
-      const previous = handoffs.get(sid)
-      if (previous?.timer) clearTimeout(previous.timer)
-      const ms = Math.max(config.handoffMs, config.pollMs * 2)
-      t("handoff.arm", { sid, kind, delayMs: ms, replaced: previous?.kind ?? null })
-      const timer = setTimeout(() => {
-        handoffs.delete(sid)
-        t("handoff.fire", { sid, kind, delayMs: ms })
-        if (!held.delete(sid)) return
-        lock.release(sid, kind === "tool" ? "no tool started" : "no continuation")
-        void syncState(sid, { holding: null })
-      }, ms)
-      if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref()
-      handoffs.set(sid, { kind, timer, at: Date.now() })
-    }
-
     const controller = new AbortController()
     // Stream liveness: a subscription that dies silently is the one failure the
     // queue cannot survive (the holder keeps refreshing a lease nobody releases),
@@ -1503,7 +1529,6 @@ export default Plugin.define({
             finish: (event as AnyEvent).data?.finish ?? null,
             status: (event as AnyEvent).data?.status?.type ?? null,
             held: sid ? held.has(sid) : null,
-            handoff: sid ? handoffs.has(sid) : null,
             waiting: sid ? waiting.has(sid) : null,
             n: stream.events,
           })
@@ -1554,10 +1579,11 @@ export default Plugin.define({
             continue
           }
           // A step ends one model request, not the turn. In `request` scope the
-          // slot is freed here — unless the step is followed at once by a tool
-          // or a continuation, in which case the lease is kept across the gap
-          // (`handoffMs`) and released on the matching event. In `turn` scope a
-          // step is not a release at all.
+          // slot is freed here for any finish. A `tool-calls` or `length` step
+          // is followed by another request from the same session, so it also
+          // writes a return ticket: the session is served at the front of its
+          // level next time (once someone has been admitted since it released).
+          // In `turn` scope a step is not a release at all.
           if (type === "session.step.ended" || type === "session.step.failed") {
             if (config.lockScope !== "request") {
               t("event.ignore", { type, sid, why: "turn scope" })
@@ -1566,55 +1592,33 @@ export default Plugin.define({
             // The event stream is server-wide, so every instance of every
             // location sees this step — but only the instance that served the
             // request may decide what its boundary means. Releasing here
-            // unconditionally would drop the lease the owner is keeping for the
-            // tool that is about to start (the handoff), so a sibling instance
-            // would silently defeat it. A lease left by a dead instance is the
-            // stale sweep's job, not a sibling's.
+            // unconditionally would drop a lease another instance is keeping for
+            // the request it is currently serving. A lease left by a dead
+            // instance is the stale sweep's job, not a sibling's.
             if (!held.has(sid)) {
               t("event.ignore", { type, sid, why: "step of a lease this instance does not hold" })
               continue
             }
             const finish = type === "session.step.ended" ? String((event as AnyEvent).data?.finish ?? "") : ""
-            if (config.handoffMs > 0 && (finish === "tool-calls" || finish === "length")) {
-              t("step.handoff", { type, sid, finish, handoffMs: Math.max(config.handoffMs, config.pollMs * 2) })
-              armHandoff(sid, finish === "tool-calls" ? "tool" : "continue")
-              continue
-            }
-            t("step.release", { type, sid, finish })
+            t("step.release", { type, sid, finish, returning: finish === "tool-calls" || finish === "length" })
             held.delete(sid)
-            lock.release(sid, type)
+            lock.release(sid, finish === "tool-calls" || finish === "length" ? "step-boundary" : type)
+            if (finish === "tool-calls" || finish === "length") {
+              // The request is going to continue; hand the session a return right.
+              returnTickets.write(sid)
+              t("ticket.write", { sid, why: "step-boundary" })
+            }
             // The step is over, so nobody holds the slot any more — clear the
             // badge even when another instance served the request and this one
             // has no `held` entry for it.
             void syncState(sid, { holding: null })
             continue
           }
-          // The first tool of a step. If the step boundary kept the slot for
-          // exactly this moment, the engine is now really free: release it.
-          if (type === "session.tool.called") {
-            const handoff = handoffs.get(sid)
-            if (!handoff) {
-              t("event.ignore", { type, sid, why: "no handoff armed" })
-              continue
-            }
-            if (handoff.timer) clearTimeout(handoff.timer)
-            handoffs.delete(sid)
-            t("tool.release", { sid, kind: handoff.kind, gapMs: Date.now() - handoff.at })
-            if (!held.delete(sid)) continue
-            lock.release(sid, "tool started")
-            void syncState(sid, { holding: null })
-            continue
-          }
           // A terminal event ends the request or turn for good; the lease is
           // released here and the badge must go with it. A queued session has no
           // `holding`, so this write is a no-op for it.
-          t("terminal", { type, sid, held: held.has(sid), handoff: handoffs.has(sid) })
-          held.delete(sid)
-          const pending = handoffs.get(sid)
-          if (pending) {
-            if (pending.timer) clearTimeout(pending.timer)
-            handoffs.delete(sid)
-          }
+          t("terminal", { type, sid, held: held.has(sid) })
+          const wasHeld = held.delete(sid)
           lock.release(sid, type)
           void syncState(sid, { holding: null })
           // `release` only frees a slot this session held; a queued one has no
@@ -1623,10 +1627,19 @@ export default Plugin.define({
           // run that will never happen.
           if (END_OF_RUN_EVENTS.has(type)) {
             lock.cancelWait(sid, type)
+            returnTickets.drop(sid)
           }
           // A session that no longer runs cannot be the one the user needs now.
           if (type === "session.deleted" || type === "session.archived") {
             flags.drop(sid)
+            returnTickets.drop(sid)
+          }
+          // A form/permission pause frees the slot but the run continues after
+          // the human answers, so the pausing session keeps its place: it gets a
+          // return ticket, exactly like a step it is expected to continue from.
+          if (wasHeld && isRunContinuing(type)) {
+            returnTickets.write(sid)
+            t("ticket.write", { sid, why: type })
           }
           // A queued session has no lease, so a terminal event for it (deleted,
           // inbox cancelled) releases nothing — still drop its title mark.
@@ -1684,7 +1697,7 @@ export default Plugin.define({
               lock.refresh(sid)
               t("refresh", { sid, source: "heartbeat" })
             }
-            t("heartbeat", { held: [...held], handoffs: [...handoffs.keys()], waiting: [...waiting] })
+            t("heartbeat", { held: [...held], waiting: [...waiting] })
           }, config.refreshEveryMs)
         : undefined
     if (heartbeat && typeof (heartbeat as { unref?: () => void }).unref === "function") {
@@ -1712,17 +1725,20 @@ export default Plugin.define({
             } catch {
               // a snapshot is best-effort
             }
-            const queue = rankedWaiters().map((entry, index) => ({
-              sid: entry.sid,
-              rank: entry.rank,
-              position: index + 1,
-              age: entry.age,
-            }))
+            const queue = rankedWaiters()
+              .sort(compareQueue)
+              .map((entry, index) => ({
+                sid: entry.sid,
+                rank: entry.rank,
+                position: index + 1,
+                age: entry.age,
+                boost: entry.boost ?? null,
+                defer: !!entry.defer,
+              }))
             t("snapshot", {
               leases,
               queue,
               held: [...held],
-              handoffs: [...handoffs.keys()],
               waiting: [...waiting],
               events: stream.events,
               lastEventAgoMs: stream.lastAt ? Date.now() - stream.lastAt : null,
@@ -1744,6 +1760,7 @@ export default Plugin.define({
       scope: config.lockScope,
       limit: config.limit,
       handoffMs: config.handoffMs,
+      returnTicketTtlMs: config.returnTicketTtlMs,
       leaseTimeoutMs: config.leaseTimeoutMs,
       pollMs: config.pollMs,
       refreshEveryMs: config.refreshEveryMs,
@@ -1765,8 +1782,8 @@ export default Plugin.define({
 
     log(
       "info",
-      `ready: src=${SOURCE} scope=${config.lockScope} limit=${config.limit} handoff=${
-        config.handoffMs
+      `ready: src=${SOURCE} scope=${config.lockScope} limit=${config.limit} ticket=${
+        config.returnTicketTtlMs
       }ms local=${config.localProviders.join(",")} timeout=${Math.round(
         config.acquireTimeoutMs / 60_000,
       )}min onTimeout=${config.onTimeout} mark=${config.markWaitingTitle} prio=${
@@ -1775,7 +1792,7 @@ export default Plugin.define({
     )
 
     return async () => {
-      t("shutdown", { held: [...held], waiting: [...waiting], handoffs: [...handoffs.keys()], events: stream.events })
+      t("shutdown", { held: [...held], waiting: [...waiting], events: stream.events })
       controller.abort()
       clearInterval(sweeper)
       if (heartbeat) clearInterval(heartbeat)
@@ -1785,10 +1802,6 @@ export default Plugin.define({
       // hooks nobody awaits any more.
       for (const sid of waiting) lock.cancelWait(sid, "unload")
       waiting.clear()
-      for (const handoff of handoffs.values()) {
-        if (handoff.timer) clearTimeout(handoff.timer)
-      }
-      handoffs.clear()
       for (const sid of held) lock.release(sid, "unload")
       held.clear()
       for (const sid of [...marked]) await unmarkWaiting(sid, "unload")

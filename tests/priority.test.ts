@@ -7,6 +7,7 @@ import test from "node:test"
 
 import {
   aheadInLevel,
+  beforeInLevel,
   compareQueue,
   isLevel,
   LEVEL_CYCLE,
@@ -126,4 +127,58 @@ test("aheadInLevel: only the same level, and only a strictly earlier place", () 
     ["ses_1", "ses_0"],
   )
   assert.deepEqual(aheadInLevel([], self), [])
+})
+
+test("beforeInLevel: a boosted session jumps its own level; defer waits at the back", () => {
+  // Same level, differing only by boost / defer / age.
+  const plainOld = { sid: "old", rank: 1, age: 10 }
+  const plainYoung = { sid: "young", rank: 1, age: 90 }
+  const boosted = { sid: "ret", rank: 1, age: 90, boost: 500 }
+  const deferred = { sid: "def", rank: 1, age: 10, defer: true }
+  const boostedEarlier = { sid: "ret0", rank: 1, age: 90, boost: 400 }
+
+  // Boost first, even against an older plain waiter.
+  assert.equal(beforeInLevel(boosted, plainOld), true)
+  assert.equal(beforeInLevel(plainOld, boosted), false)
+  // Among boosted, earlier release first.
+  assert.equal(beforeInLevel(boostedEarlier, boosted), true)
+  // A deferred session waits behind a plain one, despite being older.
+  assert.equal(beforeInLevel(plainOld, deferred), true)
+  assert.equal(beforeInLevel(deferred, plainOld), false)
+  // Plain order stays age-first.
+  assert.equal(beforeInLevel(plainOld, plainYoung), true)
+  assert.equal(beforeInLevel(plainYoung, plainOld), false)
+})
+
+test("compareQueue: rank first, then boost, then plain-before-deferred, then age", () => {
+  const queue = [
+    { sid: "deferred_low", rank: 0, age: 1, defer: true },
+    { sid: "boosted_high", rank: 2, age: 5, boost: 200 },
+    { sid: "deferred_norm", rank: 1, age: 1, defer: true },
+    { sid: "boosted_norm_late", rank: 1, age: 5, boost: 900 },
+    { sid: "plain_norm_old", rank: 1, age: 1 },
+    { sid: "boosted_norm", rank: 1, age: 50, boost: 300 },
+    { sid: "plain_norm_young", rank: 1, age: 99 },
+  ].sort(compareQueue)
+
+  assert.deepEqual(
+    queue.map((item) => item.sid),
+    // high ⚡ first regardless of boost
+    ["boosted_high", "boosted_norm", "boosted_norm_late", "plain_norm_old", "plain_norm_young", "deferred_norm", "deferred_low"],
+  )
+})
+
+test("aheadInLevel honours boost and defer inside the level", () => {
+  const self = { sid: "plain", rank: 1, age: 100 }
+  const waiters = [
+    { sid: "other_plain_older", rank: 1, age: 10 }, // ahead by age
+    { sid: "boosted", rank: 1, age: 200, boost: 100 }, // ahead by boost
+    { sid: "deferred_old", rank: 1, age: 1, defer: true }, // behind despite age
+    { sid: "high", rank: 2, age: 1 }, // different level
+    { sid: "younger_plain", rank: 1, age: 200 }, // behind
+  ]
+  assert.deepEqual(
+    aheadInLevel(waiters, self).map((item) => item.sid),
+    ["other_plain_older", "boosted"],
+  )
 })

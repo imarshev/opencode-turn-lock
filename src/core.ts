@@ -77,6 +77,11 @@ export type TurnLockOptions = {
   holdBack?: (sid: string, since: number) => boolean
   /** Called just before a lease is removed, i.e. at the moment its slot frees. */
   onFree?: (at: number) => void
+  /** Called every time a *new* lease is taken (a session newly admitted to a
+   *  slot), never for a re-acquire by the current holder and never for the
+   *  over-limit timeout branch. The plugin counts these so a returning session
+   *  can tell whether it was overtaken while it was away. */
+  onTake?: () => void
 }
 
 export type TurnLock = {
@@ -103,6 +108,7 @@ export function createTurnLock(options: TurnLockOptions): TurnLock {
   const onChange = options.onChange ?? (() => {})
   const holdBack = options.holdBack
   const onFree = options.onFree ?? (() => {})
+  const onTake = options.onTake ?? (() => {})
   const cancelTtlMs = Math.max(pollMs * 2, options.cancelTtlMs ?? 5_000)
 
   /** A freed slot is announced before the lease disappears, so a waiter that
@@ -175,6 +181,11 @@ export function createTurnLock(options: TurnLockOptions): TurnLock {
       owner: options.owner,
     }
     store.write(lease)
+    try {
+      onTake()
+    } catch {
+      // listeners must never break the lock
+    }
     const after = freshLeases(now())
     if (after.length <= limit) return "taken"
     const ordered = after

@@ -15,6 +15,9 @@
 // back to a session by its title. That is the one ambiguity here: two sessions
 // with the same title would share the first match. The alternative — no click
 // at all — loses the useful part, so the caller decides by passing `cycle`.
+// A session the title agent has not reached yet has no title at all: the client
+// draws a localized placeholder, so the row is joined by project and `time.busy`
+// order instead (see `matchRows`).
 
 import { holdSentence, rowOrder, stateFromTitle, waitLabel, waitSentence, type Lang, type TurnLockState } from "./state.ts"
 import { levelOfTitle } from "./title.ts"
@@ -34,6 +37,11 @@ export type InboxRowData = {
   state?: TurnLockState
   /** The session id, when the loader knows it (needed for a click). */
   id?: string
+  /** The session's directory. The client draws the project name from it, and it
+   *  tells two untitled sessions of different projects apart. */
+  directory?: string
+  /** `time.busy` — the key the client sorts the Working section by. */
+  busy?: number
 }
 
 export type InboxViewOptions = {
@@ -186,6 +194,72 @@ function titleOf(row: Element): string {
   return row.querySelector(TITLE)?.textContent ?? ""
 }
 
+/**
+ * The project name the client draws above the title: the project's own name or,
+ * when it has none, the last segment of its worktree (`$` in the shipped
+ * renderer). Only the session's directory is known here; it is the same text
+ * unless the project was renamed.
+ */
+function projectName(path: string | undefined): string {
+  const text = String(path ?? "").replace(/[/\\]+$/, "")
+  const cut = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"))
+  return (cut >= 0 ? text.slice(cut + 1) : text).toLowerCase()
+}
+
+/**
+ * Is `path` inside the project the row names? The client names a project after
+ * its worktree, while a session may have been opened in a subdirectory of it.
+ */
+function inProject(path: string | undefined, project: string): boolean {
+  if (!project) return false
+  const text = String(path ?? "").toLowerCase().replace(/\\/g, "/")
+  return text.endsWith(`/${project}`) || text.includes(`/${project}/`)
+}
+
+/** The project line of a row: the header is avatar, project name, [badge], time. */
+function projectOf(row: Element): string {
+  const name = row.firstElementChild?.children?.[1]
+  return (name?.textContent ?? "").trim().toLowerCase()
+}
+
+/**
+ * Join the rows to the sessions the loader returned. The title is the natural
+ * key, but a session the title agent has not reached yet has no title at all:
+ * the client draws the localized placeholder (`session.tab.session`) instead,
+ * so the text cannot identify it. Those rows are matched against the untitled
+ * sessions by project name and then by `time.busy`, which is the order the
+ * client lists the Working section in. Two untitled sessions of one project may
+ * still swap a badge until one of them is titled; the state drawn is always the
+ * one the server wrote for the session it was matched to, never a guess.
+ */
+function matchRows(rows: readonly InboxRowData[]): (title: string, project: string) => InboxRowData | undefined {
+  const byTitle = new Map<string, InboxRowData[]>()
+  for (const row of rows) {
+    if (!row.title) continue
+    const list = byTitle.get(row.title)
+    if (list) list.push(row)
+    else byTitle.set(row.title, [row])
+  }
+  const untitled = rows
+    .filter((row) => !row.title)
+    .sort((left, right) => (left.busy ?? Infinity) - (right.busy ?? Infinity))
+  const taken = new Set<InboxRowData>()
+  return (title, project) => {
+    const sameTitle = byTitle.get(title)?.find((row) => !taken.has(row))
+    if (sameTitle) {
+      taken.add(sameTitle)
+      return sameTitle
+    }
+    // No session carries this text, so it is the placeholder of an untitled row.
+    const free = untitled.filter((row) => !taken.has(row))
+    const exact = free.find((row) => projectName(row.directory) === project)
+    const nested = exact ?? free.find((row) => inProject(row.directory, project))
+    const match = nested ?? free[0]
+    if (match) taken.add(match)
+    return match
+  }
+}
+
 const badges = new WeakMap<Element, HTMLElement>()
 
 function ensureStyle(doc: Document): void {
@@ -228,10 +302,9 @@ export function applyInboxView(
   const elements = Array.from(section.querySelectorAll(ROW))
   if (elements.length === 0) return false
 
-  // The loader knows the session's state; the title is only the join key and a
-  // fallback for rows the loader did not return.
-  const byTitle = new Map<string, InboxRowData>()
-  for (const row of rows) byTitle.set(row.title, row)
+  // The loader knows the session's state; the title is the join key and a
+  // fallback for rows the loader did not return (see matchRows for untitled).
+  const match = matchRows(rows)
 
   const doc = elements[0].ownerDocument ?? (globalThis as { document?: Document }).document
   if (!doc) return false
@@ -241,7 +314,7 @@ export function applyInboxView(
   const ordered = elements
     .map((element, index) => {
       const title = titleOf(element)
-      const data = byTitle.get(title)
+      const data = match(title, projectOf(element))
       const state = data?.state ?? stateFromTitle(title)
       return { element, index, title, data, state }
     })

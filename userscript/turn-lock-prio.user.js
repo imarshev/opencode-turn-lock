@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.8.0
+// @version      0.8.1
 // @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий), бейджи приоритета/облака/места, времени ожидания, удержания слота и «в работе» для working-сессий, а также честный статус «⏳ В очереди» вместо «Работает» в открытой сессии — в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
@@ -83,7 +83,9 @@
   // not recreate when the title changes.
   //
   // A row carries no session id in the DOM, so a click is routed by title; two
-  // sessions with the same title would share the first match.
+  // sessions with the same title would share the first match. A session the
+  // title agent has not reached yet has no title at all and the client draws a
+  // placeholder, so its row is joined by project name and `time.busy` order.
   const INBOX_UI = true
   const STATE_KEY = "turn-lock"
   const WORKING = '[data-slot="sidebar-inbox-working"]'
@@ -326,9 +328,12 @@
     ;(document.head || document.documentElement).appendChild(style)
   }
 
-  // title -> { id, state }, refreshed from the list the client itself reads.
-  // The event stream below is the fast path; the 2s poll is the fallback.
-  const rowsByTitle = new Map()
+  // The sessions the client's own list returned, refreshed from the same
+  // `/api/session` it reads. An event stream below is the fast path; the 2s
+  // poll is the fallback. `title` is "" for a session the title agent has not
+  // reached yet: `/api/session` has no `title` field at all then, and the client
+  // draws a localized placeholder instead, so the row cannot be joined by text.
+  let listed = []
   let statesAt = 0
   let statesBusy = false
   let statesAgain = false
@@ -345,20 +350,87 @@
       if (!response.ok) return
       const body = await response.json()
       const list = (body && body.data) || []
-      rowsByTitle.clear()
+      listed = []
       for (const session of list) {
-        if (!session || typeof session.title !== "string") continue
-        rowsByTitle.set(session.title, { id: session.id, state: readState(session.metadata) })
+        if (!session || typeof session !== "object") continue
+        listed.push({
+          id: session.id,
+          title: typeof session.title === "string" ? session.title : "",
+          directory: (session.location && session.location.directory) || session.directory,
+          busy: session.time && Number.isFinite(Number(session.time.busy)) ? Number(session.time.busy) : undefined,
+          state: readState(session.metadata),
+        })
       }
       statesAt = Date.now()
     } catch {
-      // keep the last known map; the next tick retries
+      // keep the last known list; the next tick retries
     } finally {
       statesBusy = false
       if (statesAgain) {
         statesAgain = false
         void loadStates().then(() => draw())
       }
+    }
+  }
+
+  // The project name the client draws above the title: its own name or the last
+  // segment of the worktree. Only the session's directory is known here.
+  const projectName = (path) => {
+    const text = String(path || "").replace(/[/\\]+$/, "")
+    const cut = Math.max(text.lastIndexOf("/"), text.lastIndexOf("\\"))
+    return (cut >= 0 ? text.slice(cut + 1) : text).toLowerCase()
+  }
+
+  // Is the session inside the project the row names? The client names a project
+  // after its worktree; a session may have been opened in a subdirectory of it.
+  const inProject = (path, project) => {
+    if (!project) return false
+    const text = String(path || "").toLowerCase().replace(/\\/g, "/")
+    return text.endsWith(`/${project}`) || text.includes(`/${project}/`)
+  }
+
+  // The header line of a row is avatar, project name, [badge], time.
+  const projectOf = (row) => {
+    const header = row.firstElementChild
+    const name = header && header.children ? header.children[1] : null
+    return String((name && name.textContent) || "").trim().toLowerCase()
+  }
+
+  // Join the DOM rows to the sessions the list returned. A titled row is joined
+  // by its text; an untitled one shows the client's localized placeholder, so it
+  // is joined by project name and then by `time.busy` — the order the client
+  // itself lists the Working section in. Two untitled sessions of one project
+  // may swap a badge until one of them is titled; the state drawn is always the
+  // one the server wrote for the session it was matched to, never a guess.
+  const matchRows = () => {
+    const byTitle = new Map()
+    const untitled = []
+    for (const session of listed) {
+      if (!session.title) {
+        untitled.push(session)
+        continue
+      }
+      const list = byTitle.get(session.title)
+      if (list) list.push(session)
+      else byTitle.set(session.title, [session])
+    }
+    untitled.sort(
+      (left, right) => (left.busy === undefined ? Infinity : left.busy) - (right.busy === undefined ? Infinity : right.busy),
+    )
+    const taken = new Set()
+    return (title, project) => {
+      const result = (byTitle.get(title) || []).find((session) => !taken.has(session))
+      if (result) {
+        taken.add(result)
+        return result
+      }
+      // No session carries this text: it is the placeholder of an untitled row.
+      const free = untitled.filter((session) => !taken.has(session))
+      const exact = free.find((session) => projectName(session.directory) === project)
+      const nested = exact || free.find((session) => inProject(session.directory, project))
+      const match = nested || free[0]
+      if (match) taken.add(match)
+      return match
     }
   }
 
@@ -369,11 +441,12 @@
     const rows = [...section.querySelectorAll(INBOX_ROW)]
     if (!rows.length) return
     ensureStyle()
+    const match = matchRows()
     const ordered = rows
       .map((row, index) => {
         const title = row.querySelector('span[dir="auto"]')?.textContent || ""
-        const entry = rowsByTitle.get(title)
-        return { row, title, index, data: entry, state: (entry && entry.state) || stateFromTitle(title) }
+        const data = match(title, projectOf(row))
+        return { row, title, index, data, state: (data && data.state) || stateFromTitle(title) }
       })
       .sort(
         (left, right) =>

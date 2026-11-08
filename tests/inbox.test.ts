@@ -96,9 +96,13 @@ function document(): FakeDocument {
   return doc
 }
 
-function row(doc: FakeDocument, title: string): Fake {
+function row(doc: FakeDocument, title: string, project = ""): Fake {
+  const avatar = node({ className: "avatar" })
+  const name = node({ textContent: project })
   const time = node({ textContent: "26m" })
   const header = node()
+  header.appendChild(avatar)
+  header.appendChild(name)
   header.appendChild(time)
   const titleSpan = node({ textContent: title })
   const element = node({ ownerDocument: doc })
@@ -248,6 +252,73 @@ test("a working row always says something: a place in the queue, or that it is n
   assert.match(ordinaryBadge.innerHTML, /1 мин/)
 })
 
+test("a session with no title yet still shows its state, joined by project and order", () => {
+  const doc = document()
+  // An untitled session renders `session.tab.session` ("Сессия" / "Session")
+  // instead of a title, so the text cannot be the join key. The project line is
+  // what differs; the client lists the rows in `time.busy` order.
+  const ordinary = row(doc, "Сессия", "opencode-turn-lock")
+  const cloud = row(doc, "Сессия", "VPN")
+  const { root } = mount([ordinary, cloud])
+
+  const rows: InboxRowData[] = [
+    // `/api/session` has no `title` at all for a session the title agent has not
+    // reached yet.
+    { id: "ses_web", title: "", directory: "F:\\Development\\opencode-turn-lock", state: state("normal"), busy: 2 },
+    { id: "ses_vpn", title: "", directory: "F:\\Development\\VPN", state: state("normal", { cloud: true }), busy: 1 },
+  ]
+
+  assert.equal(applyInboxView(root as unknown as ParentNode, rows), true)
+  const badgeOf = (element: Fake) => element.firstElementChild?.children.find((child) => child.className === BADGE_CLASS)
+
+  const cloudBadge = badgeOf(cloud)
+  assert.ok(cloudBadge, "an untitled row is badged")
+  assert.equal(cloudBadge.dataset.cloud, "true")
+  assert.equal(cloudBadge.dataset.idle, "false")
+  assert.match(cloudBadge.title, /облачная модель/)
+
+  assert.equal(badgeOf(ordinary)?.dataset.cloud, "false")
+  assert.equal(badgeOf(ordinary)?.dataset.idle, "true", "the local untitled row stays idle")
+  assert.ok(Number(cloud.style.order) < Number(ordinary.style.order), "cloud still goes first")
+})
+
+test("an untitled row never takes the state of a titled one", () => {
+  const doc = document()
+  const titled = row(doc, "Поправить отчёт", "dos2-planner")
+  const untitled = row(doc, "Session", "VPN")
+  const { root } = mount([titled, untitled])
+
+  const rows: InboxRowData[] = [
+    { id: "ses_titled", title: "Поправить отчёт", directory: "F:\\Development\\dos2-planner", state: state("normal"), busy: 1 },
+    { id: "ses_untitled", title: "", directory: "F:\\Development\\VPN", state: state("normal", { cloud: true }), busy: 2 },
+  ]
+
+  applyInboxView(root as unknown as ParentNode, rows)
+  const badgeOf = (element: Fake) => element.firstElementChild?.children.find((child) => child.className === BADGE_CLASS)
+  assert.equal(badgeOf(titled)?.dataset.cloud, "false")
+  assert.equal(badgeOf(untitled)?.dataset.cloud, "true")
+})
+
+test("an untitled session opened in a subdirectory still finds its project", () => {
+  const doc = document()
+  const cloud = row(doc, "Сессия", "dos2-planner")
+  const { root } = mount([cloud])
+
+  const rows: InboxRowData[] = [
+    {
+      id: "ses_sub",
+      title: "",
+      directory: "F:\\Development\\dos2-planner\\src\\ui",
+      state: state("normal", { cloud: true }),
+      busy: 1,
+    },
+  ]
+
+  applyInboxView(root as unknown as ParentNode, rows)
+  const badge = cloud.firstElementChild?.children.find((child) => child.className === BADGE_CLASS)
+  assert.equal(badge?.dataset.cloud, "true")
+})
+
 test("the view tolerates a section without rows and a missing section", () => {
   const doc = document()
   const { root } = mount([])
@@ -343,4 +414,9 @@ test("the Tampermonkey script reads the same metadata and draws the same badge",
   assert.match(source, /в работе/)
   assert.match(source, /\/api\/event/)
   assert.match(source, /session\.metadata\.updated/)
+  // An untitled session is still listed, and its row is joined by project: the
+  // client draws a placeholder instead of the empty title.
+  assert.match(source, /typeof session\.title === "string" \? session\.title : ""/)
+  assert.match(source, /location\.directory/)
+  assert.match(source, /const projectOf =/)
 })

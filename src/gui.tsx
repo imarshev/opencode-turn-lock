@@ -262,11 +262,21 @@ export default Plugin.define({
           lang: () => (ctx.locale.locale().toLowerCase().startsWith("ru") ? "ru" : "en"),
           load: async () => {
             const list = await ctx.client.session.list()
-            const data = (list?.data ?? []) as Array<{ id?: string; title?: string; metadata?: unknown }>
+            const data = (list?.data ?? []) as Array<{
+              id?: string
+              title?: string
+              metadata?: unknown
+              time?: { busy?: number }
+              location?: { directory?: string }
+            }>
             return data.map((session) => ({
               id: session.id,
+              // An untitled session has no `title`: the client draws a
+              // placeholder, so the row is joined by its project instead.
               title: String(session.title ?? ""),
               state: readState(session.metadata),
+              directory: session.location?.directory,
+              busy: session.time?.busy,
             }))
           },
           cycle: (row) => {

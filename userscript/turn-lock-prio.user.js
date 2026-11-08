@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.7.0
-// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий) и бейджи приоритета/облака/места, времени ожидания, удержания слота и «в работе» для working-сессий в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
+// @version      0.8.0
+// @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий), бейджи приоритета/облака/места, времени ожидания, удержания слота и «в работе» для working-сессий, а также честный статус «⏳ В очереди» вместо «Работает» в открытой сессии — в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
 // @match        https://*/*
@@ -132,6 +132,15 @@
 [data-slot="sidebar-inbox-item"] .${BADGE}:hover { filter: brightness(1.25); }
 [data-slot="sidebar-inbox-item"] .${BADGE} svg { width: 9px; height: 9px; }
 [data-slot="sidebar-inbox-item"] .${BADGE} .tl-wait { font-variant-numeric: tabular-nums; white-space: nowrap; }
+[data-component="session-working"][data-turn-lock-phase] > :not(.tl-status) {
+  display: none !important;
+}
+[data-component="session-working"] .tl-status {
+  display: inline-flex;
+  align-items: center;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 `
 
   const positive = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Math.trunc(Number(value)) : undefined)
@@ -150,7 +159,18 @@
     }
     if (Number.isFinite(Number(raw.since)) && Number(raw.since) > 0) state.since = Number(raw.since)
     if (Number.isFinite(Number(raw.holding)) && Number(raw.holding) > 0) state.holding = Number(raw.holding)
+    if (raw.phase === "queued" || raw.phase === "sending") state.phase = raw.phase
     return state
+  }
+
+  // The same rule as state.ts: the explicit field wins, and a state written
+  // before it existed still answers from its place or its held slot.
+  const phaseOf = (state) => {
+    if (!state) return undefined
+    if (state.phase) return state.phase
+    if (state.position !== undefined || state.since !== undefined) return "queued"
+    if (state.holding !== undefined) return "sending"
+    return undefined
   }
 
   // The fallback for sessions marked by an older version.
@@ -337,7 +357,7 @@
       statesBusy = false
       if (statesAgain) {
         statesAgain = false
-        void loadStates().then(() => sortInbox())
+        void loadStates().then(() => draw())
       }
     }
   }
@@ -395,6 +415,91 @@
     })
   }
 
+  // --------------------------------------------------------- session status
+  //
+  // The client prints "Работает" for any busy session whose timeline is still
+  // empty — exactly the state of a request held in the gate. The phase in
+  // metadata says which of the two it is, so this replaces the line while the
+  // phase is known and puts the host's own word back when it is not. Same DOM
+  // contract as the desktop half (src/status.ts).
+  const WORKING_ROW = '[data-component="session-working"]'
+  const HEADER_DOT = '[data-session-title] [role="status"][aria-label]'
+  const STATUS = "tl-status"
+  const PHASE_ATTR = "data-turn-lock-phase"
+  const dotLabels = new WeakMap()
+
+  const statusLabel = (status, now) => {
+    const phase = phaseOf(status)
+    if (!phase) return undefined
+    if (phase === "queued") {
+      const place = status.position !== undefined ? `${status.position}/${status.total}` : ""
+      // The wait ticks on its own: it is computed from `since`.
+      const wait = status.since !== undefined ? waitLabel(now - status.since) : ""
+      const short = [place, wait].filter(Boolean).join(" · ")
+      const said = `${RU ? "В очереди" : "Queued"}${short ? ` · ${short}` : ""}`
+      const hint = [RU ? "ждёт свободный слот локального движка" : "waiting for a free slot on the local engine"]
+      if (place) hint.push(RU ? `${place} в очереди` : `${place} in queue`)
+      if (status.since !== undefined) hint.push(waitSentence(now - status.since))
+      return { phase, text: `⏳ ${said}`, spoken: said, title: hint.join(" · ") }
+    }
+    const words = RU ? "Отправлено в движок" : "Sent to the engine"
+    return {
+      phase,
+      text: `▶ ${words}`,
+      spoken: words,
+      title: RU
+        ? "слот получен, ответ движка ещё не начал приходить"
+        : "the slot is taken; the engine's answer has not started arriving",
+    }
+  }
+
+  const applyStatus = () => {
+    const label = statusLabel(state.status, Date.now())
+    const container = document.querySelector(WORKING_ROW)
+    if (container) {
+      let own = container.querySelector(`.${STATUS}`)
+      if (!label) {
+        if (own) own.remove()
+        if (container.hasAttribute(PHASE_ATTR)) container.removeAttribute(PHASE_ATTR)
+        if (container.hasAttribute("title")) container.removeAttribute("title")
+      } else {
+        ensureStyle()
+        // The host can rebuild the row; a span that lost its parent is made again.
+        if (!own || own.parentNode !== container) {
+          own = document.createElement("span")
+          own.className = STATUS
+          container.appendChild(own)
+        }
+        if (own.textContent !== label.text) own.textContent = label.text
+        if (container.getAttribute(PHASE_ATTR) !== label.phase) container.setAttribute(PHASE_ATTR, label.phase)
+        if (container.getAttribute("title") !== label.title) container.setAttribute("title", label.title)
+      }
+    }
+    // The title's dot carries no text: only its accessible name says what it is.
+    const dot = document.querySelector(HEADER_DOT)
+    if (!dot) return
+    if (label) {
+      if (!dotLabels.has(dot)) dotLabels.set(dot, dot.getAttribute("aria-label") || "")
+      if (dot.getAttribute("aria-label") !== label.spoken) dot.setAttribute("aria-label", label.spoken)
+      if (dot.getAttribute("title") !== label.title) dot.setAttribute("title", label.title)
+    } else {
+      const original = dotLabels.get(dot)
+      if (original !== undefined) {
+        if (dot.getAttribute("aria-label") !== original) dot.setAttribute("aria-label", original)
+        dotLabels.delete(dot)
+      }
+      if (dot.hasAttribute("title")) dot.removeAttribute("title")
+    }
+  }
+
+  // The two views share every tick: the inbox sort only exists on Home, the
+  // status line only in a session, and each returns at once when its node is
+  // absent.
+  const draw = () => {
+    sortInbox()
+    applyStatus()
+  }
+
   // The client's own event stream is the fast path for the inbox: a metadata
   // write or a queue change arrives as an event and the list is re-read at
   // once instead of waiting for the 2s poll. A burst (one queue change rewrites
@@ -424,7 +529,7 @@
         statesAt = 0 // the poll re-reads when the tab comes back
         return
       }
-      void loadStates().then(() => sortInbox())
+      void loadStates().then(() => draw())
     }, REFRESH_MS)
   }
 
@@ -436,6 +541,11 @@
       data &&
       data.sessionID === state.id
     ) {
+      // A phase change arrives here first: the label moves without a read.
+      if (type === "session.metadata.updated") {
+        state.status = readState(data.metadata)
+        applyStatus()
+      }
       const level =
         type === "session.metadata.updated"
           ? (readState(data.metadata) || {}).level || "normal"
@@ -575,6 +685,8 @@
       // A subagent session is judged by its parent's verdict, not its own: a
       // `/prio` there would write a flag the scheduler never reads.
       parent: Boolean(info && info.parentID),
+      // The phase (queued/sending) and the numbers behind the label.
+      status: readState(info && info.metadata),
     }
   }
 
@@ -751,13 +863,18 @@
 
   // --------------------------------------------------------------------- loop
 
-  const state = { id: null, level: "normal", busy: false, error: false, missing: false, parent: false }
+  const state = { id: null, level: "normal", busy: false, error: false, missing: false, parent: false, status: undefined }
   let lastRead = 0
   let reading = false
 
   const refresh = async (force) => {
     const id = sessionID()
     if (!id) {
+      // Off a session route there is no label to keep: put the host's word back.
+      if (state.status !== undefined) {
+        state.status = undefined
+        applyStatus()
+      }
       hide()
       return
     }
@@ -769,6 +886,8 @@
       state.id = id
       state.level = info.level
       state.parent = info.parent
+      state.status = info.status
+      applyStatus()
       state.error = false
       state.missing = false
       try {
@@ -793,6 +912,8 @@
         state.id = id
         state.level = "normal"
         state.parent = false
+        state.status = undefined
+        applyStatus()
         render(state)
       }
     } finally {
@@ -833,23 +954,26 @@
     // separate tick rather than part of refresh(). The state comes from the
     // session list, refreshed at most every two seconds while the section is up.
     if (INBOX_UI) {
-      void loadStates().then(() => sortInbox())
-      sortInbox()
+      void loadStates().then(() => draw())
+      draw()
       // The stream is the fast path; the poll below remains the fallback.
       void listen()
     }
     setInterval(() => {
       if (document.visibilityState === "visible") {
         if (INBOX_UI && Date.now() - statesAt > 2000 && document.querySelector(WORKING)) {
-          void loadStates().then(() => sortInbox())
+          void loadStates().then(() => draw())
         }
-        sortInbox()
+        draw()
       }
       // SPA navigation changes the path without a load, so the route is checked
       // every tick; the title is re-read less often.
       const id = sessionID()
       if (id !== state.id) {
         lastRead = 0
+        // New route: the old session's phase says nothing about this one.
+        state.status = undefined
+        applyStatus()
         void refresh(true)
         return
       }
@@ -857,8 +981,8 @@
     }, 1000)
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
-        if (INBOX_UI) void loadStates().then(() => sortInbox())
-        sortInbox()
+        if (INBOX_UI) void loadStates().then(() => draw())
+        draw()
         void refresh(true)
       }
     })

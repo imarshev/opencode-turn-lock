@@ -12,6 +12,11 @@
 // states do not fit a toggle, and a menu would cost a second click for the
 // commonest case; the mark in the title always says where the session stands.
 //
+// The same window also owns the session's status line (status.ts): the host
+// prints "Работает" for any busy session with nothing to show yet, and a request
+// held in the gate is exactly that. The label is replaced from metadata while
+// the phase is known.
+//
 // The pill hides only when the server *answered* that `/prio` is not registered
 // (`priorityEnabled: false`). An unreachable or still-starting server is not an
 // answer: the app restores the last session before its sidecar answers, and a
@@ -32,6 +37,7 @@ import { inboxLevel, startInboxView } from "./inbox.ts"
 import { answerFrom, pillVisible, type PillAnswer } from "./pill.ts"
 import { LEVEL_CYCLE, type PriorityLevel } from "./priority.ts"
 import { readState } from "./state.ts"
+import { startStatusView } from "./status.ts"
 
 /** Which level a title claims — the same reading the session list shows. */
 const levelOf = inboxLevel
@@ -66,6 +72,9 @@ export default Plugin.define({
     // Client-only: the server part never sees this option. The sorter lives in
     // the same window as the sidebar, so it can style the rows the host renders.
     const sortInbox = ctx.options?.sortInbox !== false
+    // Client-only too: it replaces the timeline's "Working" line while the queue
+    // holds the request back. Off means the host's own word stands everywhere.
+    const showStatus = ctx.options?.showQueueStatus !== false
 
     // session key -> level. A plain signal holding a new Map, so every pill
     // re-reads when any session's state changes.
@@ -181,7 +190,10 @@ export default Plugin.define({
     // stale (a place, a hold, a new title, a row entering or leaving Working),
     // so the list is re-read at once instead of waiting for its 2s poll. The
     // view coalesces the burst, because one queue change rewrites every waiter.
+    // The session's own status label rides the same stream: a phase change is a
+    // metadata write, and that is exactly what arrives here.
     let refreshInbox: (() => void) | undefined
+    let refreshStatus: (() => void) | undefined
     const listen = async () => {
       try {
         for await (const event of ctx.client.event.subscribe({
@@ -199,6 +211,7 @@ export default Plugin.define({
           signal: ctx.signal,
         })) {
           refreshInbox?.()
+          refreshStatus?.()
           const type = (event as { type?: string }).type
           // Only these two carry a level; the rest are here for the inbox and
           // must not reset a remembered level.
@@ -276,6 +289,30 @@ export default Plugin.define({
         })
       : undefined
 
+    // The session's own line. The host prints "Работает" for any busy session
+    // with nothing to show yet — which is exactly a request held in the gate. The
+    // phase in metadata says which of the two it is, so the label is replaced
+    // while it is known and the host's word comes back when it is not. One
+    // `session.get` per second at most; the event stream cuts the wait short.
+    const stopStatus = showStatus
+      ? startStatusView({
+          reloadMs: 1_000,
+          lang: () => (ctx.locale.locale().toLowerCase().startsWith("ru") ? "ru" : "en"),
+          load: async () => {
+            const session = ctx.sessions.current()
+            if (!session) return undefined
+            const info = await session.server.client.session.get({ sessionID: session.id })
+            return readState(info?.metadata)
+          },
+          watch: (refresh) => {
+            refreshStatus = refresh
+            return () => {
+              if (refreshStatus === refresh) refreshStatus = undefined
+            }
+          },
+        })
+      : undefined
+
     ctx.add(ComposerPill, () => ({
       id: "priority",
       show: (input: ComposerPillProps) => {
@@ -303,7 +340,9 @@ export default Plugin.define({
 
     return () => {
       stopInboxSort?.()
+      stopStatus?.()
       refreshInbox = undefined
+      refreshStatus = undefined
       for (const timer of timers) clearTimeout(timer)
       timers.clear()
     }

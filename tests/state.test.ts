@@ -8,6 +8,7 @@ import test from "node:test"
 import {
   compareOrder,
   orderRows,
+  phaseOf,
   readState,
   rowOrder,
   stateFromTitle,
@@ -42,6 +43,32 @@ test("metadata: our key is written without touching the session's own keys", () 
 
   const cleared = withState(next, undefined)
   assert.deepEqual(cleared, { experimental: { instructions: "keep me" } })
+})
+
+test("the phase round-trips and reads as queued or sending without the field", () => {
+  const queued: TurnLockState = { level: "normal", phase: "queued", position: 2, total: 5, since: 1_700_000_000_000 }
+  assert.deepEqual(readState(withState({}, queued)), queued)
+
+  const sending: TurnLockState = { level: "normal", phase: "sending", holding: 1_700_000_000_000 }
+  assert.deepEqual(readState(withState({}, sending)), sending)
+
+  // A session written by an older version carries no phase at all.
+  assert.equal(readState({ [STATE_KEY]: { level: "normal", phase: "later" } })?.phase, undefined)
+  assert.deepEqual(readState({ [STATE_KEY]: { level: "normal", phase: "queued" } }), {
+    level: "normal",
+    phase: "queued",
+  })
+
+  assert.equal(phaseOf(undefined), undefined)
+  assert.equal(phaseOf({ level: "normal" }), undefined)
+  assert.equal(phaseOf(queued), "queued")
+  assert.equal(phaseOf(sending), "sending")
+  // Derived, for everything written before the field existed.
+  assert.equal(phaseOf({ level: "normal", position: 1, total: 3 }), "queued")
+  assert.equal(phaseOf({ level: "normal", since: 1 }), "queued")
+  assert.equal(phaseOf({ level: "normal", holding: 1 }), "sending")
+  // The field wins over the derived answer, so a writer can correct it.
+  assert.equal(phaseOf({ level: "normal", phase: "sending", position: 1, total: 3 }), "sending")
 })
 
 test("a title from an older version still reads as a state", () => {

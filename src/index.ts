@@ -103,7 +103,7 @@ import {
 } from "./priority.ts"
 import { createPriorityFlags } from "./priority-store.ts"
 import { createReturnTickets } from "./tickets.ts"
-import { readState, withState, type TurnLockState } from "./state.ts"
+import { readState, withState, type Phase, type TurnLockState } from "./state.ts"
 import { fileStore, processAlive } from "./store-file.ts"
 import { createTrace, type TraceFields } from "./trace.ts"
 import {
@@ -547,6 +547,7 @@ export default Plugin.define({
     type StatePatch = {
       level?: PriorityLevel
       cloud?: boolean | null
+      phase?: Phase | null
       position?: number | null
       total?: number | null
       since?: number | null
@@ -555,7 +556,7 @@ export default Plugin.define({
     const applyPatch = (state: TurnLockState, patch: StatePatch): TurnLockState => {
       const next: TurnLockState = { ...state }
       if (patch.level) next.level = patch.level
-      for (const key of ["cloud", "position", "total", "since", "holding"] as const) {
+      for (const key of ["cloud", "phase", "position", "total", "since", "holding"] as const) {
         const value = patch[key]
         if (value === undefined) continue
         if (value === null) delete next[key]
@@ -1052,6 +1053,7 @@ export default Plugin.define({
       }
       const place = placeOf(sid, since)
       void syncState(sid, {
+        phase: "queued",
         position: place?.position ?? null,
         total: place?.total ?? null,
         since,
@@ -1088,7 +1090,7 @@ export default Plugin.define({
     }
 
     /** Restore the original title once the wait is over. */
-    async function unmarkWaiting(sid: string, reason: string): Promise<void> {
+    async function unmarkWaiting(sid: string, reason: string, phase: Phase | null = null): Promise<void> {
       waitEpoch.set(sid, epochOf(sid) + 1)
       const generation = generationOf(sid)
       // A wait that started while this one was being torn down owns the queue
@@ -1097,7 +1099,7 @@ export default Plugin.define({
       // `position` in metadata with no sidecar behind it.
       const settled = () => generationOf(sid) === generation
       const clear = () =>
-        settled() ? syncState(sid, { position: null, total: null, since: null }) : Promise.resolve()
+        settled() ? syncState(sid, { position: null, total: null, since: null, phase }) : Promise.resolve()
       const wasMarked = marked.delete(sid)
       if (!wasMarked && !readWaitMark(sid)) {
         void clear()
@@ -1205,10 +1207,14 @@ export default Plugin.define({
           if (!state) continue
           const place = state.position !== undefined || state.total !== undefined || state.since !== undefined
           const hold = state.holding !== undefined && !leased.has(sid)
-          if (!place && !hold) continue
+          // A phase that outlived its place is stale too, but a live lease owns
+          // its `sending`: the sweep must not wipe a request that is in flight.
+          const stale = state.phase !== undefined && !leased.has(sid)
+          if (!place && !hold && !stale) continue
           await syncState(sid, {
             ...(place ? { position: null, total: null, since: null } : {}),
             ...(hold ? { holding: null } : {}),
+            phase: null,
           })
           cleared += 1
         }
@@ -1240,7 +1246,7 @@ export default Plugin.define({
           } else {
             log("debug", `grant ${event.sid} (held ${event.held}/${event.limit})`)
           }
-          void unmarkWaiting(event.sid, "grant").finally(() => {
+          void unmarkWaiting(event.sid, "grant", "sending").finally(() => {
             void refreshPlaces()
           })
           break
@@ -1504,7 +1510,7 @@ export default Plugin.define({
               log("info", `yield ${sid}: ${who} ${ahead.length === 1 ? "outranks" : "outrank"} it`)
               held.delete(sid)
               lock.release(sid, "priority")
-              void syncState(sid, { holding: null })
+              void syncState(sid, { holding: null, phase: null })
             }
           }
         }

@@ -21,11 +21,24 @@ export { CLOUD_MARK } from "./title.ts"
 /** The key this plugin owns inside `session.metadata`. */
 export const STATE_KEY = "turn-lock"
 
+/**
+ * What the scheduler is doing with this session's model request right now:
+ * `queued` — the request is held before the engine, `sending` — its slot is
+ * taken and the request is on its way. Absent when nothing is gated.
+ */
+export type Phase = "queued" | "sending"
+
 /** Everything a row needs to be sorted and drawn. `level` is always present. */
 export type TurnLockState = {
   level: PriorityLevel
   /** The last model request went to a cloud provider (the session is not gated). */
   cloud?: boolean
+  /**
+   * The explicit phase, written by the scheduler while a request is gated.
+   * Older sessions have no field at all; `phaseOf` derives the same answer from
+   * `position` and `holding`, so every reader works with both.
+   */
+  phase?: Phase
   /** 1-based place in the queue, present only while the session waits. */
   position?: number
   /** How many sessions wait in total, present together with `position`. */
@@ -56,6 +69,7 @@ export function readState(metadata: unknown): TurnLockState | undefined {
     level: isLevel(value.level) ? value.level : "normal",
   }
   if (value.cloud === true) state.cloud = true
+  if (value.phase === "queued" || value.phase === "sending") state.phase = value.phase
   const position = positive(value.position)
   const total = positive(value.total)
   if (position !== undefined && total !== undefined && position <= total) {
@@ -71,6 +85,7 @@ export function readState(metadata: unknown): TurnLockState | undefined {
 function compact(state: TurnLockState): Record<string, unknown> {
   const value: Record<string, unknown> = { level: state.level }
   if (state.cloud) value.cloud = true
+  if (state.phase !== undefined) value.phase = state.phase
   if (state.position !== undefined) value.position = state.position
   if (state.total !== undefined) value.total = state.total
   if (state.since !== undefined) value.since = state.since
@@ -124,6 +139,19 @@ export function stateFromTitle(title: string | null | undefined): TurnLockState 
     found = true
   }
   return found ? state : undefined
+}
+
+/**
+ * The phase a state describes. The explicit field wins; a state written before
+ * it existed (or a title's marks) still answers: a place in the queue means the
+ * request is held back, a held slot means it went out.
+ */
+export function phaseOf(state: TurnLockState | undefined): Phase | undefined {
+  if (!state) return undefined
+  if (state.phase) return state.phase
+  if (state.position !== undefined || state.since !== undefined) return "queued"
+  if (state.holding !== undefined) return "sending"
+  return undefined
 }
 
 /** The two label languages this plugin speaks. */

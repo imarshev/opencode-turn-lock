@@ -61,7 +61,7 @@
 //     "leaseTimeoutMs": 7200000,        // lease without refresh = abandoned
 //     "pollMs": 200,
 //     "returnTicketTtlMs": 300000,      // how long a released step's return right stays fresh (5 min)
-//     "handoffMs": 0,                   // legacy, accepted but unused; 0 = the slot frees at step.ended
+//     "warmHandoffMs": 12000,           // keep the slot across a short tool so the continuation is warm; 0 = free at the tool start
 //     "fifoGraceMs": 2000,              // how long place 1 may take a freed slot before place 2 gets it
 //     "refreshEveryMs": 20000,
 //     "sweepMs": 60000,
@@ -151,9 +151,14 @@ export type TurnLockConfig = {
    *  the front of its level (once someone has been admitted since it released);
    *  an older ticket is dropped. 0 disables the return priority entirely. */
   returnTicketTtlMs: number
-  /** Legacy, accepted for compatibility but unused: the slot now always frees
-   *  at `step.ended`. Kept so an old config line cannot error. */
-  handoffMs: number
+  /** `request` scope only: how long the session keeps its lease after its first
+   *  tool starts, so the continuation lands on the engine's warm prompt cache
+   *  instead of queueing and re-reading the prompt. The slot is not offered to
+   *  the queue during the window; when it runs out the lease is freed and a
+   *  return ticket is written, exactly as at a step boundary. 0 frees the slot
+   *  at the tool start (the behaviour before 09.11.2026). The old name
+   *  `handoffMs` is still read when this key is absent. */
+  warmHandoffMs: number
   pollMs: number
   /** How long the head of a level may take a freed slot before the next waiter
    *  of the same level is let through. 0 disables the FIFO order (first awake wins). */
@@ -207,13 +212,20 @@ export const DEFAULTS: TurnLockConfig = {
   // the front of its level. `"turn"` restores the old whole-turn lease.
   lockScope: "request",
   pollMs: 200,
-  // The return ticket replaces the old handoff: the slot is freed at
-  // `step.ended` at once, and the ticket is what stops the returning session
-  // from being pushed behind waiters that joined while it worked. It only lives
-  // 5 minutes — a session that does not come back within the window simply
-  // queues again. `handoffMs` is accepted for compatibility but no longer used.
+  // The return ticket replaces the old handoff at the step boundary: the slot
+  // is freed at `step.ended` at once, and the ticket is what stops the
+  // returning session from being pushed behind waiters that joined while it
+  // worked. It only lives 5 minutes — a session that does not come back within
+  // the window simply queues again.
   returnTicketTtlMs: 5 * 60_000,
-  handoffMs: 0,
+  // Keep the slot warm across a tool call. The engine drops a conversation's
+  // prompt cache when another conversation takes the slot, and at the night's
+  // budget the parked copy was evicted within a few requests (measured
+  // 09.11.2026: 298 evictions in 8 h, 185 re-reads of 150-210k tokens, 2.4 h
+  // of prefill). Tools are short (p50 1 s, p90 6 s), so 12 s lets almost every
+  // continuation land on the same engine state; a longer tool costs at most
+  // the window, not a full re-read.
+  warmHandoffMs: 12_000,
   // The head of a level gets two poll ticks to take a freed slot; if it does not
   // (dead process, wedged event loop), the next place is served instead.
   fifoGraceMs: 2_000,
@@ -275,7 +287,20 @@ export const RELEASE_EVENTS = [
  *  cloud flag then — not at the first request. */
 const MODEL_EVENTS = ["session.created", "session.model.selected"] as const
 
-const EVENT_TYPES = [...RELEASE_EVENTS, ...MODEL_EVENTS] as string[]
+/** The start of a step's tool call. In `request` scope this is the moment the
+ *  model request is really over: the answer is streamed, the engine is free
+ *  while the tool runs. `session.step.ended` cannot serve as that moment —
+ *  OpenCode closes a `tool-calls` step only after the tool has returned, so a
+ *  slow tool would hold the slot for its whole run (measured 08.11.2026: a
+ *  93 s shell diff held the only slot while the model was idle). */
+const TOOL_EVENTS = ["session.tool.called", "session.tool.input.started"] as const
+
+/** Tools whose run is itself a model request: a subagent's requests ride the
+ *  parent's lease (`coveredBy`), so the parent must not free it at the tool
+ *  start. `task` is the pre-V2 name of the same tool. */
+const SUBAGENT_TOOLS = new Set(["subagent", "task"])
+
+const EVENT_TYPES = [...RELEASE_EVENTS, ...MODEL_EVENTS, ...TOOL_EVENTS] as string[]
 
 /** Events after which this session's run is over, so a wait it queued must not
  *  outlive it. `form.*` and `permission.*` are deliberately absent: there the
@@ -315,6 +340,13 @@ type AnyEvent = {
     finish?: string
     /** `session.tool.called`: whether the runtime executes the call. */
     executed?: boolean
+    /** `session.tool.input.started`: the call the name belongs to. */
+    id?: string
+    name?: string
+    /** `session.step.ended` and `session.tool.called`: the assistant message of
+     *  the step. A step that ended late is recognised by it, so its event does
+     *  not free a lease the continuation already resumed. */
+    assistantMessageID?: string
   }
 }
 
@@ -372,7 +404,7 @@ function mergeConfig(base: TurnLockConfig, raw: unknown): TurnLockConfig {
     lockScope: value.lockScope === "turn" ? "turn" : value.lockScope === "request" ? "request" : base.lockScope,
     leaseTimeoutMs: asNumber(value.leaseTimeoutMs, base.leaseTimeoutMs, 1_000),
     pollMs: Math.max(5, asNumber(value.pollMs, base.pollMs, 5)),
-    handoffMs: Math.max(0, asNumber(value.handoffMs, base.handoffMs, 0)),
+    warmHandoffMs: Math.max(0, asNumber(value.warmHandoffMs ?? value.handoffMs, base.warmHandoffMs, 0)),
     returnTicketTtlMs: Math.max(0, asNumber(value.returnTicketTtlMs, base.returnTicketTtlMs, 0)),
     fifoGraceMs: Math.max(0, asNumber(value.fifoGraceMs, base.fifoGraceMs, 0)),
     refreshEveryMs: Math.max(0, asNumber(value.refreshEveryMs, base.refreshEveryMs, 0)),
@@ -498,6 +530,21 @@ export default Plugin.define({
     const store = fileStore(config.dir)
     const pruned = store.pruneDead(processAlive)
     const held = new Set<string>()
+    // Tool names by call id. `session.tool.called` carries no name, but a
+    // subagent tool must keep its parent's lease: the child's requests run on
+    // that lease, so freeing it at the tool start would let a queued session
+    // take the slot between a parent and its child. The name arrives on the
+    // earlier `session.tool.input.started`, so it is remembered until the call
+    // is seen. The map is bounded: a call that never reaches `called` (aborted
+    // step) must not grow it forever.
+    const toolNames = new Map<string, string>()
+    const rememberTool = (id: string, name: string): void => {
+      if (toolNames.size >= 500) {
+        const oldest = toolNames.keys().next().value
+        if (oldest !== undefined) toolNames.delete(oldest)
+      }
+      toolNames.set(id, name)
+    }
     const owner = String(ctx?.location?.directory ?? "")
 
     // The decision trace (trace.ts). Every line carries the instance's pid and
@@ -596,6 +643,42 @@ export default Plugin.define({
         if (stateQueue.get(sid) === next) stateQueue.delete(sid)
       })
       return next
+    }
+
+    // Warm handoff (`request` scope). The lease is kept after the first tool
+    // starts for `warmHandoffMs`, so the continuation finds the engine's prompt
+    // cache warm instead of queueing for the slot and re-reading the prompt.
+    // The map holds the pending release of each session; `since` is when the
+    // window began, for the trace.
+    const warmHolds = new Map<string, { timer: ReturnType<typeof setTimeout>; since: number }>()
+    // The step whose tool opened the window, and the step whose end arrived
+    // after its continuation had already started. OpenCode normally emits
+    // `step.ended` before the next request (0.3% of contexts arrive first), but
+    // that late event must not free a lease the resumed request is using.
+    const warmStep = new Map<string, string>()
+    const lateStep = new Map<string, string>()
+    const clearWarm = (sid: string): number | undefined => {
+      const entry = warmHolds.get(sid)
+      if (!entry) return undefined
+      clearTimeout(entry.timer)
+      warmHolds.delete(sid)
+      return entry.since
+    }
+    // The window ran out before the session asked again: free the slot exactly
+    // as a step boundary would, with a return ticket so the session is not
+    // pushed behind waiters that joined while its tool ran.
+    const expireWarm = (sid: string): void => {
+      const since = clearWarm(sid)
+      if (since === undefined) return
+      warmStep.delete(sid)
+      lateStep.delete(sid)
+      if (!held.has(sid)) return
+      t("step.release", { type: "warm-handoff", sid, finish: null, returning: true, warm: "expired" })
+      held.delete(sid)
+      lock.release(sid, "warm handoff expired")
+      returnTickets.write(sid)
+      t("ticket.write", { sid, why: "warm handoff expired" })
+      void syncState(sid, { holding: null })
     }
 
     // The cloud mark in the title is only for `titleMarks: "all"`; the metadata
@@ -969,11 +1052,15 @@ export default Plugin.define({
       // lets go.
       const ticket = returnTickets.read(sid)
       if (ticket && readGrants() <= ticket.releasedGrants) {
-        // Only a waiter that can actually take the slot is worth deferring for.
-        // If everyone else is deferred too, no grant can ever lift a ticket, so
-        // the oldest deferred session must go first instead of deadlocking
-        // until `acquireTimeoutMs`.
-        const others = waiters.some((waiter) => waiter.sid !== sid && !waiter.defer)
+        // Only a waiter that can actually take the slot is worth deferring for,
+        // and only one that would be served before `sid`. A waiter of a worse
+        // level never can: `sid` outranks it, so the level check above already
+        // holds it back. Deferring for such a waiter deadlocks the queue — the
+        // slot stays free, no grant lifts the ticket, and everyone waits until
+        // `acquireTimeoutMs` or the ticket expires.
+        const others = waiters.some(
+          (waiter) => waiter.sid !== sid && !waiter.defer && compareQueue(waiter, me) < 0,
+        )
         if (others) return true
       }
       if (config.fifoGraceMs <= 0) return false
@@ -1460,6 +1547,27 @@ export default Plugin.define({
           // inherits its parent's level; the same lookup records the session's
           // absolute creation time, which orders the queue.
           await rootOf(sid)
+          // The continuation the warm window was kept for: the lease is still
+          // ours and the engine still holds this conversation, so the request
+          // goes out at once — no queue wait, no re-read of the prompt.
+          if (held.has(sid) && warmHolds.has(sid)) {
+            const since = clearWarm(sid)
+            // A `step.ended` for this same message may still be in flight; the
+            // guard in the step branch must recognise it and leave the lease.
+            const message = warmStep.get(sid)
+            warmStep.delete(sid)
+            if (message) lateStep.set(sid, message)
+            t("step.warm-resume", {
+              sid,
+              heldMs: since === undefined ? null : Date.now() - since,
+              level: levelOf(sid),
+            })
+            log("info", `warm resume ${sid}: the continuation arrived inside the handoff window`)
+            returnTickets.drop(sid)
+            const leaseSince = lock.snapshot().leases.find((lease) => lease.sid === sid)?.since
+            void syncState(sid, { holding: leaseSince ?? Date.now() })
+            return
+          }
           if (held.has(sid)) {
             // A step event was lost: this is a new context, so the previous
             // request is over and the lease must not turn back into a turn lease.
@@ -1640,6 +1748,74 @@ export default Plugin.define({
             void applyCloudTitle(sid, !local)
             continue
           }
+          // The tool name arrives before the call itself; keep it so the call
+          // can tell a subagent (which keeps the slot) from an ordinary tool.
+          if (type === "session.tool.input.started") {
+            const data = (event as AnyEvent).data
+            if (data?.id && data?.name) rememberTool(String(data.id), String(data.name))
+            continue
+          }
+          // The first tool of a step. In `request` scope the model answer that
+          // produced it is already streamed, so the engine is free while the
+          // tool runs: the slot goes to the queue now, not at `step.ended`
+          // (which OpenCode emits only after the tool returns). The session gets
+          // a return ticket, so a fast tool cannot bounce the slot back and a
+          // slow one keeps its place in the queue meanwhile.
+          if (type === "session.tool.called") {
+            if (config.lockScope !== "request") {
+              t("event.ignore", { type, sid, why: "turn scope" })
+              continue
+            }
+            // Same ownership rule as the step boundary: only the instance that
+            // served the request may free its lease, and only once — the other
+            // tools of the step find no lease here and are ignored.
+            if (!held.has(sid)) {
+              t("event.ignore", { type, sid, why: "step of a lease this instance does not hold" })
+              continue
+            }
+            const callID = String((event as AnyEvent).data?.id ?? "")
+            const name = toolNames.get(callID)
+            if (callID) toolNames.delete(callID)
+            if (name && SUBAGENT_TOOLS.has(name)) {
+              // The child's requests run on this lease, so the engine is not
+              // free: the parent keeps the slot until its step really ends.
+              t("event.ignore", { type, sid, why: "subagent tool keeps the slot for its child" })
+              continue
+            }
+            if (!name) {
+              // The name arrives on `session.tool.input.started`, which a plugin
+              // that reloaded mid-run has not seen. An unknown tool may be a
+              // subagent, whose child rides this lease: freeing the slot now
+              // would deadlock the pair (the parent cannot end its step until
+              // the child answers). Keep the slot until the step boundary.
+              t("event.ignore", { type, sid, why: "tool name unknown: the slot stays until the step ends" })
+              continue
+            }
+            if (config.warmHandoffMs > 0) {
+              // Hold the slot for a moment instead of freeing it at once: the
+              // tool is short (p50 1 s, p90 6 s) and the continuation then
+              // lands on the same engine state, so the prompt is not read
+              // again. A slow tool pays at most the window; `expireWarm` then
+              // frees the slot exactly as a step boundary would. The second
+              // tool of a parallel batch only extends the same window.
+              const previous = warmHolds.get(sid)
+              if (previous) clearTimeout(previous.timer)
+              else t("step.warm-hold", { sid, ms: config.warmHandoffMs, tool: name ?? null })
+              const timer = setTimeout(() => expireWarm(sid), config.warmHandoffMs)
+              if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref()
+              warmHolds.set(sid, { timer, since: previous?.since ?? Date.now() })
+              const message = String((event as AnyEvent).data?.assistantMessageID ?? "")
+              if (message) warmStep.set(sid, message)
+              continue
+            }
+            t("step.release", { type, sid, finish: "tool-calls", returning: true })
+            held.delete(sid)
+            lock.release(sid, "tool started")
+            returnTickets.write(sid)
+            t("ticket.write", { sid, why: "tool-calls" })
+            void syncState(sid, { holding: null })
+            continue
+          }
           // A step ends one model request, not the turn. In `request` scope the
           // slot is freed here for any finish. A `tool-calls` or `length` step
           // is followed by another request from the same session, so it also
@@ -1662,6 +1838,32 @@ export default Plugin.define({
               continue
             }
             const finish = type === "session.step.ended" ? String((event as AnyEvent).data?.finish ?? "") : ""
+            // The step that ended late: its continuation already started on the
+            // warm lease, so this event must not free the slot it is using.
+            const message = String((event as AnyEvent).data?.assistantMessageID ?? "")
+            if (message && lateStep.get(sid) === message) {
+              lateStep.delete(sid)
+              t("event.ignore", { type, sid, why: "step ended after its continuation had already started" })
+              continue
+            }
+            // A warm hold is still pending: the step boundary is not the end of
+            // this session's engine use. `tool-calls`/`length` continue the run
+            // right away, so the lease and the window stay; any other finish
+            // means the turn is over and the slot must go now.
+            if (warmHolds.has(sid)) {
+              if (finish === "tool-calls" || finish === "length") {
+                t("step.warm-keep", { type, sid, finish })
+                continue
+              }
+              clearWarm(sid)
+              warmStep.delete(sid)
+              lateStep.delete(sid)
+              t("step.release", { type, sid, finish, returning: false, warm: "ended" })
+              held.delete(sid)
+              lock.release(sid, finish || type)
+              void syncState(sid, { holding: null })
+              continue
+            }
             t("step.release", { type, sid, finish, returning: finish === "tool-calls" || finish === "length" })
             held.delete(sid)
             lock.release(sid, finish === "tool-calls" || finish === "length" ? "step-boundary" : type)
@@ -1680,6 +1882,9 @@ export default Plugin.define({
           // released here and the badge must go with it. A queued session has no
           // `holding`, so this write is a no-op for it.
           t("terminal", { type, sid, held: held.has(sid) })
+          clearWarm(sid)
+          warmStep.delete(sid)
+          lateStep.delete(sid)
           const wasHeld = held.delete(sid)
           lock.release(sid, type)
           void syncState(sid, { holding: null })
@@ -1801,6 +2006,7 @@ export default Plugin.define({
               leases,
               queue,
               held: [...held],
+              warm: [...warmHolds.keys()],
               waiting: [...waiting],
               events: stream.events,
               lastEventAgoMs: stream.lastAt ? Date.now() - stream.lastAt : null,
@@ -1821,7 +2027,7 @@ export default Plugin.define({
     t("boot", {
       scope: config.lockScope,
       limit: config.limit,
-      handoffMs: config.handoffMs,
+      warmHandoffMs: config.warmHandoffMs,
       returnTicketTtlMs: config.returnTicketTtlMs,
       leaseTimeoutMs: config.leaseTimeoutMs,
       pollMs: config.pollMs,
@@ -1846,7 +2052,7 @@ export default Plugin.define({
       "info",
       `ready: src=${SOURCE} scope=${config.lockScope} limit=${config.limit} ticket=${
         config.returnTicketTtlMs
-      }ms local=${config.localProviders.join(",")} timeout=${Math.round(
+      }ms warm=${config.warmHandoffMs}ms local=${config.localProviders.join(",")} timeout=${Math.round(
         config.acquireTimeoutMs / 60_000,
       )}min onTimeout=${config.onTimeout} mark=${config.markWaitingTitle} prio=${
         config.priorityEnabled ? `/${config.priorityCommand}` : "off"
@@ -1859,6 +2065,13 @@ export default Plugin.define({
       clearInterval(sweeper)
       if (heartbeat) clearInterval(heartbeat)
       if (snapshotter) clearInterval(snapshotter)
+      // A pending warm release must not fire after the instance is gone: the
+      // session is released below, and the timer would then free a lease the
+      // next instance may already own.
+      for (const entry of warmHolds.values()) clearTimeout(entry.timer)
+      warmHolds.clear()
+      warmStep.clear()
+      lateStep.clear()
       // This instance's queue loops must die with it: after a hot reload they
       // would keep polling the shared store, re-mark titles and take slots for
       // hooks nobody awaits any more.

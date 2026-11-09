@@ -46,7 +46,7 @@
 
 | `ev` | Поля | Смысл |
 |---|---|---|
-| `boot` | `scope`, `limit`, `returnTicketTtlMs`, `leaseTimeoutMs`, `pollMs`, `refreshEveryMs`, `sweepMs`, `timeoutMs`, `onTimeout`, `localProviders`, `dir`, `logFile`, `traceFile`, `pruned`, `prunedSids`, `tickets`, `restored`, `orphans`, `source`, `node` | инстанс поднялся; здесь же эффективный конфиг и уборка на старте |
+| `boot` | `scope`, `limit`, `returnTicketTtlMs`, `warmHandoffMs`, `leaseTimeoutMs`, `pollMs`, `refreshEveryMs`, `sweepMs`, `timeoutMs`, `onTimeout`, `localProviders`, `dir`, `logFile`, `traceFile`, `pruned`, `prunedSids`, `tickets`, `restored`, `orphans`, `source`, `node` | инстанс поднялся; здесь же эффективный конфиг и уборка на старте |
 | `shutdown` | `held`, `waiting`, `events` | инстанс выгружается: что он считал своим |
 | `stream.open` | `types` | подписка на события открылась |
 | `stream.closed` | `events`, `livedMs`, `lastEventAgoMs`, `aborted`, `how`, `error` | подписка закрылась. `how: "ended"` — итератор завершился (в том числе по `abort` при выгрузке), `how: "threw"` — исключение. `aborted: false` — поток встал сам |
@@ -88,14 +88,17 @@
 
 `rank` в трассе: `low=0`, `normal=1`, `high=2`.
 
-### Граница шага, отпускание и возврат
+### Тёплое окно, отпускание и возврат
 
 | `ev` | Поля | Смысл |
 |---|---|---|
+| `step.warm-hold` | `sid`, `ms`, `tool` | первый инструмент шага открыл тёплое окно: лиз не отпущен, движок держит промпт |
+| `step.warm-keep` | `type`, `sid`, `finish` | `step.ended` с `tool-calls`/`length` пришёл внутри окна — лиз и окно сохранены |
+| `step.warm-resume` | `sid`, `heldMs`, `level` | продолжение пришло в окно: лиз остался за сессией, запрос ушёл без очереди |
 | `step.release` | `type`, `sid`, `finish`, `returning` | шаг отпустил лиз; `returning: true` у `tool-calls`/`length` — прогон продолжится, сессии положен тикет возврата |
-| `ticket.write` | `sid`, `why` | записан тикет возврата (`why`: `step-boundary` или тип паузы `form.*`/`permission.*`) |
+| `ticket.write` | `sid`, `why` | записан тикет возврата (`why`: `step-boundary`, `warm handoff expired` или тип паузы `form.*`/`permission.*`) |
 | `terminal` | `type`, `sid`, `held` | терминальное событие прогона |
-| `release` | `sid`, `reason`, `held`, `since`, `ageMs` | лиз отпущен: причина и сколько держали. `reason: "step-boundary"` — конец запроса к модели |
+| `release` | `sid`, `reason`, `held`, `since`, `ageMs` | лиз отпущен: причина и сколько держали. `reason`: `tool started` (окно выключено), `warm handoff expired` (окно истекло), `step-boundary` (конец запроса) |
 | `stale` | `sid`, `ageMs` | лиз выброшен как просроченный (нет `refresh` дольше `leaseTimeoutMs`) |
 
 ### Фон
@@ -105,7 +108,7 @@
 | `heartbeat` | `held[]`, `waiting[]` | тик `refreshEveryMs` |
 | `refresh` | `sid`, `source` | обновлён `seen` лизы |
 | `sweep` | `leases` | тик уборки |
-| `snapshot` | `leases[]`, `queue[]`, `held[]`, `waiting[]`, `events`, `lastEventAgoMs` | раз в `traceEveryMs` — срез состояния |
+| `snapshot` | `leases[]`, `queue[]`, `held[]`, `warm[]`, `waiting[]`, `events`, `lastEventAgoMs` | раз в `traceEveryMs` — срез состояния; `warm` — сессии в тёплом окне |
 
 Элемент `snapshot.leases`: `sid`, `since`, `seen`, `ageMs`, `staleMs` (сколько прошло с последнего refresh), `over`, `pid`, `owner`.
 Элемент `snapshot.queue`: `sid`, `rank`, `position` (1 — первый **в порядке обслуживания**, а не по времени ожидания), `age` (ключ сортировки: `createdAt` сессии или начало ожидания), `boost` (время отпускания, если тикет возврата уже «поднят» передачей слота; иначе `null`), `defer` (`true` — сессия ждёт, пока её тикет не поднимут).
@@ -139,7 +142,7 @@
 - `seen` — последний refresh; `leaseTimeoutMs` без обновления → `stale`.
 - `markedAt` — последний тик ожидания; три подряд пропущенных тика → файл считается брошенным.
 - `createdAt` — абсолютное время создания сессии, ключ сортировки очереди (переживает перезапуск инстанса).
-- `expiresAt` — тикет возврата живёт `returnTicketTtlMs` (5 мин по умолчанию); `releasedGrants` — значение общего счётчика `grants` в момент отпускания. Пока `grants` не вырос, вернувшаяся сессия `defer` (не отбирает слот у очереди); как только вырос — `boost` (первая в своём уровне).
+- `expiresAt` — тикет возврата живёт `returnTicketTtlMs` (5 мин по умолчанию); `releasedGrants` — значение общего счётчика `grants` в момент отпускания. Пока `grants` не вырос, вернувшаяся сессия `defer` (не отбирает слот у очереди); как только вырос — `boost` (первая в своём уровне). `defer` держится только за тем, кто действительно может взять слот раньше; ждущие худшего уровня не считаются — они и так уступают по уровню, а не по тикету.
 
 ## Как разбирать
 
@@ -199,11 +202,11 @@ jq -c 'select(.ev=="snapshot")' lock-*.jsonl | tail -5
 | 1 | Поток событий был жив? | `stream.open`/`stream.closed`, `snapshot.lastEventAgoMs` | на каждый `pid` один `open` и один `closed` с `aborted:true` (перезапуск); `lastEventAgoMs` — секунды | `closed` с `aborted:false`; `open` без `closed` у живого pid; минуты без `event.recv` при активных сессиях |
 | 2 | Лиз отпускал владелец? | `event.recv.held`, `event.ignore.why` | на событие ровно один инстанс с `held:true`, остальные — `does not hold` | два инстанса с `held:true` на одну сессию → двойной release |
 | 3 | Каждому взятию — свой release? | `lease.taken` vs `release` + `stale` + `shutdown.held` | каждое `lease.taken` закрыто `release`; незакрытых на конец нет | `taken` без `release`/`stale` → слот утёк до `leaseTimeoutMs` |
-| 4 | Не держали лишнего? | `release.ageMs`, `snapshot.staleMs` | `ageMs` ≈ длительность одного запроса к модели (секунды–десятки секунд); `staleMs` — десятки секунд | `ageMs` в десятки минут → лиз держится через инструменты, `release.reason` не `step-boundary` |
-| 5 | Возврат не превратился в вечное удержание? | `ticket.write`, `step.release.returning`, `snapshot.queue.boost/defer` | `ticket.write` на каждый `tool-calls`/`length`; `defer` снимается первой же выдачей слота | тикетов больше, чем `step.release`, или `defer` держится минутами при живой очереди |
+| 4 | Не держали лишнего? | `release.ageMs`, `snapshot.staleMs`, `snapshot.warm` | `ageMs` ≈ длительность одного запроса к модели (секунды–десятки секунд) плюс окно `warmHandoffMs`; `staleMs` — десятки секунд | `ageMs` в десятки минут → лиз держится через инструменты, `release.reason` не `tool started`/`warm handoff expired`/`step-boundary` |
+| 5 | Возврат не превратился в вечное удержание? | `ticket.write`, `step.release.returning`, `snapshot.queue.boost/defer` | `ticket.write` на каждый `tool-calls`/`length`; `defer` снимается первой же выдачей слота или сразу, если впереди только сессии более низкого уровня | тикетов больше, чем `step.release`, или `defer` держится минутами при живой очереди |
 | 6 | Лимит не превышался? | `acquire.result.overLimit`, `grant.overLimit`, `timeout`, `snapshot.leases` | длина `leases` ≤ `limit`; `overLimit` только после `timeout` | два обычных лиза при `limit:1`, `overLimit` без `timeout` |
 | 7 | Порядок очереди соблюдался? | `snapshot.queue` (`position`, `rank`, `age`), `grant.waitedMs`, `wait.blocked` | слот получает `position:1` своего уровня; `waitedMs` растёт монотонно | выдан не первый, хотя первый жив и не `over` |
-| 8 | Шаги не терялись? | `context.reacquire` | 0–единицы | регулярно → `step.ended` не доходит, лиз держится до таймера |
+| 8 | Шаги не терялись? | `context.reacquire`, `step.warm-resume`, `event.ignore.why` | `context.reacquire` — 0–единицы; `step.warm-resume` на каждое окно, в которое продолжение успело | регулярно → `step.ended` не доходит, лиз держится до таймера; `step ended after its continuation had already started` чаще единиц — порядок событий изменился |
 
 Плюс два прямых индикатора утечки, которые видно без вычислений:
 
@@ -212,8 +215,8 @@ jq -c 'select(.ev=="snapshot")' lock-*.jsonl | tail -5
 
 ## Особенности текущей версии
 
-- **Слот освобождается на `session.step.ended`, а не на `session.tool.called`.** `tool.called` приходит раньше `step.ended` (замер 07.11.2026: медиана −0.32 с, 90% пар), поэтому отпускание на инструменте не срабатывало и лиз жил весь прогон. Теперь конец запроса — единственная точка отпускания; `release.reason` = `step-boundary`, а `handoffMs` принимается только для совместимости и не используется.
-- **Возврат держится на тикете, а не на времени создания.** `tool-calls`/`length` пишут `<sid>.turn.json`; пока общий счётчик `grants` не вырос, сессия `defer` и не отбирает слот у очереди, после первой выдачи — `boost` и первая в своём уровне. Тикет живёт `returnTicketTtlMs` (5 мин) и удаляется при взятии слота. У сабагента тикет лежит под именем родителя (`rootOf`), поэтому родитель и ребёнок не встают друг за другом.
+- **Слот отпускается на первом `session.tool.called`, но только через `warmHandoffMs` (12 с).** `tool.called` приходит раньше `step.ended` (замер 07.11.2026: медиана −0.32 с, 90% пар) и совпадает с моментом, когда ответ модели уже отдан, — движок свободен, пока идёт инструмент. Немедленное отпускание выбивало прогретый промпт: продолжение возвращалось через 41 с ожидания и читало 150–210k токенов заново (09.11.2026: 185 таких префиллов, 2,4 ч). Поэтому лиз держится окно `warmHandoffMs`: `step.warm-hold` на старте, `step.warm-keep` на продолжающемся `step.ended`, `step.warm-resume` при возврате в окно; истекло — `release.reason` = `warm handoff expired` и тикет возврата. `warmHandoffMs: 0` возвращает прежнее поведение (`release.reason` = `tool started`). `handoffMs` читается как старое имя ключа.
+- **Возврат держится на тикете, а не на времени создания.** `tool-calls`/`length` пишут `<sid>.turn.json`; пока общий счётчик `grants` не вырос, сессия `defer` и не отбирает слот у очереди, после первой выдачи — `boost` и первая в своём уровне. `defer` считается только за тем, кто может взять слот раньше (`compareQueue`): ждущие худшего уровня голову не задерживают, иначе высокий возврат и хвост обычных стояли бы до истечения тикета при свободном слоте (дедлок 08.11.2026, ~5 мин на цикл). Тикет живёт `returnTicketTtlMs` (5 мин) и удаляется при взятии слота. У сабагента тикет лежит под именем родителя (`rootOf`), поэтому родитель и ребёнок не встают друг за другом.
 - **`snapshot.queue.position` — реальный порядок обслуживания** (`compareQueue`), а не порядок по времени ожидания; `boost`/`defer` в срезе показывают, как сработал тикет.
 - **Каждое событие видно во всех инстансах.** `event.recv` дублируется по числу локаций; `held:true` должен быть ровно у одного. Это главный тест на «сосед не трогает чужой лиз».
 - **`snapshot` пишется каждым инстансом**, поэтому в одном срезе `leases` повторяются — это одна и та же картина с разных процессов, а не разные лизы.

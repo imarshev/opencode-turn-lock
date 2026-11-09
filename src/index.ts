@@ -14,10 +14,12 @@
 // oldest session is served first. `lockScope: "turn"` restores the whole-turn
 // lease.
 //
-// Cloud providers are never gated: the `context` hook checks the provider of
-// the outgoing request and returns immediately unless it is local. Auxiliary
-// request kinds (`title`, `summary`/`compaction`, `generate`) are not hooked at
-// all, so cloud sessions and local bookkeeping calls are never delayed.
+// Cloud providers are never gated: both hooks check the provider of the outgoing
+// request and return immediately unless it is local. A compaction/summary is a
+// model request of its own and is gated by the `compaction` hook, because the
+// summary runs on the same local engine: the session keeps the slot it already
+// holds until `session.compaction.ended`. `title` and `generate` are not hooked,
+// so local bookkeeping calls are never delayed.
 //
 // Subagents are gated on their own in `request` scope: each request takes a
 // slot and inherits the level of its parent chain (a parent waiting for its
@@ -159,6 +161,11 @@ export type TurnLockConfig = {
    *  at the tool start (the behaviour before 09.11.2026). The old name
    *  `handoffMs` is still read when this key is absent. */
   warmHandoffMs: number
+  /** How long a compaction may keep the slot without its end event. The summary
+   *  runs on the local engine like any other request, so the slot must stay with
+   *  the session that asked for it; `session.compaction.ended` releases it, and
+   *  this cap is the last resort for a lost event. 0 disables the cap. */
+  compactionHoldMs: number
   pollMs: number
   /** How long the head of a level may take a freed slot before the next waiter
    *  of the same level is let through. 0 disables the FIFO order (first awake wins). */
@@ -226,6 +233,11 @@ export const DEFAULTS: TurnLockConfig = {
   // continuation land on the same engine state; a longer tool costs at most
   // the window, not a full re-read.
   warmHandoffMs: 12_000,
+  // A compaction summary is a full local request (often 150-210k tokens), and
+  // the primary request follows it. The slot must stay with the session across
+  // the summary; the end event normally releases it, so half an hour is only
+  // the anti-deadlock cap for an event the stream never delivered.
+  compactionHoldMs: 30 * 60_000,
   // The head of a level gets two poll ticks to take a freed slot; if it does not
   // (dead process, wedged event loop), the next place is served instead.
   fifoGraceMs: 2_000,
@@ -295,12 +307,21 @@ const MODEL_EVENTS = ["session.created", "session.model.selected"] as const
  *  93 s shell diff held the only slot while the model was idle). */
 const TOOL_EVENTS = ["session.tool.called", "session.tool.input.started"] as const
 
+/** The summary request. Compaction runs on the local engine like any other
+ *  request, so the slot must stay with the session that asked for it; the
+ *  `compaction` hook takes it, and these events say when the summary is over. */
+const COMPACTION_EVENTS = [
+  "session.compaction.started",
+  "session.compaction.ended",
+  "session.compaction.failed",
+] as const
+
 /** Tools whose run is itself a model request: a subagent's requests ride the
  *  parent's lease (`coveredBy`), so the parent must not free it at the tool
  *  start. `task` is the pre-V2 name of the same tool. */
 const SUBAGENT_TOOLS = new Set(["subagent", "task"])
 
-const EVENT_TYPES = [...RELEASE_EVENTS, ...MODEL_EVENTS, ...TOOL_EVENTS] as string[]
+const EVENT_TYPES = [...RELEASE_EVENTS, ...MODEL_EVENTS, ...TOOL_EVENTS, ...COMPACTION_EVENTS] as string[]
 
 /** Events after which this session's run is over, so a wait it queued must not
  *  outlive it. `form.*` and `permission.*` are deliberately absent: there the
@@ -347,6 +368,11 @@ type AnyEvent = {
      *  the step. A step that ended late is recognised by it, so its event does
      *  not free a lease the continuation already resumed. */
     assistantMessageID?: string
+    /** `session.compaction.*`: `auto` or `manual`. Auto compaction is followed
+     *  by the primary request; manual compaction is not. */
+    reason?: string
+    /** `session.compaction.failed`: the error the summary stopped with. */
+    error?: string
   }
 }
 
@@ -405,6 +431,7 @@ function mergeConfig(base: TurnLockConfig, raw: unknown): TurnLockConfig {
     leaseTimeoutMs: asNumber(value.leaseTimeoutMs, base.leaseTimeoutMs, 1_000),
     pollMs: Math.max(5, asNumber(value.pollMs, base.pollMs, 5)),
     warmHandoffMs: Math.max(0, asNumber(value.warmHandoffMs ?? value.handoffMs, base.warmHandoffMs, 0)),
+    compactionHoldMs: Math.max(0, asNumber(value.compactionHoldMs, base.compactionHoldMs, 0)),
     returnTicketTtlMs: Math.max(0, asNumber(value.returnTicketTtlMs, base.returnTicketTtlMs, 0)),
     fifoGraceMs: Math.max(0, asNumber(value.fifoGraceMs, base.fifoGraceMs, 0)),
     refreshEveryMs: Math.max(0, asNumber(value.refreshEveryMs, base.refreshEveryMs, 0)),
@@ -668,6 +695,13 @@ export default Plugin.define({
     // as a step boundary would, with a return ticket so the session is not
     // pushed behind waiters that joined while its tool ran.
     const expireWarm = (sid: string): void => {
+      // A compaction owns the lease now: the warm timer must not free the slot
+      // under the summary. `startCompaction` already absorbed the window, so
+      // this only drops a timer that raced the compaction hook.
+      if (compactionHolds.has(sid)) {
+        clearWarm(sid)
+        return
+      }
       const since = clearWarm(sid)
       if (since === undefined) return
       warmStep.delete(sid)
@@ -679,6 +713,116 @@ export default Plugin.define({
       returnTickets.write(sid)
       t("ticket.write", { sid, why: "warm handoff expired" })
       void syncState(sid, { holding: null })
+    }
+
+    // Compaction (`request` scope) is a model request of its own: the summary
+    // runs on the local engine, so the session keeps the slot until
+    // `session.compaction.ended`. Without this, the warm window expired while
+    // the summary was still generating and the queue took the engine — the
+    // continuation then queued behind another session (measured 09.11.2026:
+    // 13 of 17 compactions lost the slot mid-summary).
+    type CompactionHold = {
+      since: number
+      reason: string
+      timer?: ReturnType<typeof setTimeout>
+      /** A warm window was absorbed: an auto summary is followed by the primary
+       *  request, so the window is reopened when the summary ends. */
+      warm: boolean
+    }
+    const compactionHolds = new Map<string, CompactionHold>()
+
+    const clearCompaction = (sid: string): CompactionHold | undefined => {
+      const entry = compactionHolds.get(sid)
+      if (!entry) return undefined
+      if (entry.timer) clearTimeout(entry.timer)
+      compactionHolds.delete(sid)
+      return entry
+    }
+
+    const startCompaction = (sid: string, reason: string): void => {
+      const previous = clearCompaction(sid)
+      // The summary replaces the tool's continuation: the warm timer would
+      // otherwise fire mid-summary. The window is remembered so an auto
+      // compaction can reopen it for the primary request.
+      const warm = previous?.warm === true || warmHolds.has(sid)
+      if (warmHolds.has(sid)) {
+        const since = clearWarm(sid)
+        warmStep.delete(sid)
+        t("compaction.absorb-warm", { sid, heldMs: since === undefined ? null : Date.now() - since })
+      }
+      const entry: CompactionHold = {
+        since: previous?.since ?? Date.now(),
+        reason: reason || previous?.reason || "summary",
+        warm,
+      }
+      if (config.compactionHoldMs > 0) {
+        entry.timer = setTimeout(() => expireCompaction(sid), config.compactionHoldMs)
+        if (typeof (entry.timer as { unref?: () => void }).unref === "function") {
+          ;(entry.timer as { unref: () => void }).unref()
+        }
+      }
+      compactionHolds.set(sid, entry)
+      t("compaction.start", {
+        sid,
+        reason: entry.reason,
+        holdMs: config.compactionHoldMs,
+        warm: entry.warm,
+        scope: config.lockScope,
+      })
+      const leaseSince = lock.snapshot().leases.find((lease) => lease.sid === sid)?.since
+      // The clients draw the held slot from `phase`/`holding`; a queued wait has
+      // left its `position` behind, so it is cleared here.
+      void syncState(sid, {
+        phase: "sending",
+        holding: leaseSince ?? entry.since,
+        position: null,
+        total: null,
+        since: null,
+      })
+    }
+
+    /** The summary is over. `auto` is followed by the primary request, so the
+     *  slot stays warm; `manual` (or a failure) frees it with a return ticket. */
+    const endCompaction = (sid: string, reason: string, failed = false): void => {
+      const entry = clearCompaction(sid)
+      if (!entry) return
+      t("compaction.end", {
+        sid,
+        reason: reason || entry.reason,
+        heldMs: Date.now() - entry.since,
+        warm: entry.warm,
+        failed,
+      })
+      // A turn lease is the whole turn's; a summary inside it changes nothing.
+      if (config.lockScope === "turn") return
+      if (!held.has(sid)) return
+      if (!failed && reason === "auto" && config.warmHandoffMs > 0) {
+        const timer = setTimeout(() => expireWarm(sid), config.warmHandoffMs)
+        if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref()
+        warmHolds.set(sid, { timer, since: Date.now() })
+        t("step.warm-hold", { sid, ms: config.warmHandoffMs, tool: null, after: "compaction" })
+        return
+      }
+      t("step.release", { type: "compaction", sid, finish: reason || null, returning: true, compaction: "ended" })
+      held.delete(sid)
+      lock.release(sid, failed ? "compaction failed" : `compaction ${reason || "ended"}`)
+      returnTickets.write(sid)
+      t("ticket.write", { sid, why: "compaction ended" })
+      void syncState(sid, { holding: null, phase: null })
+    }
+
+    /** The end event was lost: free the slot before it can wedge the queue. */
+    const expireCompaction = (sid: string): void => {
+      const entry = clearCompaction(sid)
+      if (!entry) return
+      t("compaction.expired", { sid, heldMs: Date.now() - entry.since, reason: entry.reason })
+      if (!held.has(sid)) return
+      t("step.release", { type: "compaction", sid, finish: "expired", returning: true, compaction: "expired" })
+      held.delete(sid)
+      lock.release(sid, "compaction hold expired")
+      returnTickets.write(sid)
+      t("ticket.write", { sid, why: "compaction hold expired" })
+      void syncState(sid, { holding: null, phase: null })
     }
 
     // The cloud mark in the title is only for `titleMarks: "all"`; the metadata
@@ -1516,8 +1660,40 @@ export default Plugin.define({
     }
 
     // The gate itself. `context` runs for the agent loop only (including
-    // tool-driven continuations); title/summary/compaction/generate are other
-    // hooks and are never delayed by this plugin.
+    // tool-driven continuations); title/summary/generate are other hooks. A
+    // compaction is a model request of its own and is gated by the `compaction`
+    // hook below, because the summary runs on the same local engine.
+    const takeSlot = async (sid: string, source: "context" | "compaction"): Promise<boolean> => {
+      waiting.add(sid)
+      const acquireAt = Date.now()
+      t("acquire.start", { sid, level: levelOf(sid), waiting: waiting.size, source })
+      const result = await lock.acquire(sid).finally(() => waiting.delete(sid))
+      t("acquire.result", {
+        sid,
+        granted: result.granted,
+        waitedMs: Date.now() - acquireAt,
+        overLimit: result.overLimit,
+        reason: result.reason ?? null,
+        source,
+      })
+      if (!result.granted) {
+        log("debug", `skip ${sid}: ${result.reason ?? "not granted"}`)
+        return false
+      }
+      held.add(sid)
+      // The badge: the holder of the slot is drawn as the active row, with its
+      // own timer. The start is the lease's `since`, not `Date.now()` — a
+      // lease that outlived a plugin reload, or a turn lease reused by the
+      // next step, must not restart the clock on every request.
+      const leaseSince = lock.snapshot().leases.find((lease) => lease.sid === sid)?.since
+      t("lease.taken", { sid, since: leaseSince ?? null, level: levelOf(sid), source })
+      // The session now holds the slot, so its return right has been used up;
+      // the next release writes a fresh ticket.
+      returnTickets.drop(sid)
+      void syncState(sid, { holding: leaseSince ?? Date.now() })
+      return true
+    }
+
     await ctx.session.hook(
       "context",
       async (event: { sessionID?: string; model?: { providerID?: string }; messages?: unknown[] }) => {
@@ -1569,6 +1745,12 @@ export default Plugin.define({
             return
           }
           if (held.has(sid)) {
+            // A compaction still owns the lease: the summary is in flight, so a
+            // context for the same session must not release the slot under it.
+            if (compactionHolds.has(sid)) {
+              t("context.compaction-keep", { sid })
+              return
+            }
             // A step event was lost: this is a new context, so the previous
             // request is over and the lease must not turn back into a turn lease.
             t("context.reacquire", { sid, why: "no step event for the held lease" })
@@ -1610,7 +1792,7 @@ export default Plugin.define({
           // without breaking anything. A holder that sees a waiter of a better level
           // queued gives its own slot up and re-queues below; it resumes on its own
           // as soon as that waiter is served. So `▽` yields to everyone, `⚡` to nobody.
-          if (held.has(sid)) {
+          if (held.has(sid) && !compactionHolds.has(sid)) {
             const ahead = waitingAbove(rankOf(sid), sid)
             if (ahead.length) {
               const who = ahead.map((waiter) => waiter.sid).join(", ")
@@ -1623,32 +1805,67 @@ export default Plugin.define({
           }
         }
 
-        waiting.add(sid)
-        const acquireAt = Date.now()
-        t("acquire.start", { sid, level: levelOf(sid), waiting: waiting.size })
-        const result = await lock.acquire(sid).finally(() => waiting.delete(sid))
-        t("acquire.result", {
-          sid,
-          granted: result.granted,
-          waitedMs: Date.now() - acquireAt,
-          overLimit: result.overLimit,
-          reason: result.reason ?? null,
-        })
-        if (!result.granted) {
-          log("debug", `skip ${sid}: ${result.reason ?? "not granted"}`)
+        const granted = await takeSlot(sid, "context")
+        if (!granted) return
+      },
+    )
+
+    // The compaction gate. A summary is a model request of its own, so it needs
+    // the same slot as the agent loop — and the session must keep the slot it
+    // already holds while the summary generates. Without this hook the warm
+    // window expired mid-summary and the queue took the engine (13 of 17
+    // compactions on 09.11.2026), so the continuation queued behind another
+    // session right after its own compaction.
+    await ctx.session.hook(
+      "compaction",
+      async (event: { sessionID?: string; model?: { providerID?: string }; messages?: unknown[] }) => {
+        const sid = event?.sessionID
+        if (!sid) return
+        t("compaction.enter", { sid, providerID: event?.model?.providerID ?? null, scope: config.lockScope })
+        const local = await isLocalProvider(event?.model?.providerID)
+        void syncState(sid, { cloud: local ? null : true })
+        void applyCloudTitle(sid, !local)
+        if (!local) {
+          t("compaction.cloud", { sid, providerID: event?.model?.providerID ?? null })
           return
         }
-        held.add(sid)
-        // The badge: the holder of the slot is drawn as the active row, with its
-        // own timer. The start is the lease's `since`, not `Date.now()` — a
-        // lease that outlived a plugin reload, or a turn lease reused by the
-        // next step, must not restart the clock on every request.
-        const leaseSince = lock.snapshot().leases.find((lease) => lease.sid === sid)?.since
-        t("lease.taken", { sid, since: leaseSince ?? null, level: levelOf(sid) })
-        // The session now holds the slot, so its return right has been used up;
-        // the next release writes a fresh ticket.
-        returnTickets.drop(sid)
-        void syncState(sid, { holding: leaseSince ?? Date.now() })
+
+        if (config.lockScope === "request") {
+          await rootOf(sid)
+          // The tool that opened the warm window is still the same engine use:
+          // the summary replaces the continuation, so the lease stays and the
+          // window is absorbed into the compaction hold.
+          if (held.has(sid)) {
+            startCompaction(sid, "held")
+            return
+          }
+          // A child's summary runs on the parent's lease, exactly like its
+          // requests; taking a second slot would deadlock the pair.
+          const cover = await coveredBy(sid)
+          if (cover) {
+            lock.refresh(cover)
+            t("compaction.covered", { sid, root: cover })
+            log("info", `subagent ${sid}: compaction covered by ${cover}`)
+            return
+          }
+        } else {
+          const gate = await resolveGate(sid)
+          if (gate.kind !== "root") {
+            if (gate.kind === "covered") lock.refresh(gate.root)
+            t("compaction.subagent", { sid, kind: gate.kind, root: gate.root })
+            log("info", `subagent ${sid}: compaction ${gate.kind} by ${gate.root}`)
+            return
+          }
+          // A turn lease already covers the summary; just remember it so the
+          // step/terminal guards do not free the slot mid-compaction.
+          if (held.has(sid)) {
+            startCompaction(sid, "held")
+            return
+          }
+        }
+
+        if (!(await takeSlot(sid, "compaction"))) return
+        startCompaction(sid, "acquired")
       },
     )
 
@@ -1816,6 +2033,27 @@ export default Plugin.define({
             void syncState(sid, { holding: null })
             continue
           }
+          // Compaction is a request of its own. The `compaction` hook took the
+          // slot (or kept the one already held); these events are its end. Only
+          // the instance that holds the compaction may decide — the stream is
+          // server-wide, like every other event.
+          if ((COMPACTION_EVENTS as readonly string[]).includes(type)) {
+            const reason = String((event as AnyEvent).data?.reason ?? "")
+            if (type === "session.compaction.started") {
+              t("compaction.event", { type, sid, reason: reason || null })
+              // The hook runs before the summary. If it was missed (a reload
+              // between the tool and the summary), a held lease still must not
+              // lose the slot to the warm timer.
+              if (held.has(sid) && !compactionHolds.has(sid)) startCompaction(sid, "event")
+              continue
+            }
+            if (!compactionHolds.has(sid)) {
+              t("event.ignore", { type, sid, why: "compaction of a lease this instance does not hold" })
+              continue
+            }
+            endCompaction(sid, reason, type === "session.compaction.failed")
+            continue
+          }
           // A step ends one model request, not the turn. In `request` scope the
           // slot is freed here for any finish. A `tool-calls` or `length` step
           // is followed by another request from the same session, so it also
@@ -1838,6 +2076,13 @@ export default Plugin.define({
               continue
             }
             const finish = type === "session.step.ended" ? String((event as AnyEvent).data?.finish ?? "") : ""
+            // The summary is in flight: a step boundary (the summary's own, or
+            // a late one from the tool that opened the window) is not the end of
+            // this session's engine use.
+            if (compactionHolds.has(sid)) {
+              t("step.compaction-keep", { type, sid, finish })
+              continue
+            }
             // The step that ended late: its continuation already started on the
             // warm lease, so this event must not free the slot it is using.
             const message = String((event as AnyEvent).data?.assistantMessageID ?? "")
@@ -1881,6 +2126,16 @@ export default Plugin.define({
           // A terminal event ends the request or turn for good; the lease is
           // released here and the badge must go with it. A queued session has no
           // `holding`, so this write is a no-op for it.
+          //
+          // A compaction is still generating on this lease: an idle or a status
+          // event belongs to the work around the summary, not to its end, and
+          // must not hand the engine to the queue. The cap in `expireCompaction`
+          // is the way out if the end event never arrives.
+          if (compactionHolds.has(sid) && type !== "session.deleted" && type !== "session.archived") {
+            t("terminal.compaction-keep", { type, sid })
+            continue
+          }
+          if (compactionHolds.has(sid)) clearCompaction(sid)
           t("terminal", { type, sid, held: held.has(sid) })
           clearWarm(sid)
           warmStep.delete(sid)
@@ -2007,6 +2262,7 @@ export default Plugin.define({
               queue,
               held: [...held],
               warm: [...warmHolds.keys()],
+              compaction: [...compactionHolds.keys()],
               waiting: [...waiting],
               events: stream.events,
               lastEventAgoMs: stream.lastAt ? Date.now() - stream.lastAt : null,
@@ -2028,6 +2284,7 @@ export default Plugin.define({
       scope: config.lockScope,
       limit: config.limit,
       warmHandoffMs: config.warmHandoffMs,
+      compactionHoldMs: config.compactionHoldMs,
       returnTicketTtlMs: config.returnTicketTtlMs,
       leaseTimeoutMs: config.leaseTimeoutMs,
       pollMs: config.pollMs,
@@ -2052,7 +2309,7 @@ export default Plugin.define({
       "info",
       `ready: src=${SOURCE} scope=${config.lockScope} limit=${config.limit} ticket=${
         config.returnTicketTtlMs
-      }ms warm=${config.warmHandoffMs}ms local=${config.localProviders.join(",")} timeout=${Math.round(
+      }ms warm=${config.warmHandoffMs}ms compaction=${config.compactionHoldMs}ms local=${config.localProviders.join(",")} timeout=${Math.round(
         config.acquireTimeoutMs / 60_000,
       )}min onTimeout=${config.onTimeout} mark=${config.markWaitingTitle} prio=${
         config.priorityEnabled ? `/${config.priorityCommand}` : "off"
@@ -2072,6 +2329,10 @@ export default Plugin.define({
       warmHolds.clear()
       warmStep.clear()
       lateStep.clear()
+      for (const entry of compactionHolds.values()) {
+        if (entry.timer) clearTimeout(entry.timer)
+      }
+      compactionHolds.clear()
       // This instance's queue loops must die with it: after a hot reload they
       // would keep polling the shared store, re-mark titles and take slots for
       // hooks nobody awaits any more.

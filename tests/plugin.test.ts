@@ -285,6 +285,20 @@ async function setup(
         tools: {},
       })
     },
+    /** Runs the compaction hook the way the server does before a summary request. */
+    async compaction(sessionID: string, providerID = "strata") {
+      const hook = hooks.find((candidate) => candidate.name === "compaction")
+      if (!hook) throw new Error("plugin did not register the compaction hook")
+      await hook.callback({
+        sessionID,
+        model: { providerID },
+        agent: "build",
+        system: [],
+        messages: [],
+        options: {},
+        tools: {},
+      })
+    },
     async events() {
       // give the subscription loop a chance to start before the first emit
       await wait(20)
@@ -1992,6 +2006,189 @@ test("request scope: a stop step closes the warm window at once", async () => {
     await harness.teardown()
   }
 })
+
+test("request scope: a compaction keeps the slot the tool opened", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, warmHandoffMs: 150 })
+  try {
+    await harness.context("ses_1")
+
+    let secondDone = false
+    const second = harness.context("ses_2").then(() => {
+      secondDone = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_2.wait.json")), "the second session is queued")
+
+    harness.bus.emit({
+      type: "session.tool.input.started",
+      data: { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", name: "bash" },
+    })
+    harness.bus.emit({
+      type: "session.tool.called",
+      data: { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", input: {}, executed: true },
+    })
+    await wait(30)
+
+    // The engine starts a summary for the same session: the warm window must not
+    // hand the slot to the queue while the summary is still being generated.
+    await harness.compaction("ses_1")
+    await wait(250)
+    assert.equal(existsSync(join(harness.dir, "ses_1.lease.json")), true, "the summary keeps the slot")
+    assert.equal(secondDone, false, "the queue does not take the engine during a compaction")
+    assert.equal(
+      harness.traceLines().some((line) => line.ev === "release" && line.reason === "warm handoff expired"),
+      false,
+      "the warm timer did not free the slot",
+    )
+    const metadata = harness.metadata.get("ses_1") as Record<string, any>
+    assert.equal(metadata?.["turn-lock"]?.phase, "sending", "the GUI and the userscript see a held slot")
+    assert.equal(typeof metadata?.["turn-lock"]?.holding, "number", "the held slot has a start time")
+
+    // Auto compaction is followed by the primary request: it resumes warm.
+    harness.bus.emit({
+      type: "session.compaction.ended",
+      data: { sessionID: "ses_1", reason: "auto", text: "summary" },
+    })
+    await wait(20)
+    await harness.context("ses_1")
+    assert.equal(secondDone, false, "the continuation runs on the slot the summary kept")
+    const events = harness.traceLines().map((line) => line.ev)
+    assert.ok(events.includes("compaction.start"), "the trace names the compaction hold")
+    assert.ok(events.includes("compaction.end"), "the trace names the compaction end")
+    assert.ok(events.includes("step.warm-resume"), "the continuation resumed on the kept slot")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await second
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: a compaction from an idle session waits in the queue and shows it in metadata", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, warmHandoffMs: 0 })
+  try {
+    await harness.context("ses_1")
+
+    let compacted = false
+    const compaction = harness.compaction("ses_2").then(() => {
+      compacted = true
+    })
+    await until(() => existsSync(join(harness.dir, "ses_2.wait.json")), "the compacting session is queued")
+    await until(
+      () => (harness.metadata.get("ses_2") as Record<string, any>)?.["turn-lock"]?.phase === "queued",
+      "the queue phase reaches metadata",
+    )
+    assert.equal(compacted, false, "the summary waits for the slot")
+    const queued = harness.metadata.get("ses_2") as Record<string, any>
+    assert.equal(typeof queued?.["turn-lock"]?.position, "number", "the clients see the place")
+
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await compaction
+    assert.equal(existsSync(join(harness.dir, "ses_2.lease.json")), true, "the summary took the freed slot")
+    await until(
+      () => (harness.metadata.get("ses_2") as Record<string, any>)?.["turn-lock"]?.phase === "sending",
+      "the sending phase reaches metadata",
+    )
+
+    harness.bus.emit({
+      type: "session.compaction.ended",
+      data: { sessionID: "ses_2", reason: "manual", text: "summary" },
+    })
+    await until(() => !existsSync(join(harness.dir, "ses_2.lease.json")), "a manual compaction frees the slot")
+    assert.equal(existsSync(join(harness.dir, "ses_2.turn.json")), true, "the session keeps its return right")
+    await until(
+      () => (harness.metadata.get("ses_2") as Record<string, any>)?.["turn-lock"]?.holding === undefined,
+      "the released slot leaves metadata",
+    )
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: a step ending during a compaction does not free the slot", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, warmHandoffMs: 5_000 })
+  try {
+    await harness.context("ses_1")
+    await harness.compaction("ses_1")
+    harness.bus.emit({
+      type: "session.step.ended",
+      data: { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop" },
+    })
+    await wait(100)
+    assert.equal(existsSync(join(harness.dir, "ses_1.lease.json")), true, "the summary still owns the slot")
+    assert.equal(
+      harness.traceLines().some((line) => line.ev === "release" && line.sid === "ses_1"),
+      false,
+      "the step boundary did not release the summary's slot",
+    )
+    assert.ok(
+      harness.traceLines().some((line) => line.ev === "step.compaction-keep"),
+      "the trace names the kept step boundary",
+    )
+
+    harness.bus.emit({
+      type: "session.compaction.ended",
+      data: { sessionID: "ses_1", reason: "manual", text: "summary" },
+    })
+    await until(() => !existsSync(join(harness.dir, "ses_1.lease.json")), "the summary frees the slot")
+    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), true)
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: a cloud compaction is not gated", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, warmHandoffMs: 0 })
+  try {
+    await harness.context("ses_local")
+    const started = Date.now()
+    await harness.compaction("ses_cloud", "polzaai")
+    assert.ok(Date.now() - started < 500, "a cloud summary is not delayed")
+    assert.equal(
+      fileStore(harness.dir)
+        .list()
+        .some((lease: { sid: string }) => lease.sid === "ses_cloud"),
+      false,
+      "a cloud summary creates no lease",
+    )
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("request scope: a lost compaction end releases the slot after the cap", async () => {
+  const harness = await setup({ lockScope: "request", limit: 1, warmHandoffMs: 0, compactionHoldMs: 60 })
+  try {
+    await harness.context("ses_1")
+    await harness.compaction("ses_1")
+    await until(() => !existsSync(join(harness.dir, "ses_1.lease.json")), "the cap frees the slot", 1_000)
+    assert.equal(existsSync(join(harness.dir, "ses_1.turn.json")), true, "the session keeps its return right")
+    assert.ok(
+      harness.traceLines().some((line) => line.ev === "compaction.expired"),
+      "the trace names the safety release",
+    )
+  } finally {
+    await harness.teardown()
+  }
+})
+
+test("turn scope: a compaction keeps the turn lease", async () => {
+  const harness = await setup({ lockScope: "turn", limit: 1 })
+  try {
+    await harness.context("ses_1")
+    await harness.compaction("ses_1")
+    harness.bus.emit({
+      type: "session.compaction.ended",
+      data: { sessionID: "ses_1", reason: "auto", text: "summary" },
+    })
+    await wait(50)
+    assert.equal(existsSync(join(harness.dir, "ses_1.lease.json")), true, "the turn still owns the slot")
+    harness.bus.emit({ type: "session.idle", data: { sessionID: "ses_1" } })
+    await until(() => !existsSync(join(harness.dir, "ses_1.lease.json")), "the turn end frees the lease")
+  } finally {
+    await harness.teardown()
+  }
+})
+
 
 test("request scope: a step that ends after its continuation started does not free the slot", async () => {
   // OpenCode normally emits `step.ended` before the next request, but 0.3% of

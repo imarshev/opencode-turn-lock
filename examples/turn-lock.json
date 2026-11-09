@@ -7,6 +7,7 @@
   "onTimeout": "proceed",
   "leaseTimeoutMs": 7200000,
   "lockScope": "request",
+  "compactionHoldMs": 1800000,
   "pollMs": 200,
   "returnTicketTtlMs": 300000,
   "fifoGraceMs": 2000,

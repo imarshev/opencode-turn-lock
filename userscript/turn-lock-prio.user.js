@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         opencode: очередь /prio (turn-lock) в веб-UI
 // @namespace    https://github.com/imarshev/opencode-turn-lock
-// @version      0.8.1
+// @version      0.8.3
 // @description  Пилюля очереди /prio (три уровня: обычный, приоритет, низкий), бейджи приоритета/облака/места, времени ожидания, удержания слота и «в работе» для working-сессий, а также честный статус «⏳ В очереди» вместо «Работает» в открытой сессии — в веб-клиенте opencode. Неофициальный хак: веб-хост пока не монтирует GUI-плагины.
 // @author       imarshev
 // @match        http://*/*
@@ -38,7 +38,8 @@
 //
 // Scope: match patterns cannot wildcard inside a host, so the manifest above is
 // deliberately broad (@match http://*/*) and the guard below keeps it inert
-// outside local networks. Do not "fix" this by writing @include globs for LAN
+// outside local networks and the hosts listed in EXTRA_HOSTS (a public tunnel is
+// a plain DNS name, so it has to be named there explicitly). Do not "fix" this by writing @include globs for LAN
 // ranges: Tampermonkey converts a trailing `.*` in a glob host into its `.tld`
 // marker and then swaps it for a top-level-domain alternation, so
 // `@include http://192.168.*/*` matches only hosts like `192.168.com` -- never
@@ -51,8 +52,22 @@
   // The broad @match above is the only way to reach a LAN IP (see the header),
   // so this guard is the real scope. Outside loopback / RFC1918 / mDNS names
   // the script does nothing at all.
+  //
+  // A tunnel (opentunnel, cloudflared, tailscale funnel) is a plain public DNS
+  // name, so the shape test below can never accept it -- and it must not, or
+  // every site on the internet would get a script that polls /api/session. The
+  // way in is this explicit list: an exact host, or a suffix starting with "."
+  // (".opentunnel.xyz" accepts every tunnel of that provider). It is a constant
+  // on purpose: @include globs for hosts are broken in Tampermonkey, see above.
+  const EXTRA_HOSTS = [".opentunnel.xyz"]
   const hostname = location.hostname.replace(/^\[|\]$/g, "").toLowerCase()
+  const hostListed = EXTRA_HOSTS.some((pattern) =>
+    pattern.startsWith(".")
+      ? hostname === pattern.slice(1) || hostname.endsWith(pattern)
+      : hostname === pattern,
+  )
   const local =
+    hostListed ||
     hostname === "localhost" ||
     hostname === "::1" ||
     /^127\./.test(hostname) ||
@@ -62,7 +77,8 @@
     /\.(local|lan|home\.arpa)$/.test(hostname)
   if (!local) return
 
-  // The marks the server part writes into a title; ordinary carries none. One
+  // The level marks an older server version wrote into a title; ordinary carries
+  // none. They are read only as a fallback for a session with no metadata. One
   // click moves one step down this ladder.
   const MARKS = { high: "⚡", low: "▽" }
   const CYCLE = { normal: "high", high: "low", low: "normal" }
@@ -161,7 +177,7 @@
     }
     if (Number.isFinite(Number(raw.since)) && Number(raw.since) > 0) state.since = Number(raw.since)
     if (Number.isFinite(Number(raw.holding)) && Number(raw.holding) > 0) state.holding = Number(raw.holding)
-    if (raw.phase === "queued" || raw.phase === "sending") state.phase = raw.phase
+    if (raw.phase === "queued" || raw.phase === "sending" || raw.phase === "warm") state.phase = raw.phase
     return state
   }
 
@@ -515,6 +531,17 @@
       if (status.since !== undefined) hint.push(waitSentence(now - status.since))
       return { phase, text: `⏳ ${said}`, spoken: said, title: hint.join(" · ") }
     }
+    if (phase === "warm") {
+      const words = RU ? "Держит движок" : "Holding the engine"
+      return {
+        phase,
+        text: `⏸ ${words}`,
+        spoken: words,
+        title: RU
+          ? "слот удерживается для продолжения; ответ уже получен"
+          : "the slot is kept for the continuation; the answer has already arrived",
+      }
+    }
     const words = RU ? "Отправлено в движок" : "Sent to the engine"
     return {
       phase,
@@ -758,7 +785,7 @@
       // A subagent session is judged by its parent's verdict, not its own: a
       // `/prio` there would write a flag the scheduler never reads.
       parent: Boolean(info && info.parentID),
-      // The phase (queued/sending) and the numbers behind the label.
+      // The phase (queued/sending/warm) and the numbers behind the label.
       status: readState(info && info.metadata),
     }
   }
